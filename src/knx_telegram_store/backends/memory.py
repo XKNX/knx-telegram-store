@@ -12,16 +12,16 @@ from ..store import StoreCapabilities, TelegramStore
 class MemoryStore(TelegramStore):
     """In-memory implementation of TelegramStore using a deque."""
 
-    def __init__(self, max_size: int = 500) -> None:
+    def __init__(self, max_telegrams: int = 500) -> None:
         """Initialize the memory store."""
-        self._max_size = max_size
-        self._telegrams: deque[StoredTelegram] = deque(maxlen=max_size)
+        self._max_telegrams = max_telegrams
+        self._telegrams: deque[StoredTelegram] = deque(maxlen=max_telegrams)
         self._capabilities = StoreCapabilities(
             supports_time_range=True,
             supports_time_delta=True,
             supports_pagination=True,
             supports_count=True,
-            max_storage=max_size,
+            max_storage=max_telegrams,
         )
 
     @property

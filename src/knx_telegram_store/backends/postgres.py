@@ -42,12 +42,29 @@ class PostgresStore(BaseSQLStore):
     def _upgrade_schema(self, connection) -> None:
         """Synchronous part of schema upgrade (run via run_sync)."""
         inspector = inspect(connection)
-        existing_columns = {col["name"] for col in inspector.get_columns("telegrams")}
+        try:
+            columns = inspector.get_columns("telegrams")
+        except Exception:
+            # Table might not exist yet
+            return
+        existing_columns = {col["name"] for col in columns}
         
-        # Mapping of library names to existing SpectrumKNX names for compatibility
-        # If SpectrumKNX has 'source_address', we might want to aliasing or rename.
-        # For now, we assume we want the library names.
+        # 1. Handle renames from legacy SpectrumKNX schema
+        renames = {
+            "source_address": "source",
+            "target_address": "destination",
+            "telegram_type": "telegramtype",
+            "value_numeric": "value",
+            "value_json": "payload"
+        }
+        for old, new in renames.items():
+            if old in existing_columns and new not in existing_columns:
+                connection.execute(text(f'ALTER TABLE telegrams RENAME COLUMN "{old}" TO "{new}"'))
+                # Refresh existing_columns after rename
+                existing_columns.remove(old)
+                existing_columns.add(new)
         
+        # 2. Ensure all library columns exist
         expected_columns = {
             "direction": "VARCHAR(20) DEFAULT ''",
             "payload": "JSONB",

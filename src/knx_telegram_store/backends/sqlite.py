@@ -17,11 +17,14 @@ class SqliteStore(BaseSQLStore):
         max_telegrams: int | None = None
     ) -> None:
         """Initialize the SQLite store."""
-        # Ensure parent directory exists
-        path = Path(db_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure parent directory exists (unless in-memory)
+        if str(db_path) != ":memory:":
+            path = Path(db_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            url = f"sqlite+aiosqlite:///{path}"
+        else:
+            url = "sqlite+aiosqlite:///:memory:"
         
-        url = f"sqlite+aiosqlite:///{path}"
         engine = create_async_engine(url)
         super().__init__(engine, max_telegrams)
 
