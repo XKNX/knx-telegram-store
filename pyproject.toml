@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "knx-telegram-store"
+version = "0.1.0"
+description = "A standalone, host-agnostic Python library for KNX telegram persistence."
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [
+    {name = "Martin Hoefling"}
+]
+keywords = ["knx", "home-assistant", "persistence", "storage", "telegram"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Home Automation",
+    "Framework :: AsyncIO",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/mar-v-in/knx-telegram-store"
+Bug-Tracker = "https://github.com/mar-v-in/knx-telegram-store/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["knx_telegram_store*"]
+
+[project.optional-dependencies]
+sqlite = ["aiosqlite>=0.20"]
+postgres = ["asyncpg>=0.29", "sqlalchemy[asyncio]>=2.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4.1",
+    "ruff>=0.3",
+    "aiosqlite>=0.20"
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+exclude = [
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "I", "U", "UP"]
+ignore = [
+    "E501", # Line too long
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
