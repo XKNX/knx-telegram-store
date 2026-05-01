@@ -23,8 +23,8 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/martinhoefling/knx-telegram-store"
-Bug-Tracker = "https://github.com/martinhoefling/knx-telegram-store/issues"
+Homepage = "https://github.com/XKNX/knx-telegram-store"
+Bug-Tracker = "https://github.com/XKNX/knx-telegram-store/issues"
 
 [tool.setuptools]
 include-package-data = true
