@@ -54,19 +54,35 @@ class PostgresStore(BaseSQLStore):
             "source_address": "source",
             "target_address": "destination",
             "telegram_type": "telegramtype",
-            "value_numeric": "value",
-            "value_json": "payload"
+            "value_json": "payload",
+            "value": "value_numeric"  # Legacy value was FLOAT, library value is JSONB
         }
         for old, new in renames.items():
-            if old in existing_columns and new not in existing_columns:
-                connection.execute(text(f'ALTER TABLE telegrams RENAME COLUMN "{old}" TO "{new}"'))
-                # Refresh existing_columns after rename
-                existing_columns.remove(old)
-                existing_columns.add(new)
+            if old in existing_columns:
+                if new not in existing_columns:
+                    connection.execute(text(f'ALTER TABLE telegrams RENAME COLUMN "{old}" TO "{new}"'))
+                    existing_columns.remove(old)
+                    existing_columns.add(new)
+                elif old == "value":
+                    # Special case: 'value' (float) and 'value_numeric' (float) both exist.
+                    # We must move 'value' out of the way so it can be recreated as JSONB.
+                    is_float = any(c["name"] == "value" and "double" in str(c["type"]).lower() for c in columns)
+                    if is_float:
+                        connection.execute(text('ALTER TABLE telegrams RENAME COLUMN "value" TO "value_legacy_float"'))
+                        existing_columns.remove("value")
+                        existing_columns.add("value_legacy_float")
+
+        # Migrate raw_data from bytea to text (hex encoded)
+        if "raw_data" in existing_columns:
+            for col in columns:
+                if col["name"] == "raw_data" and "bytea" in str(col["type"]).lower():
+                    connection.execute(text("ALTER TABLE telegrams ALTER COLUMN raw_data TYPE TEXT USING encode(raw_data, 'hex')"))
         
         # 2. Ensure all library columns exist
         expected_columns = {
-            "direction": "VARCHAR(20) DEFAULT ''",
+            "direction": "VARCHAR(20) DEFAULT 'Incoming'",
+            "value": "JSONB",
+            "value_numeric": "FLOAT",
             "payload": "JSONB",
             "dpt_name": "VARCHAR(100)",
             "unit": "VARCHAR(20)",
@@ -78,3 +94,13 @@ class PostgresStore(BaseSQLStore):
         for col_name, col_type in expected_columns.items():
             if col_name not in existing_columns:
                 connection.execute(text(f"ALTER TABLE telegrams ADD COLUMN {col_name} {col_type}"))
+                existing_columns.add(col_name)
+
+        # 3. Data migrations for incorrect previous renames
+        if "value_legacy_float" in existing_columns and "value_numeric" in existing_columns:
+            connection.execute(text('UPDATE telegrams SET value_numeric = value_legacy_float WHERE value_numeric IS NULL AND value_legacy_float IS NOT NULL'))
+            
+        if "payload" in existing_columns and "value" in existing_columns:
+            connection.execute(text('UPDATE telegrams SET value = payload WHERE value IS NULL AND payload IS NOT NULL'))
+            # Clear payload where it was incorrectly used for JSON data
+            connection.execute(text('UPDATE telegrams SET payload = NULL WHERE value = payload'))
