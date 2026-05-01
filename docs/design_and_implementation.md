@@ -1,7 +1,7 @@
 # `knx-telegram-store` — Design & Implementation Plan
 
-> **Status:** Draft — Pending Review  
-> **Date:** 2026-04-26  
+> **Status:** In Progress — Syncing with implementation plan  
+> **Date:** 2026-05-01  
 > **Authors:** Martin  
 > **PyPI Name:** `knx-telegram-store` (confirmed available)
 
@@ -17,8 +17,9 @@
 6. [Backend Implementations](#6-backend-implementations)
 7. [Integration Strategy](#7-integration-strategy)
 8. [Package Structure](#8-package-structure)
-9. [Implementation Roadmap](#9-implementation-roadmap)
-10. [Verification Plan](#10-verification-plan)
+9. [Open Questions](#9-open-questions)
+10. [Implementation Roadmap](#10-implementation-roadmap)
+11. [Verification Plan](#11-verification-plan)
 
 ---
 
@@ -39,8 +40,8 @@ A **standalone, host-agnostic Python library** (`knx-telegram-store`) that:
 
 1. Defines a **single canonical data model** for a stored KNX telegram.
 2. Provides an **abstract storage interface** with pluggable backends.
-3. Ships four backends: **In-Memory** (testing), **HA Storage** (Home Assistant native), **SQLite** (lightweight persistent), **PostgreSQL/TimescaleDB** (full scale).
-4. Provides a **unified query/filter model** that advanced backends implement natively (SQL) and simple backends degrade gracefully (return all telegrams unfiltered).
+3. Ships three backends: **In-Memory** (testing and small deployments), **SQLite** (lightweight persistent), **PostgreSQL/TimescaleDB** (full scale).
+4. Provides a **unified query/filter model** implemented natively by all backends.
 5. Is usable from both Home Assistant KNX and SpectrumKNX **without pulling in their respective framework dependencies**.
 
 ---
@@ -51,10 +52,11 @@ A **standalone, host-agnostic Python library** (`knx-telegram-store`) that:
 
 - **Backend independence:** The library has no dependency on Home Assistant, SpectrumKNX, FastAPI, or xknx. Consumers handle telegram enrichment (DPT decoding, name resolution) before writing to the store.
 - **Shared features:** Filtering, time-delta context windows, pagination, and time-range queries are implemented once in SQL backends and benefit both consumers.
-- **Zero-migration for HA Storage:** The HA Storage backend wraps the existing `Store` mechanism with the same data format. No migration of existing JSON data is required.
+- **Zero-migration:** The library defines the interface; consumers wrap their existing storage or use the provided SQL backends.
+- **Batch Storage Efficiency:** For high-throughput backends (SQL), `store_many()` is recommended with a minimum batch size of **10 telegrams** for better write performance.
 - **Incremental adoption:** Each consumer can adopt the library independently:
   1. Define the interface in the library.
-  2. Wrap HA's existing storage as one backend (no data migration).
+  2. Implement/Wrap existing storage as a backend.
   3. Extract SpectrumKNX's PostgreSQL storage into the Postgres backend.
   4. Implement SQLite as an additional backend available to both systems.
 
@@ -162,7 +164,6 @@ class StoreCapabilities:
     
     Consumers use this to decide whether to apply client-side post-filtering.
     """
-    supports_server_filtering: bool = False
     supports_time_range: bool = False
     supports_time_delta: bool = False
     supports_pagination: bool = False
@@ -204,9 +205,7 @@ class TelegramStore(ABC):
     async def query(self, query: TelegramQuery) -> TelegramQueryResult:
         """Retrieve telegrams matching the given query.
         
-        Backends that do not support server-side filtering SHOULD return
-        all stored telegrams and set `result.server_filtered = False`.
-        The consumer is then responsible for client-side filtering.
+        All backends MUST implement full filtering as defined in TelegramQuery.
         """
 
     @abstractmethod
@@ -223,7 +222,10 @@ class TelegramStore(ABC):
 
 ### Key design decision: no `get_latest_per_destination()` in the interface
 
-Home Assistant currently maintains a `last_ga_telegrams` dict (most recent telegram per group address). This remains a **consumer-side concern** in HA. In the future, it can be replaced by a frontend query fetching the last N telegrams with appropriate filtering. The storage library focuses on bulk storage and querying.
+Home Assistant currently maintains a `last_ga_telegrams` dict (most recent telegram per group address). This remains a **consumer-side concern** in HA. At startup, HA can compute this dict by iterating over the results of an initial "recent telegrams" query from the store. The storage library focuses on bulk storage and querying.
+
+> [!NOTE]
+> Since this is removed from the library interface, it **must be explicitly implemented/maintained in the HA `Telegrams` class** during integration.
 
 ---
 
@@ -281,22 +283,20 @@ class TelegramQueryResult:
 
     telegrams: list[StoredTelegram]
     total_count: int
-    server_filtered: bool    # True = backend applied all query filters
     limit_reached: bool      # True = more results exist beyond limit
 ```
 
 ### Graceful degradation matrix
 
-| Feature | In-Memory | HA Storage | SQLite | PostgreSQL |
-|---|---|---|---|---|
-| Multi-value filters | ❌ returns all | ❌ returns all | ✅ SQL `IN()` | ✅ SQL `IN()` |
-| Time range | ❌ returns all | ❌ returns all | ✅ `WHERE ts BETWEEN` | ✅ hypertable-optimized |
-| Time-delta context | ❌ returns all | ❌ returns all | ✅ SQL subquery | ✅ native (current SpectrumKNX impl) |
-| Pagination | ❌ returns all | ❌ returns all | ✅ `LIMIT/OFFSET` | ✅ `LIMIT/OFFSET` |
-| Count | ✅ `len()` | ✅ `len()` | ✅ `SELECT COUNT(*)` | ✅ `SELECT COUNT(*)` |
-| `server_filtered` | `False` | `False` | `True` | `True` |
+| Feature | In-Memory | SQLite | PostgreSQL |
+|---|---|---|---|
+| Multi-value filters | ✅ list comprehension | ✅ SQL `IN()` | ✅ SQL `IN()` |
+| Time range | ✅ timestamp check | ✅ `WHERE ts BETWEEN` | ✅ hypertable-optimized |
+| Time-delta context | ✅ two-pass filter | ✅ SQL subquery | ✅ native (current SpectrumKNX impl) |
+| Pagination | ✅ list slicing | ✅ `LIMIT/OFFSET` | ✅ `LIMIT/OFFSET` |
+| Count | ✅ `len()` | ✅ `SELECT COUNT(*)` | ✅ `SELECT COUNT(*)` |
 
-When `server_filtered = False`, the consumer's frontend applies the same `TelegramQuery` filter logic client-side. This is exactly what Home Assistant does today — the group monitor filters in the browser.
+Since all backends support native filtering, the consumer can trust that the results returned by `query()` are accurate and do not require further client-side processing.
 
 ---
 
@@ -304,36 +304,20 @@ When `server_filtered = False`, the consumer's frontend applies the same `Telegr
 
 ### 6a. In-Memory Backend (`backends/memory.py`)
 
-**Purpose:** Unit testing and development environments.
+**Purpose:** Unit testing and development environments, or simple deployments that don't require persistence.
 
 ```
 MemoryStore(max_size: int = 500)
 ```
 
 - Stores telegrams in a `collections.deque(maxlen=max_size)`.
-- `query()` returns all telegrams with `server_filtered=False`.
+- **Full Query Support:** Implements the `TelegramQuery` model natively via Python list processing.
+- `query()` returns filtered telegrams.
 - `store()` / `store_many()` append to the deque (oldest are evicted when full).
 - No persistence — data is lost when the process exits.
 - Zero dependencies.
 
-### 6b. HA Storage Backend (`backends/ha_storage.py`)
-
-**Purpose:** Home Assistant's native storage. Wraps the existing HA `Store` JSON mechanism to maintain full backward compatibility. **No data migration required.**
-
-```
-HAStorageStore(store: Store, max_size: int = 500)
-```
-
-- Receives a pre-configured HA `Store[list[dict]]` instance from the HA integration.
-- Internally uses `deque(maxlen=max_size)` for in-memory access, same as today.
-- `load()` reads from `Store.async_load()` — handles the existing JSON format (including tuple↔list conversion for payloads).
-- `save()` writes to `Store.async_save()` — same JSON format as today.
-- `query()` returns all telegrams with `server_filtered=False`.
-- The HA integration calls `load()` at startup and `save()` at shutdown, exactly as it does today.
-
-> **Why this is not a breaking change:** The HA Storage backend reads and writes the same JSON structure that HA uses today. The `StoredTelegram` ↔ `TelegramDict` conversion happens at the boundary (in the HA integration code), not in the stored data. Existing `.storage/knx/telegrams_history.json` files continue to work unchanged.
-
-### 6c. SQLite Backend (`backends/sqlite.py`)
+### 6b. SQLite Backend (`backends/sqlite.py`)
 
 **Purpose:** Lightweight persistent storage for HA users who want longer history without PostgreSQL, and for single-user SpectrumKNX deployments.
 
@@ -342,11 +326,14 @@ SqliteStore(db_path: str | Path, max_telegrams: int | None = None)
 ```
 
 - Uses `aiosqlite` for async I/O.
-- Creates a single `telegrams` table with proper indexes on `timestamp`, `source`, `destination`, `telegramtype`, `dpt_main`.
+- **Automated Schema Management:** `initialize()` handles creation of the `telegrams` table and indices. It also manages idempotent schema upgrades (adding missing columns) if an existing database is found.
 - Implements full `TelegramQuery` filtering via SQL `WHERE` clauses.
 - Supports time-delta context windows via SQL subqueries.
 - Optional `max_telegrams` cap with automatic pruning of oldest rows (`DELETE FROM telegrams WHERE rowid IN (SELECT rowid FROM telegrams ORDER BY timestamp ASC LIMIT ?)`).
 - Optional dependency: `knx-telegram-store[sqlite]` → `aiosqlite`.
+
+> [!NOTE]
+> `aiosqlite` is chosen for its async-friendly interface. While HA's `recorder` uses `SQLAlchemy` + `sqlite3`, `aiosqlite` is safe for the event loop as it offloads I/O to a thread.
 
 **Schema:**
 
@@ -378,7 +365,7 @@ CREATE INDEX IF NOT EXISTS ix_telegrams_type ON telegrams (telegramtype, timesta
 CREATE INDEX IF NOT EXISTS ix_telegrams_dpt ON telegrams (dpt_main, dpt_sub, timestamp DESC);
 ```
 
-### 6d. PostgreSQL + TimescaleDB Backend (`backends/postgres.py`)
+### 6c. PostgreSQL + TimescaleDB Backend (`backends/postgres.py`)
 
 **Purpose:** Full-scale time-series storage for SpectrumKNX and advanced HA deployments.
 
@@ -386,10 +373,9 @@ CREATE INDEX IF NOT EXISTS ix_telegrams_dpt ON telegrams (dpt_main, dpt_sub, tim
 PostgresStore(dsn: str)
 ```
 
-- Uses `asyncpg` via SQLAlchemy async (matches SpectrumKNX's current stack).
-- Schema extends the existing SpectrumKNX `telegrams` hypertable with new columns (`direction`, `dpt_name`, `unit`, `data_secure`, `source_name`, `destination_name`).
-- `initialize()` creates the hypertable with `IF NOT EXISTS` and adds missing columns for backward compatibility with existing SpectrumKNX databases.
+- **Automated Schema Management:** `initialize()` handles creation of the `telegrams` hypertable and indices. It supports idempotent schema upgrades for existing SpectrumKNX/Postgres databases by detecting and adding missing columns.
 - Full `TelegramQuery` support including time-delta context windows (ported from SpectrumKNX's current `api.py` implementation).
+- **TimescaleDB Optimization:** The backend leverages TimescaleDB hypertables and should use time-series specific functions (like `time_bucket`) for efficient time-range queries where applicable.
 - Optional dependency: `knx-telegram-store[postgres]` → `asyncpg`, `sqlalchemy[asyncio]`.
 
 **Schema (extends existing SpectrumKNX):**
@@ -450,11 +436,11 @@ CREATE INDEX IF NOT EXISTS ix_telegrams_type ON telegrams (telegramtype, timesta
 
 **Changes to `telegrams.py`:**
 
-- The `Telegrams` class receives a `TelegramStore` instance instead of managing its own `deque` + `Store`.
+- The `Telegrams` class receives a `TelegramStore` instance instead of managing its own `deque`.
 - `telegram_to_dict()` produces a `StoredTelegram` (internally converting HA-specific xknx enrichment).
-- For the HA Storage backend: `load_history()` → `store.load()`, `save_history()` → `store.save()`. Format unchanged.
 - `recent_telegrams` property → `store.query(TelegramQuery())`.
-- `last_ga_telegrams` remains a consumer-side dict maintained by the `Telegrams` class (unchanged behavior).
+- `last_ga_telegrams` remains a consumer-side dict maintained by the `Telegrams` class. It is populated at startup by computing it from the initial set of recent telegrams loaded from the store.
+- **Configuration:** HA must allow users to configure the preferred backend (Memory, SQLite, or Postgres) via integration options.
 
 **Changes to `websocket.py`:**
 
@@ -506,7 +492,7 @@ CREATE INDEX IF NOT EXISTS ix_telegrams_type ON telegrams (telegramtype, timesta
 knx-telegram-store/
 ├── pyproject.toml
 ├── README.md
-├── LICENSE                          # Apache 2.0 (matching xknx ecosystem)
+├── LICENSE                          # MIT License (matching knx-frontend)
 ├── docs/
 │   └── design_and_implementation.md # This document
 ├── src/
@@ -518,7 +504,6 @@ knx-telegram-store/
 │       ├── backends/
 │       │   ├── __init__.py
 │       │   ├── memory.py            # In-memory backend (testing)
-│       │   ├── ha_storage.py        # HA Storage backend (wraps HA Store)
 │       │   ├── sqlite.py            # SQLite backend
 │       │   └── postgres.py          # PostgreSQL + TimescaleDB backend
 │       └── _version.py
@@ -548,27 +533,34 @@ dev = ["pytest", "pytest-asyncio", "pytest-cov", "aiosqlite", "asyncpg", "sqlalc
 
 ---
 
-## 9. Implementation Roadmap
+## 9. Open Questions
+
+*(No open questions remaining)*
+
+---
+
+## 10. Future Ideas
+
+- **Backend Migration:** Provide a utility to migrate data between backends (e.g., from HA Storage JSON to SQLite).
+
+---
+
+## 11. Implementation Roadmap
 
 ### Phase 1: Core Library (this PR)
 
 1. **Define the interface** — `StoredTelegram`, `TelegramStore`, `TelegramQuery`, `StoreCapabilities`
 2. **In-Memory backend** — For testing; simple deque-based implementation
 3. **Unit tests** — Shared test suite parametrized across backends
+4. **Project Setup** — Initialize `LICENSE` (MIT) and project documentation
 
-### Phase 2: HA Storage Backend
-
-4. **HA Storage backend** — Wraps HA's existing `Store` mechanism with zero data migration
-5. **Integrate into HA** — Refactor `telegrams.py` to use `TelegramStore` interface
-6. **Verify** — Existing `test_telegrams.py` tests must pass unchanged
-
-### Phase 3: PostgreSQL Backend
+### Phase 2: PostgreSQL Backend
 
 7. **Extract from SpectrumKNX** — Port the SQLAlchemy storage and time-delta query logic into `PostgresStore`
 8. **Refactor SpectrumKNX** — Replace `models.py` + inline queries with the library
 9. **Verify** — SpectrumKNX integration tests, existing live/history views work
 
-### Phase 4: SQLite Backend
+### Phase 3: SQLite Backend
 
 10. **Implement SQLite** — Async SQLite with full query support
 11. **Test in both consumers** — HA with SQLite backend, SpectrumKNX with SQLite backend
