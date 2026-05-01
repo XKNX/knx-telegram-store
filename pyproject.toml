@@ -32,7 +32,7 @@ where = ["src"]
 include = ["knx_telegram_store*"]
 
 [project.optional-dependencies]
-sqlite = ["aiosqlite>=0.20"]
+sqlite = ["aiosqlite>=0.20", "sqlalchemy[asyncio]>=2.0"]
 postgres = ["asyncpg>=0.29", "sqlalchemy[asyncio]>=2.0"]
 dev = [
     "pytest>=8.0",

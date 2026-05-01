@@ -3,12 +3,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from knx_telegram_store import StoredTelegram, TelegramQuery
-from knx_telegram_store.backends.memory import MemoryStore
 
-
-@pytest.fixture
-def store():
-    return MemoryStore(max_size=100)
 
 @pytest.fixture
 def sample_telegrams():
@@ -133,11 +128,8 @@ async def test_pagination(store, sample_telegrams):
     assert result.limit_reached is False
 
 @pytest.mark.asyncio
-async def test_max_size(sample_telegrams):
-    small_store = MemoryStore(max_size=2)
-    await small_store.store_many(sample_telegrams)
-    assert await small_store.count() == 2
-    # Should only have the last two (t2: 1.1.1, t3: 1.1.3)
-    result = await small_store.query(TelegramQuery(order_descending=False))
-    assert result.telegrams[0].source == "1.1.1"
-    assert result.telegrams[1].source == "1.1.3"
+async def test_clear(store, sample_telegrams):
+    await store.store_many(sample_telegrams)
+    assert await store.count() == 4
+    await store.clear()
+    assert await store.count() == 0
