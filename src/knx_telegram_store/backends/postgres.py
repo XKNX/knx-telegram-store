@@ -96,11 +96,20 @@ class PostgresStore(BaseSQLStore):
                 connection.execute(text(f"ALTER TABLE telegrams ADD COLUMN {col_name} {col_type}"))
                 existing_columns.add(col_name)
 
-        # 3. Data migrations for incorrect previous renames
+        # 3. Data migrations for old SpectrumKNX rows
+        # Old schema had value_numeric (FLOAT) and value_json (now payload),
+        # but no value (JSONB) column. Populate value from value_numeric
+        # so the library's query returns it correctly.
+        if "value" in existing_columns and "value_numeric" in existing_columns:
+            connection.execute(text(
+                'UPDATE telegrams SET value = to_jsonb(value_numeric) '
+                'WHERE value IS NULL AND value_numeric IS NOT NULL'
+            ))
+
+        # Handle edge case from intermediate migrations where value was
+        # a FLOAT column renamed to value_legacy_float
         if "value_legacy_float" in existing_columns and "value_numeric" in existing_columns:
-            connection.execute(text('UPDATE telegrams SET value_numeric = value_legacy_float WHERE value_numeric IS NULL AND value_legacy_float IS NOT NULL'))
-            
-        if "payload" in existing_columns and "value" in existing_columns:
-            connection.execute(text('UPDATE telegrams SET value = payload WHERE value IS NULL AND payload IS NOT NULL'))
-            # Clear payload where it was incorrectly used for JSON data
-            connection.execute(text('UPDATE telegrams SET payload = NULL WHERE value = payload'))
+            connection.execute(text(
+                'UPDATE telegrams SET value_numeric = value_legacy_float '
+                'WHERE value_numeric IS NULL AND value_legacy_float IS NOT NULL'
+            ))
