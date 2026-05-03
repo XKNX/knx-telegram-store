@@ -1,4 +1,3 @@
-
 import pytest
 
 from knx_telegram_store.backends.memory import MemoryStore
@@ -12,8 +11,8 @@ async def store(request, tmp_path):
         store = MemoryStore(max_telegrams=100)
     elif request.param == "sqlite":
         db_file = tmp_path / "test.db"
-        store = SqliteStore(db_file, max_telegrams=100)
-    
+        store = SqliteStore(db_file, retention_days=10)
+
     await store.initialize()
     yield store
     await store.close()

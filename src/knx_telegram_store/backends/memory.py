@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Sequence
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from ..model import StoredTelegram
 from ..query import TelegramQuery, TelegramQueryResult
@@ -68,10 +68,10 @@ class MemoryStore(TelegramStore):
         # 3. Time-delta context window
         if query.delta_before_ms > 0 or query.delta_after_ms > 0:
             pivot_timestamps = [t.timestamp for t in results]
-            
+
             delta_before = timedelta(milliseconds=query.delta_before_ms)
             delta_after = timedelta(milliseconds=query.delta_after_ms)
-            
+
             # Re-collect all telegrams within any pivot's window
             # This implementation is O(N*M) but N is small for MemoryStore (500)
             context_results = set()
@@ -91,7 +91,7 @@ class MemoryStore(TelegramStore):
         start = query.offset
         end = query.offset + query.limit
         paginated_results = results[start:end]
-        
+
         limit_reached = len(results) > end
 
         return TelegramQueryResult(
@@ -103,6 +103,14 @@ class MemoryStore(TelegramStore):
     async def count(self) -> int:
         """Return the total number of stored telegrams."""
         return len(self._telegrams)
+
+    async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
+        """Memory store uses max_telegrams for pruning."""
+        return 0
+
+    async def evict_expired(self, *, dry_run: bool = False) -> int:
+        """Memory store uses max_telegrams for pruning."""
+        return 0
 
     async def clear(self) -> None:
         """Remove all stored telegrams."""
