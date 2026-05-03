@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from collections.abc import Sequence
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import (
@@ -30,10 +30,10 @@ from ..store import StoreCapabilities, TelegramStore
 class BaseSQLStore(TelegramStore):
     """Base class for SQLAlchemy-based telegram stores."""
 
-    def __init__(self, engine: AsyncEngine, max_telegrams: int | None = None) -> None:
+    def __init__(self, engine: AsyncEngine, retention_days: int | None = None) -> None:
         """Initialize the SQL store."""
         self.engine = engine
-        self._max_telegrams = max_telegrams
+        self._retention_days = retention_days
         self._metadata = MetaData()
         self.telegrams = Table(
             "telegrams",
@@ -60,7 +60,7 @@ class BaseSQLStore(TelegramStore):
             supports_time_delta=True,
             supports_pagination=True,
             supports_count=True,
-            max_storage=max_telegrams,
+            max_storage=None,
         )
 
     @property
@@ -109,29 +109,26 @@ class BaseSQLStore(TelegramStore):
 
         async with self.engine.begin() as conn:
             await conn.execute(self.telegrams.insert(), values)
-            if self._max_telegrams:
-                await self._prune(conn)
 
-    async def _prune(self, conn: Any) -> None:
-        """Prune old telegrams if max_storage is exceeded."""
-        # Simple pruning: delete oldest rows beyond max_telegrams
-        # Note: This could be optimized for large databases
-        count_stmt = select(func.count()).select_from(self.telegrams)
-        count = await conn.scalar(count_stmt)
-        if count > self._max_telegrams:
-            to_delete = count - self._max_telegrams
-            # Use a subquery to find the IDs to delete (SQLite/Postgres compatible)
-            # Since we don't have a PK, we use the timestamp as a proxy or just delete N oldest
-            # In PostgreSQL/TimescaleDB we might want a different strategy, but for now:
-            subq = (
-                select(self.telegrams.c.timestamp)
-                .order_by(self.telegrams.c.timestamp.asc())
-                .limit(to_delete)
-            )
-            delete_stmt = self.telegrams.delete().where(
-                self.telegrams.c.timestamp.in_(subq)
-            )
-            await conn.execute(delete_stmt)
+    async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
+        """Delete all telegrams with timestamp < cutoff."""
+        if dry_run:
+            stmt = select(func.count()).select_from(self.telegrams).where(self.telegrams.c.timestamp < cutoff)
+            async with self.engine.connect() as conn:
+                return await conn.scalar(stmt) or 0
+
+        delete_stmt = self.telegrams.delete().where(self.telegrams.c.timestamp < cutoff)
+        async with self.engine.begin() as conn:
+            result = await conn.execute(delete_stmt)
+            return result.rowcount
+
+    async def evict_expired(self, *, dry_run: bool = False) -> int:
+        """Delete telegrams older than the configured retention period."""
+        if self._retention_days is None:
+            return 0
+
+        cutoff = datetime.now(UTC) - timedelta(days=self._retention_days)
+        return await self.evict_older_than(cutoff, dry_run=dry_run)
 
     async def query(self, query: TelegramQuery) -> TelegramQueryResult:
         """Retrieve telegrams matching the given query."""
@@ -159,15 +156,15 @@ class BaseSQLStore(TelegramStore):
         if (query.delta_before_ms > 0 or query.delta_after_ms > 0) and filters:
             # Create a subquery for the matching pivots
             pivots = select(self.telegrams.c.timestamp).where(and_(*filters)).alias("pivots")
-            
+
             if self.engine.dialect.name == "sqlite":
                 # SQLite specific date math
                 before_str = f"-{query.delta_before_ms / 1000.0} seconds"
                 after_str = f"+{query.delta_after_ms / 1000.0} seconds"
-                
+
                 cond = and_(
                     self.telegrams.c.timestamp >= func.datetime(pivots.c.timestamp, before_str),
-                    self.telegrams.c.timestamp <= func.datetime(pivots.c.timestamp, after_str)
+                    self.telegrams.c.timestamp <= func.datetime(pivots.c.timestamp, after_str),
                 )
             else:
                 # Standard math (Postgres, etc.)
@@ -175,20 +172,18 @@ class BaseSQLStore(TelegramStore):
                 delta_after = timedelta(milliseconds=query.delta_after_ms)
                 cond = and_(
                     self.telegrams.c.timestamp >= pivots.c.timestamp - delta_before,
-                    self.telegrams.c.timestamp <= pivots.c.timestamp + delta_after
+                    self.telegrams.c.timestamp <= pivots.c.timestamp + delta_after,
                 )
 
             # Use EXISTS to find rows within range of any pivot
-            stmt = select(self.telegrams).where(
-                select(pivots).where(cond).exists()
-            )
+            stmt = select(self.telegrams).where(select(pivots).where(cond).exists())
         else:
             if filters:
                 stmt = stmt.where(and_(*filters))
 
         # 3. Total Count (before pagination)
         count_stmt = select(func.count()).select_from(stmt.alias("unpaginated"))
-        
+
         # 4. Ordering
         if query.order_descending:
             stmt = stmt.order_by(self.telegrams.c.timestamp.desc())

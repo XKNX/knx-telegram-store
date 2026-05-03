@@ -7,10 +7,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .model import StoredTelegram
 
+
 @dataclass(frozen=True, kw_only=True, slots=True)
 class TelegramQuery:
     """Declarative query for telegram retrieval.
-    
+
     Filter semantics:
     - Empty list = no restriction (pass-through)
     - Within a category = OR logic (any match passes)
@@ -49,4 +50,4 @@ class TelegramQueryResult:
 
     telegrams: list[StoredTelegram]
     total_count: int
-    limit_reached: bool      # True = more results exist beyond limit
+    limit_reached: bool  # True = more results exist beyond limit
