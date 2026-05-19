@@ -26,8 +26,6 @@ LOOKUP_CATEGORIES = [
     "destination",
     "telegramtype",
     "direction",
-    "dpt_name",
-    "unit",
     "source_name",
     "destination_name",
 ]

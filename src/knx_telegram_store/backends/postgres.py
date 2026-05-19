@@ -82,19 +82,17 @@ class PostgresStore(BaseSQLStore):
                         text("ALTER TABLE telegrams ALTER COLUMN raw_data TYPE TEXT USING encode(raw_data, 'hex')")
                     )
 
+        cols_to_migrate = {
+            "source": "source",
+            "destination": "destination",
+            "telegramtype": "telegramtype",
+            "direction": "direction",
+            "source_name": "source_name",
+            "destination_name": "destination_name",
+        }
+
         # 2. Handle normalization to string_lookup
         if "source" in existing_columns:
-            cols_to_migrate = {
-                "source": "source",
-                "destination": "destination",
-                "telegramtype": "telegramtype",
-                "direction": "direction",
-                "dpt_name": "dpt_name",
-                "unit": "unit",
-                "source_name": "source_name",
-                "destination_name": "destination_name",
-            }
-
             # Populate string_lookup table
             for cat, old_col in cols_to_migrate.items():
                 if old_col in existing_columns:
@@ -122,12 +120,21 @@ class PostgresStore(BaseSQLStore):
                 )
 
             # Drop old columns
-            for old_col in cols_to_migrate.values():
-                connection.execute(text(f'ALTER TABLE telegrams DROP COLUMN "{old_col}"'))
-            
+            for old_col in list(cols_to_migrate.values()) + ["dpt_name", "unit"]:
+                if old_col in existing_columns:
+                    connection.execute(text(f'ALTER TABLE telegrams DROP COLUMN "{old_col}"'))
+
             # Re-fetch existing columns after drops
             columns = inspector.get_columns("telegrams")
             existing_columns = {col["name"] for col in columns}
+
+        # Drop legacy normalized columns if present
+        for col in ["dpt_name_id", "unit_id", "dpt_name", "unit"]:
+            if col in existing_columns and col not in cols_to_migrate:
+                try:
+                    connection.execute(text(f'ALTER TABLE telegrams DROP COLUMN "{col}"'))
+                except Exception:
+                    pass
 
         # 3. Ensure all non-normalized library columns exist
         expected_columns = {

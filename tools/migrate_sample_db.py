@@ -238,8 +238,6 @@ async def verify(old_rows: list[RawRow], store: SqliteStore, sample_size: int) -
             ("destination", old.destination or "", match.destination),
             ("telegramtype", old.telegramtype or "", match.telegramtype),
             ("direction", old.direction or "", match.direction),
-            ("dpt_name", _norm(old.dpt_name), _norm(match.dpt_name)),
-            ("unit", _norm(old.unit), _norm(match.unit)),
             ("source_name", old.source_name or "", match.source_name),
             ("destination_name", old.destination_name or "", match.destination_name),
             ("dpt_main", old.dpt_main, match.dpt_main),

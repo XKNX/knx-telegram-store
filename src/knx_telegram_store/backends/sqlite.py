@@ -42,20 +42,17 @@ class SqliteStore(BaseSQLStore):
         columns = inspector.get_columns("telegrams")
         existing_columns = {col["name"] for col in columns}
 
+        cols_to_migrate = {
+            "source": "source",
+            "destination": "destination",
+            "telegramtype": "telegramtype",
+            "direction": "direction",
+            "source_name": "source_name",
+            "destination_name": "destination_name",
+        }
+
         # 1. Detect if we are on the legacy (pre-normalized) schema
         if "source" in existing_columns:
-            # Normalize to string_lookup
-            cols_to_migrate = {
-                "source": "source",
-                "destination": "destination",
-                "telegramtype": "telegramtype",
-                "direction": "direction",
-                "dpt_name": "dpt_name",
-                "unit": "unit",
-                "source_name": "source_name",
-                "destination_name": "destination_name",
-            }
-
             # Populate string_lookup table
             for cat, old_col in cols_to_migrate.items():
                 if old_col in existing_columns:
@@ -82,12 +79,20 @@ class SqliteStore(BaseSQLStore):
                 )
 
             # Drop old columns (requires SQLite 3.35.0+)
-            for old_col in cols_to_migrate.values():
+            for old_col in list(cols_to_migrate.values()) + ["dpt_name", "unit"]:
                 try:
                     connection.execute(text(f"ALTER TABLE telegrams DROP COLUMN {old_col}"))
                 except Exception:
                     # Older SQLite versions don't support DROP COLUMN.
                     # We leave them as redundant columns.
+                    pass
+
+        # Drop legacy normalized columns if present
+        for col in ["dpt_name_id", "unit_id", "dpt_name", "unit"]:
+            if col in existing_columns and col not in cols_to_migrate:
+                try:
+                    connection.execute(text(f"ALTER TABLE telegrams DROP COLUMN {col}"))
+                except Exception:
                     pass
 
         # 2. Handle missing columns from intermediate versions (non-normalized ones)

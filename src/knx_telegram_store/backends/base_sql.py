@@ -45,8 +45,6 @@ class BaseSQLStore(TelegramStore):
             Column("destination_id", Integer, nullable=False, index=True),
             Column("telegramtype_id", Integer, nullable=False),
             Column("direction_id", Integer, nullable=False),
-            Column("dpt_name_id", Integer, nullable=True),
-            Column("unit_id", Integer, nullable=True),
             Column("source_name_id", Integer, nullable=True),
             Column("destination_name_id", Integer, nullable=True),
             Column("payload", JSON, nullable=True),
@@ -105,10 +103,6 @@ class BaseSQLStore(TelegramStore):
             pairs.add(("destination", t.destination))
             pairs.add(("telegramtype", t.telegramtype))
             pairs.add(("direction", t.direction))
-            if t.dpt_name:
-                pairs.add(("dpt_name", t.dpt_name))
-            if t.unit:
-                pairs.add(("unit", t.unit))
             pairs.add(("source_name", t.source_name))
             pairs.add(("destination_name", t.destination_name))
 
@@ -124,8 +118,6 @@ class BaseSQLStore(TelegramStore):
                         "destination_id": lookup_ids[("destination", t.destination)],
                         "telegramtype_id": lookup_ids[("telegramtype", t.telegramtype)],
                         "direction_id": lookup_ids[("direction", t.direction)],
-                        "dpt_name_id": lookup_ids.get(("dpt_name", t.dpt_name)) if t.dpt_name else None,
-                        "unit_id": lookup_ids.get(("unit", t.unit)) if t.unit else None,
                         "source_name_id": lookup_ids[("source_name", t.source_name)],
                         "destination_name_id": lookup_ids[("destination_name", t.destination_name)],
                         "payload": t.payload,
@@ -167,8 +159,6 @@ class BaseSQLStore(TelegramStore):
         d_lk = self.string_lookup.alias("d_lk")
         tt_lk = self.string_lookup.alias("tt_lk")
         dir_lk = self.string_lookup.alias("dir_lk")
-        dn_lk = self.string_lookup.alias("dn_lk")
-        u_lk = self.string_lookup.alias("u_lk")
         sn_lk = self.string_lookup.alias("sn_lk")
         den_lk = self.string_lookup.alias("den_lk")
 
@@ -178,8 +168,6 @@ class BaseSQLStore(TelegramStore):
             d_lk.c.value.label("destination"),
             tt_lk.c.value.label("telegramtype"),
             dir_lk.c.value.label("direction"),
-            dn_lk.c.value.label("dpt_name"),
-            u_lk.c.value.label("unit"),
             sn_lk.c.value.label("source_name"),
             den_lk.c.value.label("destination_name"),
             self.telegrams.c.payload,
@@ -194,10 +182,10 @@ class BaseSQLStore(TelegramStore):
         # Joins to lookup table
         stmt = stmt.join(s_lk, and_(s_lk.c.id == self.telegrams.c.source_id, s_lk.c.category == "source"))
         stmt = stmt.join(d_lk, and_(d_lk.c.id == self.telegrams.c.destination_id, d_lk.c.category == "destination"))
-        stmt = stmt.join(tt_lk, and_(tt_lk.c.id == self.telegrams.c.telegramtype_id, tt_lk.c.category == "telegramtype"))
+        stmt = stmt.join(
+            tt_lk, and_(tt_lk.c.id == self.telegrams.c.telegramtype_id, tt_lk.c.category == "telegramtype")
+        )
         stmt = stmt.join(dir_lk, and_(dir_lk.c.id == self.telegrams.c.direction_id, dir_lk.c.category == "direction"))
-        stmt = stmt.outerjoin(dn_lk, and_(dn_lk.c.id == self.telegrams.c.dpt_name_id, dn_lk.c.category == "dpt_name"))
-        stmt = stmt.outerjoin(u_lk, and_(u_lk.c.id == self.telegrams.c.unit_id, u_lk.c.category == "unit"))
         stmt = stmt.outerjoin(
             sn_lk, and_(sn_lk.c.id == self.telegrams.c.source_name_id, sn_lk.c.category == "source_name")
         )
@@ -292,8 +280,6 @@ class BaseSQLStore(TelegramStore):
                 payload=row.payload,
                 dpt_main=row.dpt_main,
                 dpt_sub=row.dpt_sub,
-                dpt_name=row.dpt_name,
-                unit=row.unit,
                 value=row.value,
                 value_numeric=row.value_numeric,
                 raw_data=row.raw_data,
