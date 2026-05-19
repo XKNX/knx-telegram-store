@@ -38,6 +38,9 @@ class PostgresStore(BaseSQLStore):
             # 4. Convert to hypertable (idempotent)
             await conn.execute(text("SELECT create_hypertable('telegrams', 'timestamp', if_not_exists => TRUE)"))
 
+        # 5. Warm the cache
+        await super().initialize()
+
     def _upgrade_schema(self, connection) -> None:
         """Synchronous part of schema upgrade (run via run_sync)."""
         inspector = inspect(connection)
@@ -79,25 +82,76 @@ class PostgresStore(BaseSQLStore):
                         text("ALTER TABLE telegrams ALTER COLUMN raw_data TYPE TEXT USING encode(raw_data, 'hex')")
                     )
 
-        # 2. Ensure all library columns exist
+        cols_to_migrate = {
+            "source": "source",
+            "destination": "destination",
+            "telegramtype": "telegramtype",
+            "direction": "direction",
+            "source_name": "source_name",
+            "destination_name": "destination_name",
+        }
+
+        # 2. Handle normalization to string_lookup
+        if "source" in existing_columns:
+            # Populate string_lookup table
+            for cat, old_col in cols_to_migrate.items():
+                if old_col in existing_columns:
+                    connection.execute(
+                        text(
+                            f"INSERT INTO string_lookup (category, value) "
+                            f"SELECT DISTINCT '{cat}', {old_col} FROM telegrams WHERE {old_col} IS NOT NULL "
+                            f"ON CONFLICT DO NOTHING"
+                        )
+                    )
+
+            # Add *_id columns
+            for cat in cols_to_migrate:
+                id_col = f"{cat}_id"
+                if id_col not in existing_columns:
+                    connection.execute(text(f"ALTER TABLE telegrams ADD COLUMN {id_col} INTEGER"))
+
+            # Update IDs using JOIN
+            for cat, old_col in cols_to_migrate.items():
+                connection.execute(
+                    text(
+                        f"UPDATE telegrams SET {cat}_id = sl.id "
+                        f"FROM string_lookup sl WHERE sl.category='{cat}' AND sl.value=telegrams.{old_col}"
+                    )
+                )
+
+            # Drop old columns
+            for old_col in list(cols_to_migrate.values()) + ["dpt_name", "unit"]:
+                if old_col in existing_columns:
+                    connection.execute(text(f'ALTER TABLE telegrams DROP COLUMN "{old_col}"'))
+
+            # Re-fetch existing columns after drops
+            columns = inspector.get_columns("telegrams")
+            existing_columns = {col["name"] for col in columns}
+
+        # Drop legacy normalized columns if present
+        for col in ["dpt_name_id", "unit_id", "dpt_name", "unit"]:
+            if col in existing_columns and col not in cols_to_migrate:
+                try:
+                    connection.execute(text(f'ALTER TABLE telegrams DROP COLUMN "{col}"'))
+                except Exception:
+                    pass
+
+        # 3. Ensure all non-normalized library columns exist
         expected_columns = {
-            "direction": "VARCHAR(20) DEFAULT 'Incoming'",
             "value": "JSONB",
             "value_numeric": "FLOAT",
             "payload": "JSONB",
-            "dpt_name": "VARCHAR(100)",
-            "unit": "VARCHAR(20)",
             "data_secure": "BOOLEAN",
-            "source_name": "VARCHAR(255) DEFAULT ''",
-            "destination_name": "VARCHAR(255) DEFAULT ''",
+            "dpt_main": "INTEGER",
+            "dpt_sub": "INTEGER",
         }
 
         for col_name, col_type in expected_columns.items():
-            if col_name not in existing_columns:
+            if col_name not in existing_columns and f"{col_name}_id" not in existing_columns:
                 connection.execute(text(f"ALTER TABLE telegrams ADD COLUMN {col_name} {col_type}"))
                 existing_columns.add(col_name)
 
-        # 3. Data migrations for old SpectrumKNX rows
+        # 4. Data migrations for old SpectrumKNX rows
         # Old schema had value_numeric (FLOAT) and value_json (now payload),
         # but no value (JSONB) column. Populate value from value_numeric
         # so the library's query returns it correctly.

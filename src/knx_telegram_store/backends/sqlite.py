@@ -33,23 +33,78 @@ class SqliteStore(BaseSQLStore):
             # 2. Perform column-level upgrades
             await conn.run_sync(self._upgrade_schema)
 
+        # 3. Warm the cache
+        await super().initialize()
+
     def _upgrade_schema(self, connection) -> None:
         """Synchronous part of schema upgrade (run via run_sync)."""
         inspector = inspect(connection)
-        existing_columns = {col["name"] for col in inspector.get_columns("telegrams")}
+        columns = inspector.get_columns("telegrams")
+        existing_columns = {col["name"] for col in columns}
 
-        # Define missing columns that should be added to existing schemas
-        # (e.g. from early SpectrumKNX or HA versions)
+        cols_to_migrate = {
+            "source": "source",
+            "destination": "destination",
+            "telegramtype": "telegramtype",
+            "direction": "direction",
+            "source_name": "source_name",
+            "destination_name": "destination_name",
+        }
+
+        # 1. Detect if we are on the legacy (pre-normalized) schema
+        if "source" in existing_columns:
+            # Populate string_lookup table
+            for cat, old_col in cols_to_migrate.items():
+                if old_col in existing_columns:
+                    connection.execute(
+                        text(
+                            f"INSERT OR IGNORE INTO string_lookup (category, value) "
+                            f"SELECT DISTINCT '{cat}', CAST({old_col} AS TEXT) FROM telegrams WHERE {old_col} IS NOT NULL"
+                        )
+                    )
+
+            # Add *_id columns
+            for cat in cols_to_migrate:
+                id_col = f"{cat}_id"
+                if id_col not in existing_columns:
+                    connection.execute(text(f"ALTER TABLE telegrams ADD COLUMN {id_col} INTEGER"))
+
+            # Update IDs
+            for cat, old_col in cols_to_migrate.items():
+                connection.execute(
+                    text(
+                        f"UPDATE telegrams SET {cat}_id = ("
+                        f"SELECT id FROM string_lookup WHERE category='{cat}' AND value=CAST(telegrams.{old_col} AS TEXT))"
+                    )
+                )
+
+            # Drop old columns (requires SQLite 3.35.0+)
+            for old_col in list(cols_to_migrate.values()) + ["dpt_name", "unit"]:
+                try:
+                    connection.execute(text(f"ALTER TABLE telegrams DROP COLUMN {old_col}"))
+                except Exception:
+                    # Older SQLite versions don't support DROP COLUMN.
+                    # We leave them as redundant columns.
+                    pass
+
+        # Drop legacy normalized columns if present
+        for col in ["dpt_name_id", "unit_id", "dpt_name", "unit"]:
+            if col in existing_columns and col not in cols_to_migrate:
+                try:
+                    connection.execute(text(f"ALTER TABLE telegrams DROP COLUMN {col}"))
+                except Exception:
+                    pass
+
+        # 2. Handle missing columns from intermediate versions (non-normalized ones)
         expected_columns = {
-            "direction": "VARCHAR(20) DEFAULT ''",
             "payload": "JSON",
-            "dpt_name": "VARCHAR(100)",
-            "unit": "VARCHAR(20)",
+            "dpt_main": "INTEGER",
+            "dpt_sub": "INTEGER",
+            "value": "JSON",
+            "value_numeric": "DOUBLE",
             "data_secure": "BOOLEAN",
-            "source_name": "VARCHAR(255) DEFAULT ''",
-            "destination_name": "VARCHAR(255) DEFAULT ''",
         }
 
         for col_name, col_type in expected_columns.items():
-            if col_name not in existing_columns:
+            if col_name not in existing_columns and f"{col_name}_id" not in existing_columns:
                 connection.execute(text(f"ALTER TABLE telegrams ADD COLUMN {col_name} {col_type}"))

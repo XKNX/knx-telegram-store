@@ -26,8 +26,6 @@ class StoredTelegram:
     # ── DPT metadata ─────────────────────────────────────────────
     dpt_main: int | None = None
     dpt_sub: int | None = None
-    dpt_name: str | None = None
-    unit: str | None = None
 
     # ── Decoded value (consumer-enriched at write time) ───────────
     value: bool | str | int | float | dict[str, Any] | None = None

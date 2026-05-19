@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from abc import abstractmethod
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -13,7 +12,6 @@ from sqlalchemy import (
     Double,
     Integer,
     MetaData,
-    String,
     Table,
     Text,
     and_,
@@ -22,6 +20,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from ..lookup import LookupCache, build_lookup_table
 from ..model import StoredTelegram
 from ..query import TelegramQuery, TelegramQueryResult
 from ..store import StoreCapabilities, TelegramStore
@@ -35,25 +34,26 @@ class BaseSQLStore(TelegramStore):
         self.engine = engine
         self._retention_days = retention_days
         self._metadata = MetaData()
+        self._lookup_cache = LookupCache()
+        self.string_lookup = build_lookup_table(self._metadata)
+
         self.telegrams = Table(
             "telegrams",
             self._metadata,
             Column("timestamp", DateTime(timezone=True), nullable=False, index=True),
-            Column("source", String(20), nullable=False),
-            Column("destination", String(20), nullable=False, index=True),
-            Column("telegramtype", String(50), nullable=False),
-            Column("direction", String(20), nullable=False, server_default=""),
+            Column("source_id", Integer, nullable=False),
+            Column("destination_id", Integer, nullable=False, index=True),
+            Column("telegramtype_id", Integer, nullable=False),
+            Column("direction_id", Integer, nullable=False),
+            Column("source_name_id", Integer, nullable=True),
+            Column("destination_name_id", Integer, nullable=True),
             Column("payload", JSON, nullable=True),
             Column("dpt_main", Integer, nullable=True),
             Column("dpt_sub", Integer, nullable=True),
-            Column("dpt_name", String(100), nullable=True),
-            Column("unit", String(20), nullable=True),
             Column("value", JSON, nullable=True),
             Column("value_numeric", Double, nullable=True),
             Column("raw_data", Text, nullable=True),  # Hex encoded string
             Column("data_secure", Boolean, nullable=True),
-            Column("source_name", String(255), server_default=""),
-            Column("destination_name", String(255), server_default=""),
         )
         self._capabilities = StoreCapabilities(
             supports_time_range=True,
@@ -78,9 +78,10 @@ class BaseSQLStore(TelegramStore):
         """SQL stores are typically not limited by count."""
         return None
 
-    @abstractmethod
     async def initialize(self) -> None:
         """Set up the store (create tables, upgrades)."""
+        # Subclasses should call this or implement their own with super().initialize()
+        await self._lookup_cache.warm(self.engine, self.string_lookup)
 
     async def close(self) -> None:
         """Close the engine."""
@@ -95,29 +96,40 @@ class BaseSQLStore(TelegramStore):
         if not telegrams:
             return
 
-        values = [
-            {
-                "timestamp": t.timestamp,
-                "source": t.source,
-                "destination": t.destination,
-                "telegramtype": t.telegramtype,
-                "direction": t.direction,
-                "payload": t.payload,
-                "dpt_main": t.dpt_main,
-                "dpt_sub": t.dpt_sub,
-                "dpt_name": t.dpt_name,
-                "unit": t.unit,
-                "value": t.value,
-                "value_numeric": t.value_numeric,
-                "raw_data": t.raw_data,
-                "data_secure": t.data_secure,
-                "source_name": t.source_name,
-                "destination_name": t.destination_name,
-            }
-            for t in telegrams
-        ]
+        # 1. Resolve lookup IDs
+        pairs: set[tuple[str, str]] = set()
+        for t in telegrams:
+            pairs.add(("source", t.source))
+            pairs.add(("destination", t.destination))
+            pairs.add(("telegramtype", t.telegramtype))
+            pairs.add(("direction", t.direction))
+            pairs.add(("source_name", t.source_name))
+            pairs.add(("destination_name", t.destination_name))
 
         async with self.engine.begin() as conn:
+            lookup_ids = await self._lookup_cache.get_or_create_ids(conn, self.string_lookup, pairs)
+
+            values = []
+            for t in telegrams:
+                values.append(
+                    {
+                        "timestamp": t.timestamp,
+                        "source_id": lookup_ids[("source", t.source)],
+                        "destination_id": lookup_ids[("destination", t.destination)],
+                        "telegramtype_id": lookup_ids[("telegramtype", t.telegramtype)],
+                        "direction_id": lookup_ids[("direction", t.direction)],
+                        "source_name_id": lookup_ids[("source_name", t.source_name)],
+                        "destination_name_id": lookup_ids[("destination_name", t.destination_name)],
+                        "payload": t.payload,
+                        "dpt_main": t.dpt_main,
+                        "dpt_sub": t.dpt_sub,
+                        "value": t.value,
+                        "value_numeric": t.value_numeric,
+                        "raw_data": t.raw_data,
+                        "data_secure": t.data_secure,
+                    }
+                )
+
             await conn.execute(self.telegrams.insert(), values)
 
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
@@ -142,18 +154,68 @@ class BaseSQLStore(TelegramStore):
 
     async def query(self, query: TelegramQuery) -> TelegramQueryResult:
         """Retrieve telegrams matching the given query."""
-        stmt = select(self.telegrams)
+        # Aliases for lookup JOINs
+        s_lk = self.string_lookup.alias("s_lk")
+        d_lk = self.string_lookup.alias("d_lk")
+        tt_lk = self.string_lookup.alias("tt_lk")
+        dir_lk = self.string_lookup.alias("dir_lk")
+        sn_lk = self.string_lookup.alias("sn_lk")
+        den_lk = self.string_lookup.alias("den_lk")
+
+        stmt = select(
+            self.telegrams.c.timestamp,
+            s_lk.c.value.label("source"),
+            d_lk.c.value.label("destination"),
+            tt_lk.c.value.label("telegramtype"),
+            dir_lk.c.value.label("direction"),
+            sn_lk.c.value.label("source_name"),
+            den_lk.c.value.label("destination_name"),
+            self.telegrams.c.payload,
+            self.telegrams.c.dpt_main,
+            self.telegrams.c.dpt_sub,
+            self.telegrams.c.value,
+            self.telegrams.c.value_numeric,
+            self.telegrams.c.raw_data,
+            self.telegrams.c.data_secure,
+        )
+
+        # Joins to lookup table
+        stmt = stmt.join(s_lk, and_(s_lk.c.id == self.telegrams.c.source_id, s_lk.c.category == "source"))
+        stmt = stmt.join(d_lk, and_(d_lk.c.id == self.telegrams.c.destination_id, d_lk.c.category == "destination"))
+        stmt = stmt.join(
+            tt_lk, and_(tt_lk.c.id == self.telegrams.c.telegramtype_id, tt_lk.c.category == "telegramtype")
+        )
+        stmt = stmt.join(dir_lk, and_(dir_lk.c.id == self.telegrams.c.direction_id, dir_lk.c.category == "direction"))
+        stmt = stmt.outerjoin(
+            sn_lk, and_(sn_lk.c.id == self.telegrams.c.source_name_id, sn_lk.c.category == "source_name")
+        )
+        stmt = stmt.outerjoin(
+            den_lk, and_(den_lk.c.id == self.telegrams.c.destination_name_id, den_lk.c.category == "destination_name")
+        )
 
         # 1. Base Filters
         filters: list[Any] = []
         if query.sources:
-            filters.append(self.telegrams.c.source.in_(query.sources))
+            # Subquery to get IDs for sources
+            source_ids = select(self.string_lookup.c.id).where(
+                self.string_lookup.c.category == "source", self.string_lookup.c.value.in_(query.sources)
+            )
+            filters.append(self.telegrams.c.source_id.in_(source_ids))
         if query.destinations:
-            filters.append(self.telegrams.c.destination.in_(query.destinations))
+            dest_ids = select(self.string_lookup.c.id).where(
+                self.string_lookup.c.category == "destination", self.string_lookup.c.value.in_(query.destinations)
+            )
+            filters.append(self.telegrams.c.destination_id.in_(dest_ids))
         if query.telegram_types:
-            filters.append(self.telegrams.c.telegramtype.in_(query.telegram_types))
+            tt_ids = select(self.string_lookup.c.id).where(
+                self.string_lookup.c.category == "telegramtype", self.string_lookup.c.value.in_(query.telegram_types)
+            )
+            filters.append(self.telegrams.c.telegramtype_id.in_(tt_ids))
         if query.directions:
-            filters.append(self.telegrams.c.direction.in_(query.directions))
+            dir_ids = select(self.string_lookup.c.id).where(
+                self.string_lookup.c.category == "direction", self.string_lookup.c.value.in_(query.directions)
+            )
+            filters.append(self.telegrams.c.direction_id.in_(dir_ids))
         if query.dpt_mains:
             filters.append(self.telegrams.c.dpt_main.in_(query.dpt_mains))
 
@@ -186,7 +248,7 @@ class BaseSQLStore(TelegramStore):
                 )
 
             # Use EXISTS to find rows within range of any pivot
-            stmt = select(self.telegrams).where(select(pivots).where(cond).exists())
+            stmt = stmt.where(select(pivots).where(cond).exists())
         else:
             if filters:
                 stmt = stmt.where(and_(*filters))
@@ -218,14 +280,12 @@ class BaseSQLStore(TelegramStore):
                 payload=row.payload,
                 dpt_main=row.dpt_main,
                 dpt_sub=row.dpt_sub,
-                dpt_name=row.dpt_name,
-                unit=row.unit,
                 value=row.value,
                 value_numeric=row.value_numeric,
                 raw_data=row.raw_data,
                 data_secure=row.data_secure,
-                source_name=row.source_name,
-                destination_name=row.destination_name,
+                source_name=row.source_name or "",
+                destination_name=row.destination_name or "",
             )
             for row in rows
         ]
