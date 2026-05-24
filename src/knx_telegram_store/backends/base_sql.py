@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from ..lookup import LookupCache, build_lookup_table
 from ..model import StoredTelegram
 from ..query import TelegramQuery, TelegramQueryResult
-from ..store import StoreCapabilities, TelegramStore
+from ..store import StoreCapabilities, TelegramStore, wrap_store_errors
 
 
 class BaseSQLStore(TelegramStore):
@@ -97,20 +97,24 @@ class BaseSQLStore(TelegramStore):
         """SQL stores are typically not limited by count."""
         return None
 
+    @wrap_store_errors
     async def initialize(self) -> None:
         """Set up the store (create tables, upgrades)."""
         # Subclasses should call this or implement their own with super().initialize()
         await self._lookup_cache.warm(self.engine, self.string_lookup)
         await self._populate_last_ga_telegrams_if_empty()
 
+    @wrap_store_errors
     async def close(self) -> None:
         """Close the engine."""
         await self.engine.dispose()
 
+    @wrap_store_errors
     async def store(self, telegram: StoredTelegram) -> None:
         """Persist a single telegram."""
         await self.store_many([telegram])
 
+    @wrap_store_errors
     async def store_many(self, telegrams: Sequence[StoredTelegram]) -> None:
         """Persist multiple telegrams."""
         if not telegrams:
@@ -185,6 +189,7 @@ class BaseSQLStore(TelegramStore):
                     )
                     await conn.execute(pg_upsert)
 
+    @wrap_store_errors
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
         """Delete all telegrams with timestamp < cutoff."""
         if dry_run:
@@ -197,6 +202,7 @@ class BaseSQLStore(TelegramStore):
             result = await conn.execute(delete_stmt)
             return result.rowcount
 
+    @wrap_store_errors
     async def evict_expired(self, *, dry_run: bool = False) -> int:
         """Delete telegrams older than the configured retention period."""
         if self._retention_days is None:
@@ -205,6 +211,7 @@ class BaseSQLStore(TelegramStore):
         cutoff = datetime.now(UTC) - timedelta(days=self._retention_days)
         return await self.evict_older_than(cutoff, dry_run=dry_run)
 
+    @wrap_store_errors
     async def query(self, query: TelegramQuery) -> TelegramQueryResult:
         """Retrieve telegrams matching the given query."""
         # Aliases for lookup JOINs
@@ -351,17 +358,20 @@ class BaseSQLStore(TelegramStore):
             limit_reached=limit_reached,
         )
 
+    @wrap_store_errors
     async def count(self) -> int:
         """Return the total number of stored telegrams."""
         async with self.engine.connect() as conn:
             return await conn.scalar(select(func.count()).select_from(self.telegrams)) or 0
 
+    @wrap_store_errors
     async def clear(self) -> None:
         """Remove all stored telegrams."""
         async with self.engine.begin() as conn:
             await conn.execute(self.telegrams.delete())
             await conn.execute(self.last_ga_telegrams.delete())
 
+    @wrap_store_errors
     async def get_last_unique_telegrams(self) -> list[StoredTelegram]:
         """Retrieve the latest unique telegram for each destination group address."""
         s_lk = self.string_lookup.alias("s_lk")

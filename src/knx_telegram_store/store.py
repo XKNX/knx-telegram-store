@@ -1,12 +1,36 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from functools import wraps
+from typing import Any, ParamSpec, TypeVar
 
 from .model import StoredTelegram
 from .query import TelegramQuery, TelegramQueryResult
+
+P = ParamSpec("P")
+T = TypeVar("T")
+
+
+class KnxTelegramStoreException(Exception):
+    """Base exception for all KNX telegram store operations."""
+
+
+def wrap_store_errors(func: Callable[P, Awaitable[T]]) -> Callable[P, Coroutine[Any, Any, T]]:  # noqa: UP047
+    """Wrap any exception thrown by a store operation in KnxTelegramStoreException."""
+
+    @wraps(func)
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        try:
+            return await func(*args, **kwargs)
+        except KnxTelegramStoreException:
+            raise
+        except Exception as err:
+            raise KnxTelegramStoreException(f"Database error during {func.__name__}: {err}") from err
+
+    return wrapper
 
 
 @dataclass(frozen=True, slots=True)

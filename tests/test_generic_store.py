@@ -236,3 +236,45 @@ async def test_get_last_unique_telegrams(store, sample_telegrams):
 
     assert dest_map["1/1/1"].value == 22.5
     assert dest_map["1/1/2"].value is None
+
+
+@pytest.mark.asyncio
+async def test_exception_wrapping(store):
+    """Test that underlying database/engine exceptions are wrapped in KnxTelegramStoreException."""
+    from unittest.mock import patch
+
+    from knx_telegram_store import KnxTelegramStoreException
+
+    # We mock an internal operation to throw a DB API or raw ValueError/AttributeError
+    # which is not already a KnxTelegramStoreException.
+    if hasattr(store, "engine"):
+        # For SQL stores
+        with patch.object(store._lookup_cache, "get_or_create_ids", side_effect=ValueError("Simulated DB Crash")):
+            with pytest.raises(KnxTelegramStoreException) as exc_info:
+                await store.store(
+                    StoredTelegram(
+                        timestamp=datetime.now(UTC),
+                        source="1.1.1",
+                        destination="1/1/1",
+                        telegramtype="GroupValueWrite",
+                        direction="Incoming",
+                        value=20.0,
+                    )
+                )
+            assert "Simulated DB Crash" in str(exc_info.value)
+    else:
+        # For MemoryStore
+        with patch.object(store, "_telegrams", new=None):
+            with pytest.raises(KnxTelegramStoreException) as exc_info:
+                await store.store(
+                    StoredTelegram(
+                        timestamp=datetime.now(UTC),
+                        source="1.1.1",
+                        destination="1/1/1",
+                        telegramtype="GroupValueWrite",
+                        direction="Incoming",
+                        value=20.0,
+                    )
+                )
+            # AttributeError should be raised and wrapped
+            assert "Database error during store" in str(exc_info.value)

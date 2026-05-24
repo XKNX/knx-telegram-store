@@ -8,6 +8,7 @@ from .backends.postgres import PostgresStore
 from .backends.sqlite import SqliteStore
 from .model import StoredTelegram
 from .query import TelegramQuery, TelegramQueryResult
+from .store import wrap_store_errors
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ class _BufferMixin:
             return
         self._flush_task = asyncio.create_task(self._flush_loop())
 
+    @wrap_store_errors
     async def stop(self) -> None:
         """Stop the periodic flush task, perform a final flush, then close."""
         self._closing = True
@@ -73,6 +75,7 @@ class _BufferMixin:
 
     # --- Write path ---
 
+    @wrap_store_errors
     async def store(self, telegram: StoredTelegram) -> None:
         """Append a telegram to the buffer (non-blocking, no I/O)."""
         if self._closing:
@@ -102,6 +105,7 @@ class _BufferMixin:
             # Re-prepend the batch so it's retried before any newer items
             self._buffer[0:0] = batch
 
+    @wrap_store_errors
     async def flush(self) -> None:
         """Flush the buffer now and reset the periodic timer.
 
@@ -117,6 +121,7 @@ class _BufferMixin:
 
     # --- Read path override (flush_first support) ---
 
+    @wrap_store_errors
     async def query(self, query: TelegramQuery, *, flush_first: bool = False) -> TelegramQueryResult:
         """Query the store.
 
@@ -131,6 +136,7 @@ class _BufferMixin:
             await self.flush()
         return await super().query(query)  # type: ignore[misc, no-any-return]
 
+    @wrap_store_errors
     async def get_last_unique_telegrams(self) -> list[StoredTelegram]:
         """Retrieve the latest unique telegram for each destination group address."""
         await self.flush()
@@ -138,6 +144,7 @@ class _BufferMixin:
 
     # --- Clear overrride (wipe buffer + table) ---
 
+    @wrap_store_errors
     async def clear(self) -> None:
         """Clear both the in-memory buffer and the underlying table."""
         self._buffer.clear()

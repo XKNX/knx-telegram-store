@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 from ..model import StoredTelegram
 from ..query import TelegramQuery, TelegramQueryResult
-from ..store import StoreCapabilities, TelegramStore
+from ..store import StoreCapabilities, TelegramStore, wrap_store_errors
 
 
 class MemoryStore(TelegramStore):
@@ -39,20 +39,25 @@ class MemoryStore(TelegramStore):
         """Return the configured maximum number of telegrams."""
         return self._max_telegrams
 
+    @wrap_store_errors
     async def initialize(self) -> None:
         """Set up the store. Idempotent."""
 
+    @wrap_store_errors
     async def close(self) -> None:
         """Tear down the store."""
 
+    @wrap_store_errors
     async def store(self, telegram: StoredTelegram) -> None:
         """Persist a single telegram."""
         self._telegrams.append(telegram)
 
+    @wrap_store_errors
     async def store_many(self, telegrams: Sequence[StoredTelegram]) -> None:
         """Persist multiple telegrams in a single batch."""
         self._telegrams.extend(telegrams)
 
+    @wrap_store_errors
     async def query(self, query: TelegramQuery) -> TelegramQueryResult:
         """Retrieve telegrams matching the given query."""
         results = list(self._telegrams)
@@ -110,18 +115,22 @@ class MemoryStore(TelegramStore):
             limit_reached=limit_reached,
         )
 
+    @wrap_store_errors
     async def count(self) -> int:
         """Return the total number of stored telegrams."""
         return len(self._telegrams)
 
+    @wrap_store_errors
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
         """Memory store uses max_telegrams for pruning."""
         return 0
 
+    @wrap_store_errors
     async def evict_expired(self, *, dry_run: bool = False) -> int:
         """Memory store uses max_telegrams for pruning."""
         return 0
 
+    @wrap_store_errors
     async def get_last_unique_telegrams(self) -> list[StoredTelegram]:
         """Retrieve the latest unique telegram for each destination group address."""
         last_ga: dict[str, StoredTelegram] = {}
@@ -129,6 +138,7 @@ class MemoryStore(TelegramStore):
             last_ga[t.destination] = t
         return list(last_ga.values())
 
+    @wrap_store_errors
     async def clear(self) -> None:
         """Remove all stored telegrams."""
         self._telegrams.clear()
