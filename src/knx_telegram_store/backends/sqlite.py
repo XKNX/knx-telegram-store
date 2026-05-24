@@ -110,3 +110,35 @@ class SqliteStore(BaseSQLStore):
         for col_name, col_type in expected_columns.items():
             if col_name not in existing_columns and f"{col_name}_id" not in existing_columns:
                 connection.execute(text(f"ALTER TABLE telegrams ADD COLUMN {col_name} {col_type}"))
+
+    def _needs_migration_sync(self, connection) -> bool:
+        """Synchronously check if legacy SQLite schema migration is required."""
+        inspector = inspect(connection)
+        if not inspector.has_table("telegrams"):
+            return False
+        columns = inspector.get_columns("telegrams")
+        existing_columns = {col["name"] for col in columns}
+
+        # 1. Pre-normalized legacy schema needs migration
+        if "source" in existing_columns:
+            return True
+
+        # 2. Missing columns from intermediate/non-normalized versions
+        expected_columns = {
+            "payload",
+            "dpt_main",
+            "dpt_sub",
+            "value",
+            "value_numeric",
+            "data_secure",
+        }
+        for col_name in expected_columns:
+            if col_name not in existing_columns and f"{col_name}_id" not in existing_columns:
+                return True
+
+        # 3. Drop legacy columns
+        for col in ["dpt_name_id", "unit_id", "dpt_name", "unit"]:
+            if col in existing_columns:
+                return True
+
+        return False

@@ -97,7 +97,9 @@ async def test_sqlite_migration(old_schema_db):
 
     # 2. Use new SqliteStore to initialize and migrate
     store = SqliteStore(db_path)
+    assert await store.needs_migration() is True
     await store.initialize()
+    assert await store.needs_migration() is False
 
     # 3. Verify data via query (transparent)
     result = await store.query(TelegramQuery(order_descending=False))

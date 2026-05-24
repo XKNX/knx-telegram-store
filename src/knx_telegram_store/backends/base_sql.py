@@ -98,6 +98,16 @@ class BaseSQLStore(TelegramStore):
         return None
 
     @wrap_store_errors
+    async def needs_migration(self) -> bool:
+        """Check if any schema upgrades or migrations are pending."""
+        async with self.engine.connect() as conn:
+            return await conn.run_sync(self._needs_migration_sync)
+
+    def _needs_migration_sync(self, connection) -> bool:
+        """Synchronously check if schema upgrades or legacy migrations are required."""
+        return False
+
+    @wrap_store_errors
     async def initialize(self) -> None:
         """Set up the store (create tables, upgrades)."""
         # Subclasses should call this or implement their own with super().initialize()

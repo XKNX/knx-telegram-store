@@ -173,3 +173,67 @@ class PostgresStore(BaseSQLStore):
                     "WHERE value_numeric IS NULL AND value_legacy_float IS NOT NULL"
                 )
             )
+
+    def _needs_migration_sync(self, connection) -> bool:
+        """Synchronously check if legacy Postgres schema migration is required."""
+        inspector = inspect(connection)
+        try:
+            columns = inspector.get_columns("telegrams")
+        except Exception:
+            return False
+        existing_columns = {col["name"] for col in columns}
+
+        # 1. Handle renames from legacy SpectrumKNX schema
+        renames = {
+            "source_address",
+            "target_address",
+            "telegram_type",
+            "value_json",
+        }
+        for old in renames:
+            if old in existing_columns:
+                return True
+
+        # Special value float rename check
+        if "value" in existing_columns:
+            is_float = any(c["name"] == "value" and "double" in str(c["type"]).lower() for c in columns)
+            if is_float:
+                return True
+
+        # raw_data bytea check
+        if "raw_data" in existing_columns:
+            for col in columns:
+                if col["name"] == "raw_data" and "bytea" in str(col["type"]).lower():
+                    return True
+
+        # 2. Handle normalization to string_lookup
+        if "source" in existing_columns:
+            return True
+
+        # Add *_id columns
+        cols_to_migrate = [
+            "source_id",
+            "destination_id",
+            "telegramtype_id",
+            "direction_id",
+            "source_name_id",
+            "destination_name_id",
+        ]
+        for col_id in cols_to_migrate:
+            if col_id not in existing_columns:
+                return True
+
+        # Missing columns
+        expected_columns = {
+            "payload",
+            "dpt_main",
+            "dpt_sub",
+            "value",
+            "value_numeric",
+            "data_secure",
+        }
+        for col_name in expected_columns:
+            if col_name not in existing_columns:
+                return True
+
+        return False

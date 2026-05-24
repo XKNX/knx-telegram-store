@@ -62,6 +62,10 @@ class TelegramStore(ABC):
     def capabilities(self) -> StoreCapabilities:
         """Return the capabilities of this backend."""
 
+    async def needs_migration(self) -> bool:
+        """Return True if the store requires a database schema migration/upgrade."""
+        return False
+
     @abstractmethod
     async def initialize(self) -> None:
         """Set up the store (create tables, open connections, etc.).
