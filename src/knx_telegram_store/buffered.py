@@ -131,6 +131,11 @@ class _BufferMixin:
             await self.flush()
         return await super().query(query)  # type: ignore[misc, no-any-return]
 
+    async def get_last_unique_telegrams(self) -> list[StoredTelegram]:
+        """Retrieve the latest unique telegram for each destination group address."""
+        await self.flush()
+        return await super().get_last_unique_telegrams()  # type: ignore[misc, no-any-return]
+
     # --- Clear overrride (wipe buffer + table) ---
 
     async def clear(self) -> None:
