@@ -87,6 +87,10 @@ class TelegramStore(ABC):
         Returns count of (would-be) deleted rows.
         """
 
+    @abstractmethod
+    async def get_last_unique_telegrams(self) -> list[StoredTelegram]:
+        """Retrieve the latest unique telegram for each destination group address."""
+
     async def clear(self) -> None:
         """Remove all stored telegrams.
 

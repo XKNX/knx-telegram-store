@@ -55,6 +55,25 @@ class BaseSQLStore(TelegramStore):
             Column("raw_data", Text, nullable=True),  # Hex encoded string
             Column("data_secure", Boolean, nullable=True),
         )
+        self.last_ga_telegrams = Table(
+            "last_ga_telegrams",
+            self._metadata,
+            Column("destination_id", Integer, primary_key=True),
+            Column("timestamp", DateTime(timezone=True), nullable=False),
+            Column("source_id", Integer, nullable=False),
+            Column("telegramtype_id", Integer, nullable=False),
+            Column("direction_id", Integer, nullable=False),
+            Column("source_name_id", Integer, nullable=True),
+            Column("destination_name_id", Integer, nullable=True),
+            Column("payload", JSON, nullable=True),
+            Column("dpt_main", Integer, nullable=True),
+            Column("dpt_sub", Integer, nullable=True),
+            Column("value", JSON, nullable=True),
+            Column("value_numeric", Double, nullable=True),
+            Column("raw_data", Text, nullable=True),
+            Column("data_secure", Boolean, nullable=True),
+        )
+
         self._capabilities = StoreCapabilities(
             supports_time_range=True,
             supports_time_delta=True,
@@ -82,6 +101,7 @@ class BaseSQLStore(TelegramStore):
         """Set up the store (create tables, upgrades)."""
         # Subclasses should call this or implement their own with super().initialize()
         await self._lookup_cache.warm(self.engine, self.string_lookup)
+        await self._populate_last_ga_telegrams_if_empty()
 
     async def close(self) -> None:
         """Close the engine."""
@@ -131,6 +151,39 @@ class BaseSQLStore(TelegramStore):
                 )
 
             await conn.execute(self.telegrams.insert(), values)
+
+            # 2. Update last_ga_telegrams with the latest telegram for each unique destination_id in the batch
+            from typing import cast
+
+            latest_per_destination: dict[int, dict[str, Any]] = {}
+            for val in values:
+                dest_id: int = cast(int, val["destination_id"])
+                if (
+                    dest_id not in latest_per_destination
+                    or val["timestamp"] > latest_per_destination[dest_id]["timestamp"]
+                ):
+                    latest_per_destination[dest_id] = val
+
+            upsert_values = list(latest_per_destination.values())
+            if upsert_values:
+                if self.engine.dialect.name == "sqlite":
+                    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+                    sqlite_stmt = sqlite_insert(self.last_ga_telegrams).values(upsert_values)
+                    sqlite_upsert = sqlite_stmt.on_conflict_do_update(
+                        index_elements=["destination_id"],
+                        set_={col: sqlite_stmt.excluded[col] for col in upsert_values[0] if col != "destination_id"},
+                    )
+                    await conn.execute(sqlite_upsert)
+                else:
+                    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                    pg_stmt = pg_insert(self.last_ga_telegrams).values(upsert_values)
+                    pg_upsert = pg_stmt.on_conflict_do_update(
+                        index_elements=["destination_id"],
+                        set_={col: pg_stmt.excluded[col] for col in upsert_values[0] if col != "destination_id"},
+                    )
+                    await conn.execute(pg_upsert)
 
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
         """Delete all telegrams with timestamp < cutoff."""
@@ -307,3 +360,121 @@ class BaseSQLStore(TelegramStore):
         """Remove all stored telegrams."""
         async with self.engine.begin() as conn:
             await conn.execute(self.telegrams.delete())
+            await conn.execute(self.last_ga_telegrams.delete())
+
+    async def get_last_unique_telegrams(self) -> list[StoredTelegram]:
+        """Retrieve the latest unique telegram for each destination group address."""
+        s_lk = self.string_lookup.alias("s_lk")
+        d_lk = self.string_lookup.alias("d_lk")
+        tt_lk = self.string_lookup.alias("tt_lk")
+        dir_lk = self.string_lookup.alias("dir_lk")
+        sn_lk = self.string_lookup.alias("sn_lk")
+        den_lk = self.string_lookup.alias("den_lk")
+
+        stmt = select(
+            self.last_ga_telegrams.c.timestamp,
+            s_lk.c.value.label("source"),
+            d_lk.c.value.label("destination"),
+            tt_lk.c.value.label("telegramtype"),
+            dir_lk.c.value.label("direction"),
+            sn_lk.c.value.label("source_name"),
+            den_lk.c.value.label("destination_name"),
+            self.last_ga_telegrams.c.payload,
+            self.last_ga_telegrams.c.dpt_main,
+            self.last_ga_telegrams.c.dpt_sub,
+            self.last_ga_telegrams.c.value,
+            self.last_ga_telegrams.c.value_numeric,
+            self.last_ga_telegrams.c.raw_data,
+            self.last_ga_telegrams.c.data_secure,
+        )
+
+        # Joins to lookup table
+        stmt = stmt.join(s_lk, and_(s_lk.c.id == self.last_ga_telegrams.c.source_id, s_lk.c.category == "source"))
+        stmt = stmt.join(
+            d_lk, and_(d_lk.c.id == self.last_ga_telegrams.c.destination_id, d_lk.c.category == "destination")
+        )
+        stmt = stmt.join(
+            tt_lk, and_(tt_lk.c.id == self.last_ga_telegrams.c.telegramtype_id, tt_lk.c.category == "telegramtype")
+        )
+        stmt = stmt.join(
+            dir_lk, and_(dir_lk.c.id == self.last_ga_telegrams.c.direction_id, dir_lk.c.category == "direction")
+        )
+        stmt = stmt.outerjoin(
+            sn_lk, and_(sn_lk.c.id == self.last_ga_telegrams.c.source_name_id, sn_lk.c.category == "source_name")
+        )
+        stmt = stmt.outerjoin(
+            den_lk,
+            and_(den_lk.c.id == self.last_ga_telegrams.c.destination_name_id, den_lk.c.category == "destination_name"),
+        )
+
+        async with self.engine.connect() as conn:
+            result = await conn.execute(stmt)
+            rows = result.fetchall()
+
+        return [
+            StoredTelegram(
+                timestamp=row.timestamp,
+                source=row.source,
+                destination=row.destination,
+                telegramtype=row.telegramtype,
+                direction=row.direction,
+                payload=row.payload,
+                dpt_main=row.dpt_main,
+                dpt_sub=row.dpt_sub,
+                value=row.value,
+                value_numeric=row.value_numeric,
+                raw_data=row.raw_data,
+                data_secure=row.data_secure,
+                source_name=row.source_name or "",
+                destination_name=row.destination_name or "",
+            )
+            for row in rows
+        ]
+
+    async def _populate_last_ga_telegrams_if_empty(self) -> None:
+        """Populate the last_ga_telegrams table from telegrams if it is empty."""
+        async with self.engine.begin() as conn:
+            count = await conn.scalar(select(func.count()).select_from(self.last_ga_telegrams))
+            if count == 0:
+                t2 = self.telegrams.alias("t2")
+                subq = (
+                    select(func.max(t2.c.timestamp))
+                    .where(t2.c.destination_id == self.telegrams.c.destination_id)
+                    .scalar_subquery()
+                )
+
+                select_stmt = select(
+                    self.telegrams.c.destination_id,
+                    self.telegrams.c.timestamp,
+                    self.telegrams.c.source_id,
+                    self.telegrams.c.telegramtype_id,
+                    self.telegrams.c.direction_id,
+                    self.telegrams.c.source_name_id,
+                    self.telegrams.c.destination_name_id,
+                    self.telegrams.c.payload,
+                    self.telegrams.c.dpt_main,
+                    self.telegrams.c.dpt_sub,
+                    self.telegrams.c.value,
+                    self.telegrams.c.value_numeric,
+                    self.telegrams.c.raw_data,
+                    self.telegrams.c.data_secure,
+                ).where(self.telegrams.c.timestamp == subq)
+
+                if self.engine.dialect.name == "sqlite":
+                    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+                    sqlite_stmt = (
+                        sqlite_insert(self.last_ga_telegrams)
+                        .from_select([c.name for c in select_stmt.selected_columns], select_stmt)
+                        .on_conflict_do_nothing()
+                    )
+                    await conn.execute(sqlite_stmt)
+                else:
+                    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                    pg_stmt = (
+                        pg_insert(self.last_ga_telegrams)
+                        .from_select([c.name for c in select_stmt.selected_columns], select_stmt)
+                        .on_conflict_do_nothing()
+                    )
+                    await conn.execute(pg_stmt)

@@ -122,6 +122,13 @@ class MemoryStore(TelegramStore):
         """Memory store uses max_telegrams for pruning."""
         return 0
 
+    async def get_last_unique_telegrams(self) -> list[StoredTelegram]:
+        """Retrieve the latest unique telegram for each destination group address."""
+        last_ga: dict[str, StoredTelegram] = {}
+        for t in self._telegrams:
+            last_ga[t.destination] = t
+        return list(last_ga.values())
+
     async def clear(self) -> None:
         """Remove all stored telegrams."""
         self._telegrams.clear()

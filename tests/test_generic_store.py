@@ -217,3 +217,22 @@ async def test_evict_no_retention(store):
     # Memory store has no retention_days configured in conftest
     if store.capabilities.max_storage is not None:
         assert await store.evict_expired() == 0
+
+
+@pytest.mark.asyncio
+async def test_get_last_unique_telegrams(store, sample_telegrams):
+    """Test get_last_unique_telegrams method."""
+    await store.store_many(sample_telegrams)
+    result = await store.get_last_unique_telegrams()
+
+    # destinations: "1/1/1" has 3 telegrams, "1/1/2" has 1 telegram.
+    # The newest for "1/1/1" is the one with value=22.5 (sample_telegrams[3]).
+    # The newest for "1/1/2" is sample_telegrams[2] (value=None).
+    assert len(result) == 2
+
+    dest_map = {t.destination: t for t in result}
+    assert "1/1/1" in dest_map
+    assert "1/1/2" in dest_map
+
+    assert dest_map["1/1/1"].value == 22.5
+    assert dest_map["1/1/2"].value is None
