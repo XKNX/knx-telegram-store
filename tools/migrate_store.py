@@ -20,6 +20,7 @@ async def migrate(
     source: TelegramStore,
     dest: TelegramStore,
     batch_size: int = 5000,
+    limit_newest: int | None = None,
 ) -> None:
     """Migrate telegrams from source to destination."""
     print(f"Initializing source store ({type(source).__name__})... (may take a while)")
@@ -48,11 +49,22 @@ async def migrate(
     source_count = await source.count()
     print(f"Source contains {source_count} telegrams.")
 
+    # Determine order and limits
+    descending = limit_newest is not None
+    limit_count = limit_newest if limit_newest is not None else source_count
+    if limit_newest is not None:
+        print(f"Limiting migration to the newest {limit_newest} telegrams.")
+
     offset = 0
+    total_processed = 0
     total_migrated = 0
-    while True:
-        # We query in ascending order to migrate oldest first
-        result = await source.query(TelegramQuery(limit=batch_size, offset=offset, order_descending=False))
+    while total_processed < limit_count:
+        current_batch_size = min(batch_size, limit_count - total_processed)
+        if current_batch_size <= 0:
+            break
+
+        # If limiting newest, query descending (newest first)
+        result = await source.query(TelegramQuery(limit=current_batch_size, offset=offset, order_descending=descending))
         if not result.telegrams:
             break
 
@@ -65,16 +77,15 @@ async def migrate(
             for t in new_telegrams:
                 existing_timestamps.add(t.timestamp)
 
-        offset += batch_size
-        print(
-            f"Processed {min(offset, source_count)}/{source_count} telegrams, migrated {total_migrated} new entries..."
-        )
+        total_processed += len(result.telegrams)
+        offset += len(result.telegrams)
+        print(f"Processed {total_processed}/{limit_count} target telegrams, migrated {total_migrated} new entries...")
 
         if not result.limit_reached:
             break
 
     print("\nMigration completed!")
-    print(f"Total telegrams processed: {min(offset, source_count)}")
+    print(f"Total telegrams processed: {total_processed}")
     print(f"New telegrams migrated:   {total_migrated}")
 
 
@@ -100,6 +111,9 @@ async def main() -> None:
     )
     parser.add_argument("--dest-uri", required=True, help="Destination URI (file path or DSN)")
     parser.add_argument("--batch-size", type=int, default=5000, help="Batch size for migration")
+    parser.add_argument(
+        "--limit-newest", type=int, default=None, help="Limit migration to the newest N telegrams from source"
+    )
 
     args = parser.parse_args()
 
@@ -107,7 +121,7 @@ async def main() -> None:
     dest = get_store(args.dest_type, args.dest_uri)
 
     try:
-        await migrate(source, dest, batch_size=args.batch_size)
+        await migrate(source, dest, batch_size=args.batch_size, limit_newest=args.limit_newest)
     finally:
         await source.close()
         await dest.close()

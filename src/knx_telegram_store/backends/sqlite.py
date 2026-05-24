@@ -82,6 +82,8 @@ class SqliteStore(BaseSQLStore):
             for old_col in list(cols_to_migrate.values()) + ["dpt_name", "unit"]:
                 try:
                     connection.execute(text(f"ALTER TABLE telegrams DROP COLUMN {old_col}"))
+                    if old_col in existing_columns:
+                        existing_columns.remove(old_col)
                 except Exception:
                     # Older SQLite versions don't support DROP COLUMN.
                     # We leave them as redundant columns.
