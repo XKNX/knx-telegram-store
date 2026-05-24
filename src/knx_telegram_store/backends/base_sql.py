@@ -448,9 +448,12 @@ class BaseSQLStore(TelegramStore):
             if count == 0:
                 t2 = self.telegrams.alias("t2")
                 subq = (
-                    select(func.max(t2.c.timestamp))
-                    .where(t2.c.destination_id == self.telegrams.c.destination_id)
-                    .scalar_subquery()
+                    select(
+                        t2.c.destination_id,
+                        func.max(t2.c.timestamp).label("max_ts"),
+                    )
+                    .group_by(t2.c.destination_id)
+                    .subquery()
                 )
 
                 select_stmt = select(
@@ -468,7 +471,13 @@ class BaseSQLStore(TelegramStore):
                     self.telegrams.c.value_numeric,
                     self.telegrams.c.raw_data,
                     self.telegrams.c.data_secure,
-                ).where(self.telegrams.c.timestamp == subq)
+                ).join(
+                    subq,
+                    and_(
+                        self.telegrams.c.destination_id == subq.c.destination_id,
+                        self.telegrams.c.timestamp == subq.c.max_ts,
+                    ),
+                )
 
                 if self.engine.dialect.name == "sqlite":
                     from sqlalchemy.dialects.sqlite import insert as sqlite_insert
