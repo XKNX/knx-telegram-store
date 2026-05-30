@@ -104,10 +104,20 @@ class SqliteStore(BaseSQLStore):
         if has_legacy_columns:
             # Determine the final set of columns we want to keep
             keep_cols = [
-                "timestamp", "source_id", "destination_id", "telegramtype_id",
-                "direction_id", "source_name_id", "destination_name_id",
-                "payload", "dpt_main", "dpt_sub", "value", "value_numeric",
-                "raw_data", "data_secure",
+                "timestamp",
+                "source_id",
+                "destination_id",
+                "telegramtype_id",
+                "direction_id",
+                "source_name_id",
+                "destination_name_id",
+                "payload",
+                "dpt_main",
+                "dpt_sub",
+                "value",
+                "value_numeric",
+                "raw_data",
+                "data_secure",
             ]
             # Only copy columns that actually exist to avoid errors
             copy_cols = [c for c in keep_cols if c in existing_columns]
@@ -124,13 +134,98 @@ class SqliteStore(BaseSQLStore):
             connection.execute(text("ALTER TABLE telegrams RENAME TO _telegrams_old"))
             # Recreate from SQLAlchemy metadata (enforces correct NOT NULL / types)
             self._metadata.tables["telegrams"].create(connection)
-            connection.execute(
-                text(f"INSERT INTO telegrams ({cols_sql}) SELECT {cols_sql} FROM _telegrams_old")
-            )
+            connection.execute(text(f"INSERT INTO telegrams ({cols_sql}) SELECT {cols_sql} FROM _telegrams_old"))
             connection.execute(text("DROP TABLE _telegrams_old"))
 
+        # 3.5. Populate value from value_numeric if it is missing/null (legacy SpectrumKNX schema)
+        if "value" in existing_columns and "value_numeric" in existing_columns:
+            connection.execute(
+                text(
+                    "UPDATE telegrams SET value = CAST(value_numeric AS TEXT) "
+                    "WHERE (value IS NULL OR value = 'null') AND value_numeric IS NOT NULL"
+                )
+            )
 
+        # 4. Data unwrapping pass for legacy {"value": ...} wrapped structures
+        try:
+            # Query rowid, value, payload from telegrams where they are legacy JSON wrapped
+            rows = connection.execute(
+                text(
+                    "SELECT rowid, value, payload FROM telegrams WHERE value LIKE '{\"value\":%' OR payload LIKE '{\"value\":%'"
+                )
+            ).fetchall()
 
+            if rows:
+                import json
+
+                for row in rows:
+                    row_id = row[0]
+                    val_str = row[1]
+                    pay_str = row[2]
+
+                    new_val = None
+                    new_pay = None
+                    needs_update = False
+
+                    def unwrap(s):
+                        if s is None:
+                            return None, False
+                        try:
+                            if isinstance(s, dict):
+                                d = s
+                            else:
+                                d = json.loads(s)
+                            if isinstance(d, dict) and "value" in d and len(d) == 1:
+                                return d["value"], True
+                        except Exception:
+                            pass
+                        return s, False
+
+                    if val_str is not None:
+                        unwrapped_val, unwrapped = unwrap(val_str)
+                        if unwrapped:
+                            new_val = unwrapped_val
+                            needs_update = True
+                        else:
+                            new_val = val_str
+
+                    if pay_str is not None:
+                        unwrapped_pay, unwrapped = unwrap(pay_str)
+                        if unwrapped:
+                            new_pay = unwrapped_pay
+                            needs_update = True
+                        else:
+                            new_pay = pay_str
+
+                    if needs_update:
+
+                        def to_json_str(orig_val, new_val_unwrapped, did_unwrap):
+                            if did_unwrap:
+                                return json.dumps(new_val_unwrapped)
+                            if orig_val is None:
+                                return None
+                            if isinstance(orig_val, dict | list | int | float | bool):
+                                return json.dumps(orig_val)
+                            try:
+                                json.loads(orig_val)
+                                return orig_val
+                            except Exception:
+                                return json.dumps(orig_val)
+
+                        json_val = to_json_str(val_str, new_val, val_str != new_val)
+                        json_pay = to_json_str(pay_str, new_pay, pay_str != new_pay)
+
+                        connection.execute(
+                            text("UPDATE telegrams SET value = :value, payload = :payload WHERE rowid = :rowid"),
+                            {"value": json_val, "payload": json_pay, "rowid": row_id},
+                        )
+
+            # Record successful migration state in store_metadata
+            connection.execute(
+                text("INSERT OR REPLACE INTO store_metadata (key, value) VALUES ('data_unwrapped', 'true')")
+            )
+        except Exception:
+            pass
 
     def _needs_migration_sync(self, connection) -> bool:
         """Synchronously check if legacy SQLite schema migration is required."""
@@ -167,5 +262,43 @@ class SqliteStore(BaseSQLStore):
         for col_name in expected_columns:
             if col_name not in existing_columns and f"{col_name}_id" not in existing_columns:
                 return True
+
+        # 4.5. Check if there are any legacy 'null' values to recover from value_numeric
+        if "value" in existing_columns and "value_numeric" in existing_columns:
+            try:
+                row = connection.execute(
+                    text(
+                        "SELECT 1 FROM telegrams WHERE (value IS NULL OR value = 'null') AND value_numeric IS NOT NULL LIMIT 1"
+                    )
+                ).fetchone()
+                if row:
+                    return True
+            except Exception:
+                pass
+
+        # 5. Check if any rows contain legacy {"value": ...} wrapped values
+        # Skip this scan entirely if the metadata table indicates we already unwrapped
+        is_unwrapped = False
+        try:
+            if inspector.has_table("store_metadata"):
+                row = connection.execute(
+                    text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")
+                ).fetchone()
+                if row and row[0] == "true":
+                    is_unwrapped = True
+        except Exception:
+            pass
+
+        if not is_unwrapped:
+            try:
+                row = connection.execute(
+                    text(
+                        "SELECT 1 FROM telegrams WHERE value LIKE '{\"value\":%' OR payload LIKE '{\"value\":%' LIMIT 1"
+                    )
+                ).fetchone()
+                if row:
+                    return True
+            except Exception:
+                pass
 
         return False

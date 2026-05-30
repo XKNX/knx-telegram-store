@@ -74,6 +74,13 @@ class BaseSQLStore(TelegramStore):
             Column("data_secure", Boolean, nullable=True),
         )
 
+        self.store_metadata = Table(
+            "store_metadata",
+            self._metadata,
+            Column("key", Text, primary_key=True),
+            Column("value", Text, nullable=True),
+        )
+
         self._capabilities = StoreCapabilities(
             supports_time_range=True,
             supports_time_delta=True,
