@@ -74,6 +74,13 @@ class BaseSQLStore(TelegramStore):
             Column("data_secure", Boolean, nullable=True),
         )
 
+        self.store_metadata = Table(
+            "store_metadata",
+            self._metadata,
+            Column("key", Text, primary_key=True),
+            Column("value", Text, nullable=True),
+        )
+
         self._capabilities = StoreCapabilities(
             supports_time_range=True,
             supports_time_delta=True,
@@ -96,6 +103,16 @@ class BaseSQLStore(TelegramStore):
     def max_telegrams(self) -> int | None:
         """SQL stores are typically not limited by count."""
         return None
+
+    @wrap_store_errors
+    async def needs_migration(self) -> bool:
+        """Check if any schema upgrades or migrations are pending."""
+        async with self.engine.connect() as conn:
+            return await conn.run_sync(self._needs_migration_sync)
+
+    def _needs_migration_sync(self, connection) -> bool:
+        """Synchronously check if schema upgrades or legacy migrations are required."""
+        return False
 
     @wrap_store_errors
     async def initialize(self) -> None:
@@ -448,9 +465,12 @@ class BaseSQLStore(TelegramStore):
             if count == 0:
                 t2 = self.telegrams.alias("t2")
                 subq = (
-                    select(func.max(t2.c.timestamp))
-                    .where(t2.c.destination_id == self.telegrams.c.destination_id)
-                    .scalar_subquery()
+                    select(
+                        t2.c.destination_id,
+                        func.max(t2.c.timestamp).label("max_ts"),
+                    )
+                    .group_by(t2.c.destination_id)
+                    .subquery()
                 )
 
                 select_stmt = select(
@@ -468,7 +488,13 @@ class BaseSQLStore(TelegramStore):
                     self.telegrams.c.value_numeric,
                     self.telegrams.c.raw_data,
                     self.telegrams.c.data_secure,
-                ).where(self.telegrams.c.timestamp == subq)
+                ).join(
+                    subq,
+                    and_(
+                        self.telegrams.c.destination_id == subq.c.destination_id,
+                        self.telegrams.c.timestamp == subq.c.max_ts,
+                    ),
+                )
 
                 if self.engine.dialect.name == "sqlite":
                     from sqlalchemy.dialects.sqlite import insert as sqlite_insert

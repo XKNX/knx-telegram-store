@@ -160,7 +160,7 @@ class PostgresStore(BaseSQLStore):
             connection.execute(
                 text(
                     "UPDATE telegrams SET value = to_jsonb(value_numeric) "
-                    "WHERE value IS NULL AND value_numeric IS NOT NULL"
+                    "WHERE (value IS NULL OR value = 'null'::jsonb) AND value_numeric IS NOT NULL"
                 )
             )
 
@@ -173,3 +173,203 @@ class PostgresStore(BaseSQLStore):
                     "WHERE value_numeric IS NULL AND value_legacy_float IS NOT NULL"
                 )
             )
+
+        # 5. Data unwrapping pass for legacy {"value": ...} wrapped structures
+        try:
+            # Postgres supports casting JSONB to text, so we can cast value::text or payload::text
+            rows = connection.execute(
+                text(
+                    "SELECT timestamp, source_id, destination_id, value::text, payload::text FROM telegrams "
+                    "WHERE (value::text LIKE '{\"value\":%' AND value IS NOT NULL) "
+                    "OR (payload::text LIKE '{\"value\":%' AND payload IS NOT NULL)"
+                )
+            ).fetchall()
+
+            if rows:
+                import json
+
+                for row in rows:
+                    timestamp = row[0]
+                    source_id = row[1]
+                    destination_id = row[2]
+                    val_str = row[3]
+                    pay_str = row[4]
+
+                    new_val = None
+                    new_pay = None
+                    needs_update = False
+
+                    def unwrap(s):
+                        if s is None:
+                            return None, False
+                        try:
+                            if isinstance(s, dict):
+                                d = s
+                            else:
+                                d = json.loads(s)
+                            if isinstance(d, dict) and "value" in d and len(d) == 1:
+                                return d["value"], True
+                        except Exception:
+                            pass
+                        return s, False
+
+                    if val_str is not None:
+                        unwrapped_val, unwrapped = unwrap(val_str)
+                        if unwrapped:
+                            new_val = unwrapped_val
+                            needs_update = True
+                        else:
+                            new_val = val_str
+
+                    if pay_str is not None:
+                        unwrapped_pay, unwrapped = unwrap(pay_str)
+                        if unwrapped:
+                            new_pay = unwrapped_pay
+                            needs_update = True
+                        else:
+                            new_pay = pay_str
+
+                    if needs_update:
+
+                        def to_json_str(orig_val, new_val_unwrapped, did_unwrap):
+                            if did_unwrap:
+                                return json.dumps(new_val_unwrapped)
+                            if orig_val is None:
+                                return None
+                            if isinstance(orig_val, dict | list | int | float | bool):
+                                return json.dumps(orig_val)
+                            try:
+                                json.loads(orig_val)
+                                return orig_val
+                            except Exception:
+                                return json.dumps(orig_val)
+
+                        json_val = to_json_str(val_str, new_val, val_str != new_val)
+                        json_pay = to_json_str(pay_str, new_pay, pay_str != new_pay)
+
+                        connection.execute(
+                            text(
+                                "UPDATE telegrams SET value = :value, payload = :payload "
+                                "WHERE timestamp = :timestamp AND source_id = :source_id AND destination_id = :destination_id"
+                            ),
+                            {
+                                "value": json_val,
+                                "payload": json_pay,
+                                "timestamp": timestamp,
+                                "source_id": source_id,
+                                "destination_id": destination_id,
+                            },
+                        )
+
+            # Record successful migration state in store_metadata
+            connection.execute(
+                text(
+                    "INSERT INTO store_metadata (key, value) VALUES ('data_unwrapped', 'true') "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+                )
+            )
+        except Exception:
+            pass
+
+    def _needs_migration_sync(self, connection) -> bool:
+        """Synchronously check if legacy Postgres schema migration is required."""
+        inspector = inspect(connection)
+        try:
+            columns = inspector.get_columns("telegrams")
+        except Exception:
+            return False
+        existing_columns = {col["name"] for col in columns}
+
+        # 1. Handle renames from legacy SpectrumKNX schema
+        renames = {
+            "source_address",
+            "target_address",
+            "telegram_type",
+            "value_json",
+        }
+        for old in renames:
+            if old in existing_columns:
+                return True
+
+        # Special value float rename check
+        if "value" in existing_columns:
+            is_float = any(c["name"] == "value" and "double" in str(c["type"]).lower() for c in columns)
+            if is_float:
+                return True
+
+        # raw_data bytea check
+        if "raw_data" in existing_columns:
+            for col in columns:
+                if col["name"] == "raw_data" and "bytea" in str(col["type"]).lower():
+                    return True
+
+        # 2. Handle normalization to string_lookup
+        if "source" in existing_columns:
+            return True
+
+        # Add *_id columns
+        cols_to_migrate = [
+            "source_id",
+            "destination_id",
+            "telegramtype_id",
+            "direction_id",
+            "source_name_id",
+            "destination_name_id",
+        ]
+        for col_id in cols_to_migrate:
+            if col_id not in existing_columns:
+                return True
+
+        # Missing columns
+        expected_columns = {
+            "payload",
+            "dpt_main",
+            "dpt_sub",
+            "value",
+            "value_numeric",
+            "data_secure",
+        }
+        for col_name in expected_columns:
+            if col_name not in existing_columns:
+                return True
+
+        # 4.5. Check if there are any legacy 'null' values to recover from value_numeric
+        if "value" in existing_columns and "value_numeric" in existing_columns:
+            try:
+                row = connection.execute(
+                    text(
+                        "SELECT 1 FROM telegrams WHERE (value IS NULL OR value = 'null'::jsonb) AND value_numeric IS NOT NULL LIMIT 1"
+                    )
+                ).fetchone()
+                if row:
+                    return True
+            except Exception:
+                pass
+
+        # 5. Check if any rows contain legacy {"value": ...} wrapped values
+        # Skip this scan entirely if the metadata table indicates we already unwrapped
+        is_unwrapped = False
+        try:
+            if inspector.has_table("store_metadata"):
+                row = connection.execute(
+                    text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")
+                ).fetchone()
+                if row and row[0] == "true":
+                    is_unwrapped = True
+        except Exception:
+            pass
+
+        if not is_unwrapped:
+            try:
+                row = connection.execute(
+                    text(
+                        "SELECT 1 FROM telegrams WHERE (value::text LIKE '{\"value\":%' AND value IS NOT NULL) "
+                        "OR (payload::text LIKE '{\"value\":%' AND payload IS NOT NULL) LIMIT 1"
+                    )
+                ).fetchone()
+                if row:
+                    return True
+            except Exception:
+                pass
+
+        return False
