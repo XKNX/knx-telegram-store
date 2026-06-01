@@ -160,7 +160,7 @@ class PostgresStore(BaseSQLStore):
             connection.execute(
                 text(
                     "UPDATE telegrams SET value = to_jsonb(value_numeric) "
-                    "WHERE (value IS NULL OR value = 'null'::jsonb) AND value_numeric IS NOT NULL"
+                    "WHERE (value IS NULL OR value::text = 'null') AND value_numeric IS NOT NULL"
                 )
             )
 
@@ -338,7 +338,7 @@ class PostgresStore(BaseSQLStore):
             try:
                 row = connection.execute(
                     text(
-                        "SELECT 1 FROM telegrams WHERE (value IS NULL OR value = 'null'::jsonb) AND value_numeric IS NOT NULL LIMIT 1"
+                        "SELECT 1 FROM telegrams WHERE (value IS NULL OR value::text = 'null') AND value_numeric IS NOT NULL LIMIT 1"
                     )
                 ).fetchone()
                 if row:
