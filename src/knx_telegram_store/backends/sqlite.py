@@ -5,7 +5,21 @@ from pathlib import Path
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from ..connection import (
+    ConnectionCheckResult,
+    ConnectionErrorKind,
+    evaluate_sqlite_path,
+    probe_engine,
+)
 from .base_sql import BaseSQLStore
+
+
+def _classify_sqlite_error(exc: BaseException) -> ConnectionErrorKind:
+    """Map a SQLite connection exception to a ConnectionErrorKind."""
+    orig = getattr(exc, "orig", None) or exc
+    if isinstance(orig, PermissionError | OSError):
+        return ConnectionErrorKind.PERMISSION
+    return ConnectionErrorKind.UNKNOWN
 
 
 class SqliteStore(BaseSQLStore):
@@ -23,6 +37,19 @@ class SqliteStore(BaseSQLStore):
 
         engine = create_async_engine(url)
         super().__init__(engine, retention_days)
+
+    @staticmethod
+    def check_config(db_path: str | Path) -> ConnectionCheckResult:
+        """Validate a SQLite path without constructing a store or touching the disk.
+
+        Synchronous — this is a pure filesystem check (no I/O await). Returns a
+        structured result indicating whether the file is writeable or can be created.
+        """
+        return evaluate_sqlite_path(db_path)
+
+    async def check_connection(self, *, timeout: float = 5.0) -> ConnectionCheckResult:
+        """Probe the SQLite database with ``SELECT 1`` (creates an empty file if missing)."""
+        return await probe_engine(self.engine, timeout=timeout, classify=_classify_sqlite_error)
 
     async def initialize(self) -> None:
         """Set up the database schema and perform upgrades."""

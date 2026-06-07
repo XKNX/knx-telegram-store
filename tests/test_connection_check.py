@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+import os
+import socket
+
+import pytest
+
+from knx_telegram_store import ConnectionErrorKind
+from knx_telegram_store.backends.memory import MemoryStore
+from knx_telegram_store.backends.sqlite import SqliteStore
+from knx_telegram_store.connection import (
+    classify_postgres_error,
+    evaluate_sqlite_path,
+)
+
+# --- SQLite static check_config (pure filesystem) ---------------------------
+
+
+def test_sqlite_check_config_memory():
+    result = SqliteStore.check_config(":memory:")
+    assert result.ok
+    assert result.kind is ConnectionErrorKind.OK
+
+
+def test_sqlite_check_config_existing_writeable_file(tmp_path):
+    db_file = tmp_path / "exists.db"
+    db_file.write_text("")  # create it
+    result = SqliteStore.check_config(db_file)
+    assert result.ok
+
+
+def test_sqlite_check_config_creatable_nested_path(tmp_path):
+    # Parent dirs do not exist yet but the nearest ancestor (tmp_path) is writeable.
+    db_file = tmp_path / "a" / "b" / "telegrams.db"
+    result = SqliteStore.check_config(db_file)
+    assert result.ok
+    # The check must not create anything on disk.
+    assert not db_file.exists()
+    assert not (tmp_path / "a").exists()
+
+
+def test_sqlite_check_config_readonly_dir(tmp_path):
+    ro_dir = tmp_path / "ro"
+    ro_dir.mkdir()
+    os.chmod(ro_dir, 0o500)
+    try:
+        result = SqliteStore.check_config(ro_dir / "telegrams.db")
+        assert not result.ok
+        assert result.kind is ConnectionErrorKind.PERMISSION
+    finally:
+        os.chmod(ro_dir, 0o700)  # restore so tmp cleanup works
+
+
+def test_sqlite_check_config_path_is_directory(tmp_path):
+    result = SqliteStore.check_config(tmp_path)
+    assert not result.ok
+    assert result.kind is ConnectionErrorKind.PERMISSION
+
+
+def test_evaluate_sqlite_path_no_side_effects(tmp_path):
+    target = tmp_path / "nope" / "x.db"
+    evaluate_sqlite_path(target)
+    assert not target.exists()
+    assert not target.parent.exists()
+
+
+# --- SQLite live check_connection -------------------------------------------
+
+
+async def test_sqlite_check_connection_ok(tmp_path):
+    store = SqliteStore(tmp_path / "x.db")
+    try:
+        result = await store.check_connection()
+        assert result.ok
+        assert result.kind is ConnectionErrorKind.OK
+    finally:
+        await store.close()
+
+
+# --- Memory backend ----------------------------------------------------------
+
+
+async def test_memory_check_connection_ok():
+    store = MemoryStore(max_telegrams=10)
+    result = await store.check_connection()
+    assert result.ok
+
+
+# --- Postgres error classification (pure, no DB) ----------------------------
+
+
+def test_classify_postgres_timeout():
+    assert classify_postgres_error(TimeoutError()) is ConnectionErrorKind.TIMEOUT
+
+
+def test_classify_postgres_host_unreachable():
+    assert classify_postgres_error(ConnectionRefusedError()) is ConnectionErrorKind.HOST_UNREACHABLE
+    assert classify_postgres_error(socket.gaierror()) is ConnectionErrorKind.HOST_UNREACHABLE
+
+
+def test_classify_postgres_missing_dependency():
+    assert classify_postgres_error(ModuleNotFoundError("asyncpg")) is ConnectionErrorKind.MISSING_DEPENDENCY
+
+
+def test_classify_postgres_unwraps_orig():
+    asyncpg = pytest.importorskip("asyncpg")
+
+    class FakeWrapped(Exception):
+        def __init__(self, orig):
+            self.orig = orig
+
+    assert classify_postgres_error(FakeWrapped(asyncpg.InvalidPasswordError("bad"))) is ConnectionErrorKind.AUTH
+    assert (
+        classify_postgres_error(FakeWrapped(asyncpg.InvalidCatalogNameError("nope")))
+        is ConnectionErrorKind.DATABASE_MISSING
+    )
+    assert (
+        classify_postgres_error(FakeWrapped(asyncpg.InsufficientPrivilegeError("denied")))
+        is ConnectionErrorKind.PERMISSION
+    )
+
+
+def test_classify_postgres_unknown():
+    assert classify_postgres_error(ValueError("weird")) is ConnectionErrorKind.UNKNOWN
+
+
+# --- Postgres live check (opt-in via env var) -------------------------------
+
+
+@pytest.mark.skipif(not os.environ.get("KNX_TEST_PG_DSN"), reason="KNX_TEST_PG_DSN not set")
+async def test_postgres_check_config_live_ok():
+    from knx_telegram_store.backends.postgres import PostgresStore
+
+    dsn = os.environ["KNX_TEST_PG_DSN"]
+    result = await PostgresStore.check_config(dsn)
+    assert result.ok, result.message
+
+
+async def test_postgres_check_config_unreachable():
+    pytest.importorskip("asyncpg")
+    from knx_telegram_store.backends.postgres import PostgresStore
+
+    # Reserved-as-unreachable: port 1 on localhost should refuse quickly.
+    result = await PostgresStore.check_config(
+        "postgresql://user:pw@127.0.0.1:1/nodb",
+        timeout=3.0,
+    )
+    assert not result.ok
+    assert result.kind in {ConnectionErrorKind.HOST_UNREACHABLE, ConnectionErrorKind.TIMEOUT}

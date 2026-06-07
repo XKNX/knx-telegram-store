@@ -1,9 +1,27 @@
 from __future__ import annotations
 
 from sqlalchemy import inspect, text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from ..connection import ConnectionCheckResult, classify_postgres_error, probe_engine
 from .base_sql import BaseSQLStore
+
+
+def _build_engine(dsn: str) -> AsyncEngine:
+    """Build an asyncpg engine from a DSN, normalizing the driver and SSL default.
+
+    Shared by ``__init__`` and ``check_config`` so connection handling stays consistent.
+    """
+    # Ensure we use asyncpg
+    if dsn.startswith("postgresql://"):
+        dsn = dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+    connect_args = {}
+    if "sslmode=require" not in dsn and "ssl=" not in dsn:
+        # Default to no SSL if not explicitly requested, to avoid blocking cert loading
+        connect_args["ssl"] = False
+
+    return create_async_engine(dsn, connect_args=connect_args)
 
 
 class PostgresStore(BaseSQLStore):
@@ -11,17 +29,26 @@ class PostgresStore(BaseSQLStore):
 
     def __init__(self, dsn: str, retention_days: int | None = None) -> None:
         """Initialize the Postgres store."""
-        # Ensure we use asyncpg
-        if dsn.startswith("postgresql://"):
-            dsn = dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
-
-        connect_args = {}
-        if "sslmode=require" not in dsn and "ssl=" not in dsn:
-            # Default to no SSL if not explicitly requested, to avoid blocking cert loading
-            connect_args["ssl"] = False
-
-        engine = create_async_engine(dsn, connect_args=connect_args)
+        engine = _build_engine(dsn)
         super().__init__(engine, retention_days)
+
+    @staticmethod
+    async def check_config(dsn: str, *, timeout: float = 5.0) -> ConnectionCheckResult:
+        """Validate a Postgres DSN by attempting a real connection.
+
+        Asynchronous — connecting requires network I/O. Builds a throwaway engine,
+        runs ``SELECT 1``, and disposes it. Distinguishes auth, host, and
+        missing-database failures via the returned result's ``kind``.
+        """
+        engine = _build_engine(dsn)
+        try:
+            return await probe_engine(engine, timeout=timeout, classify=classify_postgres_error)
+        finally:
+            await engine.dispose()
+
+    async def check_connection(self, *, timeout: float = 5.0) -> ConnectionCheckResult:
+        """Probe the live Postgres engine with ``SELECT 1`` (no migrations, no schema changes)."""
+        return await probe_engine(self.engine, timeout=timeout, classify=classify_postgres_error)
 
     async def initialize(self) -> None:
         """Set up the database schema and perform upgrades."""

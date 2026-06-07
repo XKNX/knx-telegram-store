@@ -7,6 +7,7 @@ from datetime import datetime
 from functools import wraps
 from typing import Any, ParamSpec, TypeVar
 
+from .connection import ConnectionCheckResult
 from .model import StoredTelegram
 from .query import TelegramQuery, TelegramQueryResult
 
@@ -65,6 +66,15 @@ class TelegramStore(ABC):
     async def needs_migration(self) -> bool:
         """Return True if the store requires a database schema migration/upgrade."""
         return False
+
+    async def check_connection(self) -> ConnectionCheckResult:
+        """Probe live connectivity without running migrations.
+
+        Returns a structured result describing whether the store is reachable
+        and, if not, why. Safe to call before initialize(). Default: assume
+        reachable (in-memory backends).
+        """
+        return ConnectionCheckResult.success()
 
     @abstractmethod
     async def initialize(self) -> None:

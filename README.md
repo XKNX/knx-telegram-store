@@ -58,6 +58,33 @@ async def main():
     await store.close()
 ```
 
+## Validating a config / connection
+
+Before triggering an expensive operation such as a migration, you can validate that a
+store is reachable. Both checks return a structured `ConnectionCheckResult`
+(`ok`, `kind`, `message`, `detail`) instead of raising.
+
+```python
+from knx_telegram_store import ConnectionErrorKind
+from knx_telegram_store.backends.sqlite import SqliteStore
+from knx_telegram_store.backends.postgres import PostgresStore
+
+# Static, side-effect-free config validation (before constructing a store):
+#  - SQLite: sync — checks the file is writeable or can be created
+result = SqliteStore.check_config("/data/telegrams.db")
+#  - Postgres: async — actually connects to verify user/password/host/port/database
+result = await PostgresStore.check_config("postgresql://user:pw@host:5432/knx")
+
+if not result.ok:
+    print(f"[{result.kind}] {result.message}")  # e.g. [auth] Authentication failed ...
+
+# Live probe of an already-constructed store (no migrations, no schema changes):
+store = SqliteStore("/data/telegrams.db")
+result = await store.check_connection()
+if result.kind is ConnectionErrorKind.OK:
+    await store.initialize()
+```
+
 ## License
 
 MIT

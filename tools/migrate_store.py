@@ -115,12 +115,36 @@ async def main() -> None:
         "--limit-newest", type=int, default=None, help="Limit migration to the newest N telegrams from source"
     )
 
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Only validate source/destination connections, then exit",
+    )
+
     args = parser.parse_args()
 
     source = get_store(args.src_type, args.src_uri)
     dest = get_store(args.dest_type, args.dest_uri)
 
     try:
+        # Pre-flight: verify both stores are reachable before doing any work.
+        ok = True
+        for label, store in (("Source", source), ("Destination", dest)):
+            result = await store.check_connection()
+            if result.ok:
+                print(f"{label} connection OK: {result.message}")
+            else:
+                ok = False
+                print(f"{label} connection FAILED [{result.kind.value}]: {result.message}")
+                if result.detail:
+                    print(f"  detail: {result.detail}")
+        if not ok:
+            sys.exit(1)
+
+        if args.check_only:
+            print("Connection checks passed.")
+            return
+
         await migrate(source, dest, batch_size=args.batch_size, limit_newest=args.limit_newest)
     finally:
         await source.close()
