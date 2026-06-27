@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "knx-telegram-store"
-version = "0.3.2"
+version = "0.4.0"
 description = "A standalone, host-agnostic Python library for KNX telegram persistence."
 readme = "README.md"
 requires-python = ">=3.12"
