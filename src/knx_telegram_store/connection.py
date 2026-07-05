@@ -125,7 +125,7 @@ def classify_postgres_error(exc: BaseException) -> ConnectionErrorKind:
         return ConnectionErrorKind.MISSING_DEPENDENCY
 
     try:
-        import asyncpg  # type: ignore[import-not-found]
+        import asyncpg  # type: ignore[import-not-found,import-untyped]
     except ImportError:
         asyncpg = None  # type: ignore[assignment]
 
