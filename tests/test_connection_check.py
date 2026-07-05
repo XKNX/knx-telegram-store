@@ -11,6 +11,7 @@ from knx_telegram_store.backends.sqlite import SqliteStore
 from knx_telegram_store.connection import (
     classify_postgres_error,
     evaluate_sqlite_path,
+    probe_timescaledb,
 )
 
 # --- SQLite static check_config (pure filesystem) ---------------------------
@@ -122,6 +123,61 @@ def test_classify_postgres_unwraps_orig():
 
 def test_classify_postgres_unknown():
     assert classify_postgres_error(ValueError("weird")) is ConnectionErrorKind.UNKNOWN
+
+
+# --- TimescaleDB availability probe (fake engine, no DB) ---------------------
+
+
+class _FakeResult:
+    def __init__(self, row):
+        self._row = row
+
+    def first(self):
+        return self._row
+
+
+class _FakeConn:
+    def __init__(self, row=None, error=None):
+        self._row = row
+        self._error = error
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, *args, **kwargs):
+        if self._error is not None:
+            raise self._error
+        return _FakeResult(self._row)
+
+
+class _FakeEngine:
+    def __init__(self, row=None, error=None):
+        self._row = row
+        self._error = error
+
+    def connect(self):
+        return _FakeConn(self._row, self._error)
+
+
+async def test_probe_timescaledb_available():
+    result = await probe_timescaledb(_FakeEngine(row=(1,)), timeout=1.0)
+    assert result.ok
+    assert result.kind is ConnectionErrorKind.OK
+
+
+async def test_probe_timescaledb_missing():
+    result = await probe_timescaledb(_FakeEngine(row=None), timeout=1.0)
+    assert not result.ok
+    assert result.kind is ConnectionErrorKind.MISSING_TIMESCALEDB
+
+
+async def test_probe_timescaledb_query_error_is_classified():
+    result = await probe_timescaledb(_FakeEngine(error=ValueError("boom")), timeout=1.0)
+    assert not result.ok
+    assert result.kind is ConnectionErrorKind.UNKNOWN
 
 
 # --- Postgres live check (opt-in via env var) -------------------------------

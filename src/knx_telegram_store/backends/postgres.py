@@ -3,7 +3,12 @@ from __future__ import annotations
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from ..connection import ConnectionCheckResult, classify_postgres_error, probe_engine
+from ..connection import (
+    ConnectionCheckResult,
+    classify_postgres_error,
+    probe_engine,
+    probe_timescaledb,
+)
 from .base_sql import BaseSQLStore
 
 
@@ -37,18 +42,25 @@ class PostgresStore(BaseSQLStore):
         """Validate a Postgres DSN by attempting a real connection.
 
         Asynchronous — connecting requires network I/O. Builds a throwaway engine,
-        runs ``SELECT 1``, and disposes it. Distinguishes auth, host, and
-        missing-database failures via the returned result's ``kind``.
+        runs ``SELECT 1``, verifies TimescaleDB is available, and disposes the
+        engine. Distinguishes auth, host, missing-database, and missing-TimescaleDB
+        failures via the returned result's ``kind``.
         """
         engine = _build_engine(dsn)
         try:
-            return await probe_engine(engine, timeout=timeout, classify=classify_postgres_error)
+            result = await probe_engine(engine, timeout=timeout, classify=classify_postgres_error)
+            if not result.ok:
+                return result
+            return await probe_timescaledb(engine, timeout=timeout)
         finally:
             await engine.dispose()
 
     async def check_connection(self, *, timeout: float = 5.0) -> ConnectionCheckResult:
-        """Probe the live Postgres engine with ``SELECT 1`` (no migrations, no schema changes)."""
-        return await probe_engine(self.engine, timeout=timeout, classify=classify_postgres_error)
+        """Probe the live Postgres engine and verify TimescaleDB (no migrations, no schema changes)."""
+        result = await probe_engine(self.engine, timeout=timeout, classify=classify_postgres_error)
+        if not result.ok:
+            return result
+        return await probe_timescaledb(self.engine, timeout=timeout)
 
     async def initialize(self) -> None:
         """Set up the database schema and perform upgrades."""

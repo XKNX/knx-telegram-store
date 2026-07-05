@@ -23,6 +23,7 @@ class ConnectionErrorKind(StrEnum):
     PERMISSION = "permission"  # fs not writeable / insufficient privilege
     TIMEOUT = "timeout"
     MISSING_DEPENDENCY = "missing_dependency"  # driver not installed
+    MISSING_TIMESCALEDB = "missing_timescaledb"  # TimescaleDB extension not available
     UNKNOWN = "unknown"
 
 
@@ -175,6 +176,46 @@ async def probe_engine(
     return ConnectionCheckResult.success()
 
 
+async def probe_timescaledb(
+    engine: AsyncEngine,
+    *,
+    timeout: float,
+) -> ConnectionCheckResult:
+    """Verify the TimescaleDB extension is available on the server.
+
+    ``initialize()`` runs ``CREATE EXTENSION IF NOT EXISTS timescaledb`` and
+    creates a hypertable, so a reachable server without TimescaleDB passes the
+    plain connectivity probe but fails on first use. This read-only check
+    queries ``pg_available_extensions`` — it installs nothing and changes no
+    schema — so callers can surface the problem before saving the config.
+    """
+    from sqlalchemy import text
+
+    async def _probe() -> object | None:
+        async with engine.connect() as conn:
+            result = await conn.execute(text("SELECT 1 FROM pg_available_extensions WHERE name = 'timescaledb'"))
+            return result.first()
+
+    try:
+        row = await asyncio.wait_for(_probe(), timeout=timeout)
+    except TimeoutError as err:
+        return ConnectionCheckResult.failure(
+            ConnectionErrorKind.TIMEOUT,
+            f"Connection timed out after {timeout:g}s",
+            detail=str(err),
+        )
+    except Exception as err:
+        kind = classify_postgres_error(err)
+        return ConnectionCheckResult.failure(kind, _message_for_kind(kind), detail=str(err))
+
+    if row is None:
+        return ConnectionCheckResult.failure(
+            ConnectionErrorKind.MISSING_TIMESCALEDB,
+            _message_for_kind(ConnectionErrorKind.MISSING_TIMESCALEDB),
+        )
+    return ConnectionCheckResult.success()
+
+
 _KIND_MESSAGES: dict[ConnectionErrorKind, str] = {
     ConnectionErrorKind.AUTH: "Authentication failed (check user and password)",
     ConnectionErrorKind.HOST_UNREACHABLE: "Could not reach the database host (check host and port)",
@@ -182,6 +223,7 @@ _KIND_MESSAGES: dict[ConnectionErrorKind, str] = {
     ConnectionErrorKind.PERMISSION: "Insufficient privileges for this operation",
     ConnectionErrorKind.TIMEOUT: "Connection timed out",
     ConnectionErrorKind.MISSING_DEPENDENCY: "Required database driver is not installed",
+    ConnectionErrorKind.MISSING_TIMESCALEDB: ("The TimescaleDB extension is not available on the database server"),
     ConnectionErrorKind.UNKNOWN: "Connection failed",
 }
 
