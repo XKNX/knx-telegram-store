@@ -23,16 +23,21 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from ..lookup import LookupCache, build_lookup_table
 from ..model import StoredTelegram
 from ..query import TelegramQuery, TelegramQueryResult
-from ..store import StoreCapabilities, StoreStats, TelegramStore, wrap_store_errors
+from ..store import KnxTelegramStoreException, StoreCapabilities, StoreStats, TelegramStore, wrap_store_errors
 
 
 class BaseSQLStore(TelegramStore):
     """Base class for SQLAlchemy-based telegram stores."""
 
-    def __init__(self, engine: AsyncEngine, retention_days: int | None = None) -> None:
-        """Initialize the SQL store."""
+    def __init__(self, engine: AsyncEngine, retention_days: int | None = None, *, read_only: bool = False) -> None:
+        """Initialize the SQL store.
+
+        With read_only=True the store never runs DDL/migrations and rejects all
+        mutating operations; only querying and stats are available.
+        """
         self.engine = engine
         self._retention_days = retention_days
+        self._read_only = read_only
         self._metadata = MetaData()
         self._lookup_cache = LookupCache()
         self.string_lookup = build_lookup_table(self._metadata)
@@ -87,9 +92,15 @@ class BaseSQLStore(TelegramStore):
             supports_pagination=True,
             supports_count=True,
             supports_size_stats=True,
-            supports_optimize=True,
+            supports_optimize=not read_only,
+            read_only=read_only,
             max_storage=None,
         )
+
+    def _ensure_writable(self) -> None:
+        """Raise if the store was opened read-only."""
+        if self._read_only:
+            raise KnxTelegramStoreException("Store is opened read-only")
 
     @property
     def capabilities(self) -> StoreCapabilities:
@@ -121,7 +132,8 @@ class BaseSQLStore(TelegramStore):
         """Set up the store (create tables, upgrades)."""
         # Subclasses should call this or implement their own with super().initialize()
         await self._lookup_cache.warm(self.engine, self.string_lookup)
-        await self._populate_last_ga_telegrams_if_empty()
+        if not self._read_only:
+            await self._populate_last_ga_telegrams_if_empty()
 
     @wrap_store_errors
     async def close(self) -> None:
@@ -136,6 +148,7 @@ class BaseSQLStore(TelegramStore):
     @wrap_store_errors
     async def store_many(self, telegrams: Sequence[StoredTelegram]) -> None:
         """Persist multiple telegrams."""
+        self._ensure_writable()
         if not telegrams:
             return
 
@@ -211,6 +224,7 @@ class BaseSQLStore(TelegramStore):
     @wrap_store_errors
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
         """Delete all telegrams with timestamp < cutoff."""
+        self._ensure_writable()
         if dry_run:
             stmt = select(func.count()).select_from(self.telegrams).where(self.telegrams.c.timestamp < cutoff)
             async with self.engine.connect() as conn:
@@ -231,8 +245,12 @@ class BaseSQLStore(TelegramStore):
         return await self.evict_older_than(cutoff, dry_run=dry_run)
 
     @wrap_store_errors
-    async def query(self, query: TelegramQuery) -> TelegramQueryResult:
-        """Retrieve telegrams matching the given query."""
+    async def query(self, query: TelegramQuery, *, flush_first: bool = False) -> TelegramQueryResult:
+        """Retrieve telegrams matching the given query.
+
+        flush_first is accepted for signature compatibility with the buffered
+        stores; there is no write buffer here, so it is a no-op.
+        """
         # Aliases for lookup JOINs
         s_lk = self.string_lookup.alias("s_lk")
         d_lk = self.string_lookup.alias("d_lk")
@@ -410,6 +428,7 @@ class BaseSQLStore(TelegramStore):
     @wrap_store_errors
     async def clear(self) -> None:
         """Remove all stored telegrams."""
+        self._ensure_writable()
         async with self.engine.begin() as conn:
             await conn.execute(self.telegrams.delete())
             await conn.execute(self.last_ga_telegrams.delete())

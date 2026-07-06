@@ -52,12 +52,19 @@ class ConnectionCheckResult:
         return cls(ok=False, kind=kind, message=message, detail=detail)
 
 
-def evaluate_sqlite_path(db_path: str | Path) -> ConnectionCheckResult:
+def evaluate_sqlite_path(db_path: str | Path, *, read_only: bool = False) -> ConnectionCheckResult:
     """Validate that a SQLite file is writeable or can be created.
 
+    With read_only=True the file must already exist and be readable instead
+    (a read-only store never creates a database).
     Pure filesystem check — performs no mutation (no mkdir, no file creation).
     """
     if str(db_path) == ":memory:":
+        if read_only:
+            return ConnectionCheckResult.failure(
+                ConnectionErrorKind.UNKNOWN,
+                "read_only is not supported for in-memory databases",
+            )
         return ConnectionCheckResult.success("In-memory SQLite database")
 
     path = Path(db_path)
@@ -65,6 +72,24 @@ def evaluate_sqlite_path(db_path: str | Path) -> ConnectionCheckResult:
     # A non-traversable ancestor (e.g. an unreadable parent dir) makes stat()
     # raise rather than return False — that is itself a permission failure.
     try:
+        if read_only:
+            if not path.exists():
+                return ConnectionCheckResult.failure(
+                    ConnectionErrorKind.PERMISSION,
+                    f"SQLite file '{path}' does not exist (required for read-only access)",
+                )
+            if path.is_dir():
+                return ConnectionCheckResult.failure(
+                    ConnectionErrorKind.PERMISSION,
+                    f"SQLite path '{path}' is a directory, not a file",
+                )
+            if os.access(path, os.R_OK):
+                return ConnectionCheckResult.success(f"SQLite file '{path}' is readable")
+            return ConnectionCheckResult.failure(
+                ConnectionErrorKind.PERMISSION,
+                f"SQLite file '{path}' exists but is not readable",
+            )
+
         if path.exists():
             if path.is_dir():
                 return ConnectionCheckResult.failure(

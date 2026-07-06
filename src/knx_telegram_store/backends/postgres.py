@@ -93,6 +93,7 @@ class PostgresStore(BaseSQLStore):
         this, but an explicit run makes the size drop observable right after
         a purge.
         """
+        self._ensure_writable()
         engine = self.engine.execution_options(isolation_level="AUTOCOMMIT")
         async with engine.connect() as conn:
             await conn.execute(text("VACUUM telegrams"))

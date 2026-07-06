@@ -44,6 +44,7 @@ class StoreCapabilities:
     supports_count: bool = False
     supports_size_stats: bool = False
     supports_optimize: bool = False
+    read_only: bool = False
     max_storage: int | None = None  # None = unlimited
 
 

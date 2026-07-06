@@ -26,27 +26,42 @@ def _classify_sqlite_error(exc: BaseException) -> ConnectionErrorKind:
 class SqliteStore(BaseSQLStore):
     """Async SQLite implementation of TelegramStore."""
 
-    def __init__(self, db_path: str | Path, retention_days: int | None = None) -> None:
-        """Initialize the SQLite store."""
-        # Ensure parent directory exists (unless in-memory)
-        if str(db_path) != ":memory:":
-            path = Path(db_path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            url = f"sqlite+aiosqlite:///{path}"
-        else:
-            url = "sqlite+aiosqlite:///:memory:"
+    def __init__(self, db_path: str | Path, retention_days: int | None = None, *, read_only: bool = False) -> None:
+        """Initialize the SQLite store.
 
-        engine = create_async_engine(url)
-        super().__init__(engine, retention_days)
+        With read_only=True the file is opened with sqlite's ``mode=ro`` (writes
+        are impossible at the driver level), no DDL/migrations are run, and all
+        mutating operations raise. Intended for reading a database owned and
+        written by another process (e.g. Home Assistant's telegram store).
+        """
+        self._is_memory = str(db_path) == ":memory:"
+        if self._is_memory:
+            if read_only:
+                raise ValueError("read_only is not supported for in-memory databases")
+            url = "sqlite+aiosqlite:///:memory:"
+        else:
+            path = Path(db_path)
+            if read_only:
+                url = f"sqlite+aiosqlite:///file:{path}?mode=ro&uri=true"
+            else:
+                # Ensure parent directory exists
+                path.parent.mkdir(parents=True, exist_ok=True)
+                url = f"sqlite+aiosqlite:///{path}"
+
+        # timeout is sqlite's busy timeout: with a concurrent writer (WAL or
+        # rollback journal) readers wait instead of failing with SQLITE_BUSY.
+        engine = create_async_engine(url, connect_args={"timeout": 10})
+        super().__init__(engine, retention_days, read_only=read_only)
 
     @staticmethod
-    def check_config(db_path: str | Path) -> ConnectionCheckResult:
+    def check_config(db_path: str | Path, *, read_only: bool = False) -> ConnectionCheckResult:
         """Validate a SQLite path without constructing a store or touching the disk.
 
         Synchronous — this is a pure filesystem check (no I/O await). Returns a
-        structured result indicating whether the file is writeable or can be created.
+        structured result indicating whether the file is writeable or can be
+        created (or, with read_only=True, whether it exists and is readable).
         """
-        return evaluate_sqlite_path(db_path)
+        return evaluate_sqlite_path(db_path, read_only=read_only)
 
     async def check_connection(self, *, timeout: float = 5.0) -> ConnectionCheckResult:
         """Probe the SQLite database with ``SELECT 1`` (creates an empty file if missing)."""
@@ -69,12 +84,28 @@ class SqliteStore(BaseSQLStore):
         blocks concurrent writers and temporarily needs up to twice the
         database size in free disk space.
         """
+        self._ensure_writable()
         engine = self.engine.execution_options(isolation_level="AUTOCOMMIT")
         async with engine.connect() as conn:
             await conn.execute(text("VACUUM"))
 
     async def initialize(self) -> None:
         """Set up the database schema and perform upgrades."""
+        if self._read_only:
+            # Another process owns the schema — never run DDL/migrations here.
+            # Hosts should check needs_migration() and surface a version-skew
+            # error instead of relying on this store to upgrade anything.
+            await super().initialize()
+            return
+
+        if not self._is_memory:
+            # WAL makes concurrent single-writer/multi-reader access safe
+            # (readers don't block the writer and vice versa). Persists in the
+            # database file; cannot be set inside a transaction.
+            wal_engine = self.engine.execution_options(isolation_level="AUTOCOMMIT")
+            async with wal_engine.connect() as conn:
+                await conn.execute(text("PRAGMA journal_mode=WAL"))
+
         async with self.engine.begin() as conn:
             # 1. Create table if not exists
             await conn.run_sync(self._metadata.create_all)

@@ -58,8 +58,12 @@ class MemoryStore(TelegramStore):
         self._telegrams.extend(telegrams)
 
     @wrap_store_errors
-    async def query(self, query: TelegramQuery) -> TelegramQueryResult:
-        """Retrieve telegrams matching the given query."""
+    async def query(self, query: TelegramQuery, *, flush_first: bool = False) -> TelegramQueryResult:
+        """Retrieve telegrams matching the given query.
+
+        flush_first is accepted for signature compatibility with the buffered
+        stores; there is no write buffer here, so it is a no-op.
+        """
         results = list(self._telegrams)
 
         # 1. Multi-value filters (AND across, OR within)
