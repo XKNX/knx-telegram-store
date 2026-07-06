@@ -8,7 +8,7 @@ from .backends.postgres import PostgresStore
 from .backends.sqlite import SqliteStore
 from .model import StoredTelegram
 from .query import TelegramQuery, TelegramQueryResult
-from .store import wrap_store_errors
+from .store import StoreStats, wrap_store_errors
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -141,6 +141,18 @@ class _BufferMixin:
         """Retrieve the latest unique telegram for each destination group address."""
         await self.flush()
         return await super().get_last_unique_telegrams()  # type: ignore[misc, no-any-return]
+
+    @wrap_store_errors
+    async def get_stats(self) -> StoreStats:
+        """Return store stats, flushing buffered writes first so counts are current."""
+        await self.flush()
+        return await super().get_stats()  # type: ignore[misc, no-any-return]
+
+    @wrap_store_errors
+    async def optimize(self) -> None:
+        """Flush buffered writes, then reclaim space in the backing store."""
+        await self.flush()
+        await super().optimize()  # type: ignore[misc]
 
     # --- Clear overrride (wipe buffer + table) ---
 

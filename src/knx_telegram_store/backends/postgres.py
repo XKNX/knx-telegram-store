@@ -9,6 +9,7 @@ from ..connection import (
     probe_engine,
     probe_timescaledb,
 )
+from ..store import wrap_store_errors
 from .base_sql import BaseSQLStore
 
 
@@ -61,6 +62,42 @@ class PostgresStore(BaseSQLStore):
         if not result.ok:
             return result
         return await probe_timescaledb(self.engine, timeout=timeout)
+
+    async def _size_bytes(self) -> int | None:
+        """Return the total size of the store's tables in bytes.
+
+        Uses TimescaleDB's hypertable_size() for the telegrams table (chunks
+        live in a separate schema, so pg_total_relation_size would undercount)
+        and falls back to pg_total_relation_size if telegrams is not a
+        hypertable. Runs in AUTOCOMMIT so the fallback probe does not abort a
+        transaction.
+        """
+        engine = self.engine.execution_options(isolation_level="AUTOCOMMIT")
+        async with engine.connect() as conn:
+            try:
+                telegrams_size = await conn.scalar(text("SELECT hypertable_size('telegrams')"))
+            except Exception:
+                telegrams_size = None
+            if telegrams_size is None:
+                telegrams_size = await conn.scalar(text("SELECT pg_total_relation_size('telegrams')"))
+            aux_size = await conn.scalar(
+                text("SELECT pg_total_relation_size('string_lookup') + pg_total_relation_size('last_ga_telegrams')")
+            )
+        return int(telegrams_size or 0) + int(aux_size or 0)
+
+    @wrap_store_errors
+    async def optimize(self) -> None:
+        """Reclaim space from dead tuples after deletions.
+
+        VACUUM cannot run inside a transaction; autovacuum normally handles
+        this, but an explicit run makes the size drop observable right after
+        a purge.
+        """
+        engine = self.engine.execution_options(isolation_level="AUTOCOMMIT")
+        async with engine.connect() as conn:
+            await conn.execute(text("VACUUM telegrams"))
+            await conn.execute(text("VACUUM string_lookup"))
+            await conn.execute(text("VACUUM last_ga_telegrams"))
 
     async def initialize(self) -> None:
         """Set up the database schema and perform upgrades."""

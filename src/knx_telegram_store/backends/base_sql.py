@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from ..lookup import LookupCache, build_lookup_table
 from ..model import StoredTelegram
 from ..query import TelegramQuery, TelegramQueryResult
-from ..store import StoreCapabilities, TelegramStore, wrap_store_errors
+from ..store import StoreCapabilities, StoreStats, TelegramStore, wrap_store_errors
 
 
 class BaseSQLStore(TelegramStore):
@@ -86,6 +86,8 @@ class BaseSQLStore(TelegramStore):
             supports_time_delta=True,
             supports_pagination=True,
             supports_count=True,
+            supports_size_stats=True,
+            supports_optimize=True,
             max_storage=None,
         )
 
@@ -380,6 +382,30 @@ class BaseSQLStore(TelegramStore):
         """Return the total number of stored telegrams."""
         async with self.engine.connect() as conn:
             return await conn.scalar(select(func.count()).select_from(self.telegrams)) or 0
+
+    @wrap_store_errors
+    async def get_stats(self) -> StoreStats:
+        """Return a snapshot of the store's contents and storage footprint."""
+        stmt = select(
+            func.count(),
+            func.min(self.telegrams.c.timestamp),
+            func.max(self.telegrams.c.timestamp),
+        )
+        async with self.engine.connect() as conn:
+            row = (await conn.execute(stmt)).one()
+
+        return StoreStats(
+            telegram_count=row[0] or 0,
+            oldest_timestamp=row[1],
+            newest_timestamp=row[2],
+            size_bytes=await self._size_bytes(),
+            backend=self.engine.dialect.name,
+            retention_days=self._retention_days,
+        )
+
+    async def _size_bytes(self) -> int | None:
+        """Return the on-disk size of the store in bytes, or None if unknown."""
+        return None
 
     @wrap_store_errors
     async def clear(self) -> None:

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 from ..model import StoredTelegram
 from ..query import TelegramQuery, TelegramQueryResult
-from ..store import StoreCapabilities, TelegramStore, wrap_store_errors
+from ..store import StoreCapabilities, StoreStats, TelegramStore, wrap_store_errors
 
 
 class MemoryStore(TelegramStore):
@@ -119,6 +119,19 @@ class MemoryStore(TelegramStore):
     async def count(self) -> int:
         """Return the total number of stored telegrams."""
         return len(self._telegrams)
+
+    @wrap_store_errors
+    async def get_stats(self) -> StoreStats:
+        """Return a snapshot of the store's contents."""
+        timestamps = [t.timestamp for t in self._telegrams]
+        return StoreStats(
+            telegram_count=len(self._telegrams),
+            oldest_timestamp=min(timestamps) if timestamps else None,
+            newest_timestamp=max(timestamps) if timestamps else None,
+            size_bytes=None,
+            backend="memory",
+            retention_days=None,
+        )
 
     @wrap_store_errors
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:

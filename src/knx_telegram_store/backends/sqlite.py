@@ -11,6 +11,7 @@ from ..connection import (
     evaluate_sqlite_path,
     probe_engine,
 )
+from ..store import wrap_store_errors
 from .base_sql import BaseSQLStore
 
 
@@ -50,6 +51,27 @@ class SqliteStore(BaseSQLStore):
     async def check_connection(self, *, timeout: float = 5.0) -> ConnectionCheckResult:
         """Probe the SQLite database with ``SELECT 1`` (creates an empty file if missing)."""
         return await probe_engine(self.engine, timeout=timeout, classify=_classify_sqlite_error)
+
+    async def _size_bytes(self) -> int | None:
+        """Return the database size in bytes (page_count * page_size)."""
+        async with self.engine.connect() as conn:
+            page_count = await conn.scalar(text("PRAGMA page_count"))
+            page_size = await conn.scalar(text("PRAGMA page_size"))
+        if page_count is None or page_size is None:
+            return None
+        return int(page_count) * int(page_size)
+
+    @wrap_store_errors
+    async def optimize(self) -> None:
+        """Reclaim disk space freed by deletions.
+
+        VACUUM rewrites the database file; it cannot run inside a transaction,
+        blocks concurrent writers and temporarily needs up to twice the
+        database size in free disk space.
+        """
+        engine = self.engine.execution_options(isolation_level="AUTOCOMMIT")
+        async with engine.connect() as conn:
+            await conn.execute(text("VACUUM"))
 
     async def initialize(self) -> None:
         """Set up the database schema and perform upgrades."""

@@ -42,7 +42,21 @@ class StoreCapabilities:
     supports_time_delta: bool = False
     supports_pagination: bool = False
     supports_count: bool = False
+    supports_size_stats: bool = False
+    supports_optimize: bool = False
     max_storage: int | None = None  # None = unlimited
+
+
+@dataclass(frozen=True, slots=True)
+class StoreStats:
+    """Snapshot of the store's contents and storage footprint."""
+
+    telegram_count: int
+    oldest_timestamp: datetime | None
+    newest_timestamp: datetime | None
+    size_bytes: int | None  # None if the backend cannot report a size
+    backend: str
+    retention_days: int | None
 
 
 class TelegramStore(ABC):
@@ -108,6 +122,29 @@ class TelegramStore(ABC):
     @abstractmethod
     async def count(self) -> int:
         """Return the total number of stored telegrams."""
+
+    async def get_stats(self) -> StoreStats:
+        """Return a snapshot of the store's contents and storage footprint.
+
+        Default implementation only fills the count; backends should override
+        to report timestamps and size where they can do so natively.
+        """
+        return StoreStats(
+            telegram_count=await self.count(),
+            oldest_timestamp=None,
+            newest_timestamp=None,
+            size_bytes=None,
+            backend=type(self).__name__,
+            retention_days=self.retention_days,
+        )
+
+    async def optimize(self) -> None:  # noqa: B027 — intentional no-op default, not abstract
+        """Reclaim storage space after deletions (e.g. VACUUM).
+
+        No-op by default; backends that support it set
+        capabilities.supports_optimize and override. May block writers and
+        take a long time on large databases.
+        """
 
     @abstractmethod
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
