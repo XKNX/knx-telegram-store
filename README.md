@@ -10,6 +10,10 @@ A standalone, host-agnostic Python library for KNX telegram persistence.
   - **SQLite**: Lightweight persistent storage with SQL-based filtering.
   - **PostgreSQL + TimescaleDB**: Full-scale time-series storage.
 - **Unified Query Model**: Powerful declarative filtering including time-delta context windows and pagination.
+- **Stats & Maintenance**: `get_stats()` reports count, covered time range and on-disk size; `evict_older_than()` supports dry runs; `optimize()` reclaims disk space (VACUUM).
+- **Read-Only Mode**: Open a SQLite store owned and written by another process (e.g. Home Assistant's KNX telegram store) without running migrations or allowing writes.
+- **Concurrent Access**: Writing SQLite stores use WAL journaling and a busy timeout, so a single writer and multiple (cross-process) readers coexist safely.
+- **Capability Flags**: `store.capabilities` declares what a backend supports (`supports_optimize`, `supports_size_stats`, `read_only`, …) so hosts can gate UI instead of hardcoding backends.
 - **Zero Runtime Dependencies**: Core library (model, interface, in-memory) has no dependencies.
 - **Automated Schema Management**: SQL backends handle their own creation and upgrades.
 
@@ -58,6 +62,49 @@ async def main():
     await store.close()
 ```
 
+## Stats, purging and space reclamation
+
+```python
+from datetime import UTC, datetime, timedelta
+from knx_telegram_store.backends.sqlite import SqliteStore
+
+store = SqliteStore("/data/telegrams.db", retention_days=90)
+await store.initialize()
+
+stats = await store.get_stats()
+print(f"{stats.telegram_count} telegrams, {stats.size_bytes} bytes, "
+      f"{stats.oldest_timestamp} .. {stats.newest_timestamp}")
+
+cutoff = datetime.now(UTC) - timedelta(days=30)
+would_delete = await store.evict_older_than(cutoff, dry_run=True)  # preview only
+deleted = await store.evict_older_than(cutoff)
+
+# Deleting rows does not shrink the database on disk by itself:
+if store.capabilities.supports_optimize:
+    await store.optimize()  # VACUUM — blocks writers, can take a while on large DBs
+```
+
+## Read-only access to a shared store
+
+Another process (e.g. Home Assistant's KNX integration) owns and writes the
+database; you only want to read it:
+
+```python
+store = SqliteStore("/homeassistant/.storage/knx/telegrams.db", read_only=True)
+await store.initialize()   # never runs DDL/migrations against a foreign schema
+
+if await store.needs_migration():
+    ...  # schema is older/newer than this library version — surface a warning
+
+result = await store.query(TelegramQuery(limit=100))
+await store.store(telegram)  # raises KnxTelegramStoreException — writes rejected
+```
+
+The file is opened with SQLite's `mode=ro`, so writes are impossible at the
+driver level. `capabilities.read_only` is `True` and `supports_optimize` is
+`False` in this mode. Writing stores enable WAL journaling, which makes this
+single-writer/multi-reader setup safe across processes.
+
 ## Validating a config / connection
 
 Before triggering an expensive operation such as a migration, you can validate that a
@@ -72,6 +119,8 @@ from knx_telegram_store.backends.postgres import PostgresStore
 # Static, side-effect-free config validation (before constructing a store):
 #  - SQLite: sync — checks the file is writeable or can be created
 result = SqliteStore.check_config("/data/telegrams.db")
+#    (with read_only=True: checks the file exists and is readable instead)
+result = SqliteStore.check_config("/data/telegrams.db", read_only=True)
 #  - Postgres: async — actually connects to verify user/password/host/port/database
 result = await PostgresStore.check_config("postgresql://user:pw@host:5432/knx")
 
