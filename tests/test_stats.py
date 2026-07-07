@@ -114,3 +114,14 @@ async def test_capability_flags(store):
     else:
         assert caps.supports_size_stats is False
         assert caps.supports_optimize is False
+
+
+def test_postgres_does_not_advertise_optimize():
+    # Plain VACUUM doesn't shrink Postgres files, so the capability must be
+    # off — UIs use it to decide whether to offer a "reclaim space" action.
+    # Constructing the store is lazy; no server needed.
+    from knx_telegram_store.backends.postgres import PostgresStore
+
+    store = PostgresStore("postgresql+asyncpg://user:pw@localhost:5432/db")
+    assert store.capabilities.supports_optimize is False
+    assert store.capabilities.supports_size_stats is True

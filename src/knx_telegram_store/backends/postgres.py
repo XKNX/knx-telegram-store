@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -37,6 +39,12 @@ class PostgresStore(BaseSQLStore):
         """Initialize the Postgres store."""
         engine = _build_engine(dsn)
         super().__init__(engine, retention_days)
+        # Plain VACUUM only marks dead tuples reusable — it does not return
+        # disk space to the OS, so an optimize run is not observable in the
+        # reported size (VACUUM FULL would be, but takes an ACCESS EXCLUSIVE
+        # lock and doubles disk usage while it runs). Autovacuum handles dead
+        # tuples; don't advertise a no-op to UIs.
+        self._capabilities = replace(self._capabilities, supports_optimize=False)
 
     @staticmethod
     async def check_config(dsn: str, *, timeout: float = 5.0) -> ConnectionCheckResult:
@@ -87,11 +95,12 @@ class PostgresStore(BaseSQLStore):
 
     @wrap_store_errors
     async def optimize(self) -> None:
-        """Reclaim space from dead tuples after deletions.
+        """Mark dead tuples reusable after deletions (plain VACUUM).
 
-        VACUUM cannot run inside a transaction; autovacuum normally handles
-        this, but an explicit run makes the size drop observable right after
-        a purge.
+        Not advertised via capabilities: plain VACUUM does not shrink the
+        database files, so the reported size will not drop. Kept for callers
+        that want to make dead-tuple space reusable ahead of autovacuum.
+        VACUUM cannot run inside a transaction, hence AUTOCOMMIT.
         """
         self._ensure_writable()
         engine = self.engine.execution_options(isolation_level="AUTOCOMMIT")
