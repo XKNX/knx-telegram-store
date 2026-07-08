@@ -14,6 +14,7 @@ A standalone, host-agnostic Python library for KNX telegram persistence.
 - **Read-Only Mode**: Open a SQLite store owned and written by another process (e.g. Home Assistant's KNX telegram store) without running migrations or allowing writes.
 - **Concurrent Access**: Writing SQLite stores use WAL journaling and a busy timeout, so a single writer and multiple (cross-process) readers coexist safely.
 - **Capability Flags**: `store.capabilities` declares what a backend supports (`supports_optimize`, `supports_size_stats`, `read_only`, …) so hosts can gate UI instead of hardcoding backends.
+- **Log Container Format**: `formats.ets_xml` streams the KNX `CommunicationLog` XML container (ETS6 group-monitor exports, Gira IP-Router data-logger dumps) to/from raw cEMI frames — constant memory, no protocol decoding, stdlib-only.
 - **Zero Runtime Dependencies**: Core library (model, interface, in-memory) has no dependencies.
 - **Automated Schema Management**: SQL backends handle their own creation and upgrades.
 
@@ -133,6 +134,29 @@ result = await store.check_connection()
 if result.kind is ConnectionErrorKind.OK:
     await store.initialize()
 ```
+
+## Reading / writing telegram log files
+
+`formats.ets_xml` handles the KNX `CommunicationLog` XML container (namespace
+`http://knx.org/xml/telegrams/01`) produced by ETS6 exports and Gira data loggers.
+It operates on **raw cEMI frames** — no protocol decoding, no `xknx` dependency —
+so any consumer can stream large logs with constant memory.
+
+```python
+from knx_telegram_store.formats import iter_communication_log, write_communication_log
+
+# Incremental read (file path or binary stream, e.g. a zip entry):
+for record in iter_communication_log("2026_03_05_TP1.xml"):
+    print(record.timestamp, record.service, record.raw_data.hex())
+    #      aware UTC        "L_Data.ind"   cEMI frame as logged
+
+# Streaming write (records may be a generator; ETS6-compatible output):
+with open("export.xml", "w", encoding="utf-8") as fh:
+    count = write_communication_log(records, fh, connection_name="My Export")
+```
+
+A Gira-style `<!-- timezone offset +01:00 hour -->` comment is honored, and ETS's
+7-digit fractional seconds are normalized to microseconds.
 
 ## License
 
