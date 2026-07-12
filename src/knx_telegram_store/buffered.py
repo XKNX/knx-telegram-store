@@ -32,12 +32,20 @@ class _BufferMixin:
     - clear() wipes both the in-memory buffer and the underlying table.
     """
 
-    def __init__(self, *args: Any, flush_interval: float = 1.0, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        flush_interval: float = 1.0,
+        max_buffer_size: int = 10000,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._buffer: list[StoredTelegram] = []
         self._flush_task: asyncio.Task[None] | None = None
         self._closing = False
         self.flush_interval = flush_interval
+        self.max_buffer_size = max_buffer_size
+        self._buffer_full_warned = False
 
     # --- Lifecycle ---
 
@@ -81,6 +89,14 @@ class _BufferMixin:
         if self._closing:
             _LOGGER.warning("Store is closing, dropping telegram")
             return
+        if len(self._buffer) >= self.max_buffer_size:
+            if not self._buffer_full_warned:
+                _LOGGER.warning(
+                    "Telegram store buffer limit reached (%d), dropping oldest telegrams",
+                    self.max_buffer_size,
+                )
+                self._buffer_full_warned = True
+            self._buffer.pop(0)
         self._buffer.append(telegram)
 
     def store_sync(self, telegram: StoredTelegram) -> None:
@@ -88,6 +104,14 @@ class _BufferMixin:
         if self._closing:
             _LOGGER.warning("Store is closing, dropping telegram")
             return
+        if len(self._buffer) >= self.max_buffer_size:
+            if not self._buffer_full_warned:
+                _LOGGER.warning(
+                    "Telegram store buffer limit reached (%d), dropping oldest telegrams",
+                    self.max_buffer_size,
+                )
+                self._buffer_full_warned = True
+            self._buffer.pop(0)
         self._buffer.append(telegram)
 
     async def _flush(self) -> None:
@@ -100,10 +124,20 @@ class _BufferMixin:
 
         try:
             await self.store_many(batch)  # type: ignore[attr-defined]
+            self._buffer_full_warned = False
         except Exception as err:
             _LOGGER.error("Error flushing telegram buffer: %s", err)
             # Re-prepend the batch so it's retried before any newer items
             self._buffer[0:0] = batch
+            if len(self._buffer) > self.max_buffer_size:
+                if not self._buffer_full_warned:
+                    _LOGGER.warning(
+                        "Telegram store buffer exceeded limit (%d items) after failed flush, dropping %d oldest telegrams",
+                        self.max_buffer_size,
+                        len(self._buffer) - self.max_buffer_size,
+                    )
+                    self._buffer_full_warned = True
+                self._buffer = self._buffer[-self.max_buffer_size :]
 
     @wrap_store_errors
     async def flush(self) -> None:

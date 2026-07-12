@@ -169,3 +169,69 @@ def test_properties():
     assert store.retention_days is None
     assert store.max_telegrams is None
     assert store.capabilities.supports_pagination is True
+
+
+@pytest.mark.asyncio
+async def test_buffer_limit(sample_telegram):
+    store = BufferedSqliteStore(":memory:", max_buffer_size=3)
+    await store.initialize()
+
+    # Store 4 telegrams
+    for i in range(4):
+        t = StoredTelegram(
+            timestamp=sample_telegram.timestamp,
+            source=f"1.1.{i}",
+            destination=sample_telegram.destination,
+            telegramtype=sample_telegram.telegramtype,
+            direction=sample_telegram.direction,
+        )
+        await store.store(t)
+
+    # Buffer should be capped at 3, with the oldest (1.1.0) dropped
+    assert len(store._buffer) == 3
+    assert store._buffer[0].source == "1.1.1"
+    assert store._buffer[1].source == "1.1.2"
+    assert store._buffer[2].source == "1.1.3"
+
+
+@pytest.mark.asyncio
+async def test_buffer_limit_failed_flush(sample_telegram, monkeypatch):
+    store = BufferedSqliteStore(":memory:", max_buffer_size=3)
+    await store.initialize()
+
+    async def _fail(telegrams):
+        raise RuntimeError("DB error")
+
+    monkeypatch.setattr(type(store), "store_many", _fail)
+
+    # Add 2 items, flush fails (they remain in buffer)
+    for i in range(2):
+        t = StoredTelegram(
+            timestamp=sample_telegram.timestamp,
+            source=f"1.1.{i}",
+            destination=sample_telegram.destination,
+            telegramtype=sample_telegram.telegramtype,
+            direction=sample_telegram.direction,
+        )
+        await store.store(t)
+
+    await store.flush()
+    assert len(store._buffer) == 2
+
+    # Now add 2 more items
+    for i in range(2, 4):
+        t = StoredTelegram(
+            timestamp=sample_telegram.timestamp,
+            source=f"1.1.{i}",
+            destination=sample_telegram.destination,
+            telegramtype=sample_telegram.telegramtype,
+            direction=sample_telegram.direction,
+        )
+        await store.store(t)
+
+    await store.flush()
+    # Should be capped at 3, with oldest ("1.1.0") dropped
+    assert len(store._buffer) == 3
+    assert store._buffer[0].source == "1.1.1"
+    assert store._buffer[1].source == "1.1.2"
+    assert store._buffer[2].source == "1.1.3"
