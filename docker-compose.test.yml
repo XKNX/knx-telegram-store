@@ -1,0 +1,31 @@
+# Databases for the Postgres integration tests (see scripts/run_integration_tests.sh).
+# Two servers so both code paths are exercised: TimescaleDB (hypertable +
+# compression) and stock PostgreSQL (plain fallback).
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg17
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: knx
+      POSTGRES_PASSWORD: knxtest
+      POSTGRES_DB: knx
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U knx -d knx"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: knx
+      POSTGRES_PASSWORD: knxtest
+      POSTGRES_DB: knx
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U knx -d knx"]
+      interval: 2s
+      timeout: 5s
+      retries: 30

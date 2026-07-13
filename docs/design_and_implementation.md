@@ -365,22 +365,24 @@ CREATE INDEX IF NOT EXISTS ix_telegrams_type ON telegrams (telegramtype, timesta
 CREATE INDEX IF NOT EXISTS ix_telegrams_dpt ON telegrams (dpt_main, dpt_sub, timestamp DESC);
 ```
 
-### 6c. PostgreSQL + TimescaleDB Backend (`backends/postgres.py`)
+### 6c. PostgreSQL Backend (`backends/postgres.py`)
 
-**Purpose:** Full-scale time-series storage for SpectrumKNX and advanced HA deployments.
+**Purpose:** Full-scale storage for SpectrumKNX and advanced HA deployments. Works on any PostgreSQL server; TimescaleDB is used automatically when available.
 
 ```
-PostgresStore(dsn: str)
+PostgresStore(dsn: str, retention_days: int | None = None, *, compress_after_days: int | None = 7)
 ```
 
-- **Automated Schema Management:** `initialize()` handles creation of the `telegrams` hypertable and indices. It supports idempotent schema upgrades for existing SpectrumKNX/Postgres databases by detecting and adding missing columns.
+- **Automated Schema Management:** `initialize()` handles creation of the `telegrams` table and indices. It supports idempotent schema upgrades for existing SpectrumKNX/Postgres databases by detecting and adding missing columns.
 - Full `TelegramQuery` support including time-delta context windows (ported from SpectrumKNX's current `api.py` implementation).
-- **TimescaleDB Optimization:** The backend leverages TimescaleDB hypertables and should use time-series specific functions (like `time_bucket`) for efficient time-range queries where applicable.
+- **Optional TimescaleDB:** `initialize()` probes `pg_available_extensions`. When TimescaleDB is available, the extension is enabled, `telegrams` is converted to a hypertable (`migrate_data => TRUE` also converts a table that already holds rows from a plain-PostgreSQL deployment), and native compression is configured: segment-by `destination_id`, order-by `timestamp DESC`, with an `add_compression_policy` background job compressing chunks older than `compress_after_days` (default 7 days; `None` disables). Without the extension the store runs on plain PostgreSQL tables with identical semantics. `store.timescale_enabled` reports the detected mode after `initialize()` (`None` before). `check_config()`/`check_connection()` treat a missing extension as an informative success, not an error.
+- **Retention** is exact and DELETE-based on both modes (`evict_older_than`); DML inside compressed chunks is supported by TimescaleDB ≥ 2.11, so eviction semantics do not change with compression.
 - Optional dependency: `knx-telegram-store[postgres]` → `asyncpg`, `sqlalchemy[asyncio]`.
 
 **Schema (extends existing SpectrumKNX):**
 
 ```sql
+-- Only when the extension is available on the server:
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 CREATE TABLE IF NOT EXISTS telegrams (
@@ -402,8 +404,12 @@ CREATE TABLE IF NOT EXISTS telegrams (
     destination_name  VARCHAR(255) DEFAULT ''
 );
 
--- Convert to hypertable (idempotent)
-SELECT create_hypertable('telegrams', 'timestamp', if_not_exists => TRUE);
+-- Only when TimescaleDB is available (idempotent; migrates existing rows):
+SELECT create_hypertable('telegrams', 'timestamp', if_not_exists => TRUE, migrate_data => TRUE);
+ALTER TABLE telegrams SET (timescaledb.compress,
+                           timescaledb.compress_orderby = 'timestamp DESC',
+                           timescaledb.compress_segmentby = 'destination_id');
+SELECT add_compression_policy('telegrams', INTERVAL '7 days', if_not_exists => TRUE);
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS ix_telegrams_destination ON telegrams (destination, timestamp DESC);
@@ -597,7 +603,7 @@ test_order_ascending
 
 - **HA Storage:** Mock the HA `Store` class, verify `load()` / `save()` produce the same JSON format as the current integration.
 - **SQLite:** Use `tmp_path` fixture for ephemeral databases.
-- **PostgreSQL:** Marked as integration tests (`pytest.mark.postgres`), require a running Postgres+TimescaleDB instance (CI uses Docker).
+- **PostgreSQL:** Marked as integration tests (`pytest.mark.integration`, in `tests/integration/`), run against **two** live servers — TimescaleDB and stock PostgreSQL — so both the hypertable/compression path and the plain fallback are exercised. Locally: `./scripts/run_integration_tests.sh` (Docker, see `docker-compose.test.yml`); CI runs the same suite via service containers.
 
 ### Consumer Integration Tests
 

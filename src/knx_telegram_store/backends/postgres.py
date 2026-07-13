@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
+from urllib.parse import unquote
 
 from sqlalchemy import inspect, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from ..connection import (
     ConnectionCheckResult,
+    ConnectionErrorKind,
     classify_postgres_error,
     probe_engine,
     probe_timescaledb,
 )
 from ..store import wrap_store_errors
 from .base_sql import BaseSQLStore
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _build_engine(dsn: str) -> AsyncEngine:
@@ -29,16 +35,58 @@ def _build_engine(dsn: str) -> AsyncEngine:
         # Default to no SSL if not explicitly requested, to avoid blocking cert loading
         connect_args["ssl"] = False
 
-    return create_async_engine(dsn, connect_args=connect_args)
+    url = make_url(dsn)
+    if url.database:
+        # libpq/asyncpg URIs percent-decode the database component, but
+        # SQLAlchemy's make_url leaves it encoded — decode it here so
+        # percent-encoded database names target the right database.
+        url = url.set(database=unquote(url.database))
+    return create_async_engine(url, connect_args=connect_args)
+
+
+def _timescale_advisory(result: ConnectionCheckResult) -> ConnectionCheckResult:
+    """Demote a missing-TimescaleDB probe result to an informative success.
+
+    TimescaleDB is optional: the store falls back to plain PostgreSQL when the
+    extension is not available, so its absence must not fail a connection
+    check. Any other probe failure (auth, timeout, ...) is passed through.
+    """
+    if result.ok:
+        return ConnectionCheckResult.success("Connection OK (TimescaleDB available)")
+    if result.kind is ConnectionErrorKind.MISSING_TIMESCALEDB:
+        return ConnectionCheckResult.success("Connection OK (TimescaleDB not available — using plain PostgreSQL)")
+    return result
 
 
 class PostgresStore(BaseSQLStore):
-    """PostgreSQL + TimescaleDB implementation of TelegramStore."""
+    """PostgreSQL implementation of TelegramStore.
 
-    def __init__(self, dsn: str, retention_days: int | None = None) -> None:
-        """Initialize the Postgres store."""
+    TimescaleDB is used automatically when the extension is available on the
+    server: the telegrams table becomes a hypertable and native compression is
+    enabled. Without the extension the store runs on plain PostgreSQL with
+    identical semantics.
+    """
+
+    def __init__(
+        self,
+        dsn: str,
+        retention_days: int | None = None,
+        *,
+        compress_after_days: int | None = 7,
+    ) -> None:
+        """Initialize the Postgres store.
+
+        Args:
+            dsn: PostgreSQL connection string.
+            retention_days: Optional retention period in days.
+            compress_after_days: When TimescaleDB is available, compress chunks
+                older than this many days (None disables compression setup).
+                Ignored on plain PostgreSQL.
+        """
         engine = _build_engine(dsn)
         super().__init__(engine, retention_days)
+        self._compress_after_days = compress_after_days
+        self._timescale_enabled: bool | None = None
         # Plain VACUUM only marks dead tuples reusable — it does not return
         # disk space to the OS, so an optimize run is not observable in the
         # reported size (VACUUM FULL would be, but takes an ACCESS EXCLUSIVE
@@ -46,30 +94,40 @@ class PostgresStore(BaseSQLStore):
         # tuples; don't advertise a no-op to UIs.
         self._capabilities = replace(self._capabilities, supports_optimize=False)
 
+    @property
+    def timescale_enabled(self) -> bool | None:
+        """Whether TimescaleDB is in use, or None before initialize() has run."""
+        return self._timescale_enabled
+
     @staticmethod
     async def check_config(dsn: str, *, timeout: float = 5.0) -> ConnectionCheckResult:
         """Validate a Postgres DSN by attempting a real connection.
 
         Asynchronous — connecting requires network I/O. Builds a throwaway engine,
-        runs ``SELECT 1``, verifies TimescaleDB is available, and disposes the
-        engine. Distinguishes auth, host, missing-database, and missing-TimescaleDB
-        failures via the returned result's ``kind``.
+        runs ``SELECT 1``, and disposes the engine. Distinguishes auth, host, and
+        missing-database failures via the returned result's ``kind``. TimescaleDB
+        availability is probed but only reflected in the success message — the
+        store falls back to plain PostgreSQL when the extension is missing.
         """
         engine = _build_engine(dsn)
         try:
             result = await probe_engine(engine, timeout=timeout, classify=classify_postgres_error)
             if not result.ok:
                 return result
-            return await probe_timescaledb(engine, timeout=timeout)
+            return _timescale_advisory(await probe_timescaledb(engine, timeout=timeout))
         finally:
             await engine.dispose()
 
     async def check_connection(self, *, timeout: float = 5.0) -> ConnectionCheckResult:
-        """Probe the live Postgres engine and verify TimescaleDB (no migrations, no schema changes)."""
+        """Probe the live Postgres engine (no migrations, no schema changes).
+
+        TimescaleDB availability only affects the success message; its absence
+        is not an error since the store falls back to plain PostgreSQL.
+        """
         result = await probe_engine(self.engine, timeout=timeout, classify=classify_postgres_error)
         if not result.ok:
             return result
-        return await probe_timescaledb(self.engine, timeout=timeout)
+        return _timescale_advisory(await probe_timescaledb(self.engine, timeout=timeout))
 
     async def _size_bytes(self) -> int | None:
         """Return the total size of the store's tables in bytes.
@@ -82,10 +140,14 @@ class PostgresStore(BaseSQLStore):
         """
         engine = self.engine.execution_options(isolation_level="AUTOCOMMIT")
         async with engine.connect() as conn:
-            try:
-                telegrams_size = await conn.scalar(text("SELECT hypertable_size('telegrams')"))
-            except Exception:
-                telegrams_size = None
+            telegrams_size = None
+            # Skip the hypertable probe only when we know Timescale is off;
+            # before initialize() the mode is unknown, so try it.
+            if self._timescale_enabled is not False:
+                try:
+                    telegrams_size = await conn.scalar(text("SELECT hypertable_size('telegrams')"))
+                except Exception:
+                    telegrams_size = None
             if telegrams_size is None:
                 telegrams_size = await conn.scalar(text("SELECT pg_total_relation_size('telegrams')"))
             aux_size = await conn.scalar(
@@ -110,22 +172,86 @@ class PostgresStore(BaseSQLStore):
             await conn.execute(text("VACUUM last_ga_telegrams"))
 
     async def initialize(self) -> None:
-        """Set up the database schema and perform upgrades."""
-        async with self.engine.begin() as conn:
-            # 1. Enable TimescaleDB extension
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE"))
+        """Set up the database schema and perform upgrades.
 
-            # 2. Create table if not exists
+        TimescaleDB is detected at runtime: when available, the telegrams table
+        is converted to a hypertable (migrating existing rows in place) and
+        native compression is configured; otherwise the store runs on plain
+        PostgreSQL tables.
+        """
+        # 1. Detect (and if needed enable) the TimescaleDB extension. Runs on a
+        # separate AUTOCOMMIT connection so a failed CREATE EXTENSION cannot
+        # abort the schema transaction below.
+        timescale = await self._detect_and_enable_timescale()
+
+        async with self.engine.begin() as conn:
+            # 2. Create tables if not exists
             await conn.run_sync(self._metadata.create_all)
 
             # 3. Perform column-level upgrades
             await conn.run_sync(self._upgrade_schema)
 
-            # 4. Convert to hypertable (idempotent)
-            await conn.execute(text("SELECT create_hypertable('telegrams', 'timestamp', if_not_exists => TRUE)"))
+        # 4. Hypertable conversion + compression (idempotent)
+        if timescale:
+            await self._setup_hypertable()
+
+        self._timescale_enabled = timescale
+        _LOGGER.info(
+            "Postgres store initialized (%s)",
+            "TimescaleDB: hypertable + compression" if timescale else "plain PostgreSQL",
+        )
 
         # 5. Warm the cache
         await super().initialize()
+
+    async def _detect_and_enable_timescale(self) -> bool:
+        """Return True if the TimescaleDB extension is installed or could be installed."""
+        engine = self.engine.execution_options(isolation_level="AUTOCOMMIT")
+        async with engine.connect() as conn:
+            available = await conn.execute(text("SELECT 1 FROM pg_available_extensions WHERE name = 'timescaledb'"))
+            if available.first() is None:
+                return False
+            try:
+                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE"))
+            except Exception as err:
+                # e.g. insufficient privileges — usable anyway if already installed
+                installed = await conn.execute(text("SELECT 1 FROM pg_extension WHERE extname = 'timescaledb'"))
+                if installed.first() is None:
+                    _LOGGER.warning(
+                        "TimescaleDB is available but could not be enabled (%s); falling back to plain PostgreSQL",
+                        err,
+                    )
+                    return False
+        return True
+
+    async def _setup_hypertable(self) -> None:
+        """Convert telegrams to a hypertable and configure compression.
+
+        migrate_data => TRUE also converts a table that already holds rows
+        (e.g. a store that previously ran on plain PostgreSQL). Compression
+        segments by destination GA — the dominant query filter — and orders by
+        time; a background policy compresses chunks once they age past
+        compress_after_days.
+        """
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                text("SELECT create_hypertable('telegrams', 'timestamp', if_not_exists => TRUE, migrate_data => TRUE)")
+            )
+            if self._compress_after_days is not None:
+                await conn.execute(
+                    text(
+                        "ALTER TABLE telegrams SET ("
+                        "timescaledb.compress, "
+                        "timescaledb.compress_orderby = 'timestamp DESC', "
+                        "timescaledb.compress_segmentby = 'destination_id')"
+                    )
+                )
+                await conn.execute(
+                    text(
+                        f"SELECT add_compression_policy('telegrams', "
+                        f"INTERVAL '{int(self._compress_after_days)} days', if_not_exists => TRUE)"
+                    )
+                )
 
     def _upgrade_schema(self, connection) -> None:
         """Synchronous part of schema upgrade (run via run_sync)."""

@@ -8,7 +8,7 @@ A standalone, host-agnostic Python library for KNX telegram persistence.
 - **Pluggable Backends**:
   - **In-Memory**: Fast, deque-based storage with full filtering support.
   - **SQLite**: Lightweight persistent storage with SQL-based filtering.
-  - **PostgreSQL + TimescaleDB**: Full-scale time-series storage.
+  - **PostgreSQL**: Full-scale storage. TimescaleDB is used automatically when the extension is available (hypertable partitioning + native compression); otherwise the store runs on plain PostgreSQL with identical semantics.
 - **Unified Query Model**: Powerful declarative filtering including time-delta context windows and pagination.
 - **Stats & Maintenance**: `get_stats()` reports count, covered time range and on-disk size; `evict_older_than()` supports dry runs; `optimize()` reclaims disk space (VACUUM).
 - **Read-Only Mode**: Open a SQLite store owned and written by another process (e.g. Home Assistant's KNX telegram store) without running migrations or allowing writes.
@@ -134,6 +134,55 @@ result = await store.check_connection()
 if result.kind is ConnectionErrorKind.OK:
     await store.initialize()
 ```
+
+## PostgreSQL and TimescaleDB
+
+`PostgresStore` works against any PostgreSQL server. At `initialize()` it probes
+`pg_available_extensions`: when TimescaleDB is available, the `telegrams` table
+becomes a hypertable (existing rows are migrated in place via
+`migrate_data => TRUE`) and native compression is configured — chunks are
+compressed by a background policy once they age past `compress_after_days`
+(default 7, `None` disables compression). Without the extension everything runs
+on plain PostgreSQL tables; queries, retention and stats behave identically.
+
+```python
+store = PostgresStore("postgresql://user:pw@host:5432/knx",
+                      retention_days=90, compress_after_days=7)
+await store.initialize()
+print(store.timescale_enabled)  # True / False (None before initialize())
+```
+
+`check_config()` / `check_connection()` succeed on both server types; the
+result message states which mode will be used.
+
+## Integration tests
+
+The Postgres backend has an integration test suite that runs against real
+servers — a TimescaleDB container and a stock PostgreSQL container — so both
+the hypertable/compression path and the plain fallback are exercised. With
+Docker installed:
+
+```bash
+./scripts/run_integration_tests.sh            # full suite
+./scripts/run_integration_tests.sh -k compression  # subset
+```
+
+The script starts both containers (`docker-compose.test.yml`), waits for them
+to become healthy, runs `pytest -m integration tests/integration`, and tears
+the containers down afterwards. To run tests manually, e.g. against your own
+servers:
+
+```bash
+docker compose -f docker-compose.test.yml up -d --wait
+export KNX_TEST_TIMESCALE_DSN=postgresql://knx:knxtest@localhost:5433/knx
+export KNX_TEST_PG_DSN=postgresql://knx:knxtest@localhost:5434/knx
+pytest -m integration tests/integration -v
+docker compose -f docker-compose.test.yml down -v
+```
+
+Tests for an unset DSN variable are skipped, so you can also point a single
+variable at an existing server. The same suite runs in CI against both
+containers on every push.
 
 ## Reading / writing telegram log files
 
