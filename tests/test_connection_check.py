@@ -260,6 +260,33 @@ def test_postgres_build_engine_decodes_url_components():
     assert engine.url.database == "knx?query#hash"
 
 
+def test_postgres_build_engine_translates_sslmode():
+    pytest.importorskip("asyncpg")
+    from knx_telegram_store.backends.postgres import _build_engine
+
+    # libpq's sslmode query parameter must not survive into the URL: the
+    # asyncpg dialect forwards leftover query keys verbatim to
+    # asyncpg.connect(), which rejects sslmode with a TypeError.
+    engine = _build_engine("postgresql://u:p@host:5432/db?sslmode=require")
+    assert "sslmode" not in engine.url.query
+    _, connect_kwargs = engine.dialect.create_connect_args(engine.url)
+    assert "sslmode" not in connect_kwargs
+
+
+async def test_postgres_check_config_tls_unreachable():
+    pytest.importorskip("asyncpg")
+    from knx_telegram_store.backends.postgres import PostgresStore
+
+    # A TLS DSN must fail at the network layer (unreachable host), not with a
+    # TypeError from an untranslated sslmode argument (classified UNKNOWN).
+    result = await PostgresStore.check_config(
+        "postgresql://user:pw@127.0.0.1:1/nodb?sslmode=require",
+        timeout=3.0,
+    )
+    assert not result.ok
+    assert result.kind in {ConnectionErrorKind.HOST_UNREACHABLE, ConnectionErrorKind.TIMEOUT}
+
+
 async def test_postgres_check_config_unreachable():
     pytest.importorskip("asyncpg")
     from knx_telegram_store.backends.postgres import PostgresStore

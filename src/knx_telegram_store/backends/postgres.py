@@ -30,18 +30,20 @@ def _build_engine(dsn: str) -> AsyncEngine:
     if dsn.startswith("postgresql://"):
         dsn = dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-    connect_args = {}
-    if "sslmode=require" not in dsn and "ssl=" not in dsn:
-        # Default to no SSL if not explicitly requested, to avoid blocking cert loading
-        connect_args["ssl"] = False
-
     url = make_url(dsn)
+    query = dict(url.query)
+    # asyncpg takes an ``ssl`` connect argument instead of libpq's ``sslmode``
+    # query parameter; a leftover query key would be forwarded verbatim to
+    # asyncpg.connect() and raise TypeError. Translate and strip it here.
+    # Default to no SSL when not requested, to avoid blocking cert loading.
+    ssl_value = query.pop("sslmode", None) or query.pop("ssl", None) or False
+    url = url.set(query=query)
     if url.database:
         # libpq/asyncpg URIs percent-decode the database component, but
         # SQLAlchemy's make_url leaves it encoded — decode it here so
         # percent-encoded database names target the right database.
         url = url.set(database=unquote(url.database))
-    return create_async_engine(url, connect_args=connect_args)
+    return create_async_engine(url, connect_args={"ssl": ssl_value})
 
 
 def _timescale_advisory(result: ConnectionCheckResult) -> ConnectionCheckResult:
