@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "knx-telegram-store"
-version = "0.8.1"
+version = "0.9.0"
 description = "A standalone, host-agnostic Python library for KNX telegram persistence."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -72,3 +72,6 @@ max-complexity = 15
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "integration: tests requiring a live Postgres/TimescaleDB server (run via scripts/run_integration_tests.sh)",
+]

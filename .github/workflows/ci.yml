@@ -34,3 +34,53 @@ jobs:
         run: |
           export PYTHONPATH=src
           python -m pytest tests/
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      timescaledb:
+        image: timescale/timescaledb:latest-pg17
+        ports:
+          - 5433:5432
+        env:
+          POSTGRES_USER: knx
+          POSTGRES_PASSWORD: knxtest
+          POSTGRES_DB: knx
+        options: >-
+          --health-cmd "pg_isready -U knx -d knx"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+      postgres:
+        image: postgres:17-alpine
+        ports:
+          - 5434:5432
+        env:
+          POSTGRES_USER: knx
+          POSTGRES_PASSWORD: knxtest
+          POSTGRES_DB: knx
+        options: >-
+          --health-cmd "pg_isready -U knx -d knx"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install .[dev,postgres]
+
+      - name: Run integration tests
+        env:
+          KNX_TEST_TIMESCALE_DSN: postgresql://knx:knxtest@localhost:5433/knx
+          KNX_TEST_PG_DSN: postgresql://knx:knxtest@localhost:5434/knx
+        run: |
+          export PYTHONPATH=src
+          python -m pytest -m integration tests/integration -v

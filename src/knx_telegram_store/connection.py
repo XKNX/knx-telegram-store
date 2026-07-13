@@ -23,6 +23,9 @@ class ConnectionErrorKind(StrEnum):
     PERMISSION = "permission"  # fs not writeable / insufficient privilege
     TIMEOUT = "timeout"
     MISSING_DEPENDENCY = "missing_dependency"  # driver not installed
+    # Deprecated: no longer returned by check_config/check_connection —
+    # TimescaleDB is optional and its absence is reported as a success message.
+    # Kept so consumers matching on this kind keep importing.
     MISSING_TIMESCALEDB = "missing_timescaledb"  # TimescaleDB extension not available
     UNKNOWN = "unknown"
 
@@ -206,13 +209,14 @@ async def probe_timescaledb(
     *,
     timeout: float,
 ) -> ConnectionCheckResult:
-    """Verify the TimescaleDB extension is available on the server.
+    """Probe whether the TimescaleDB extension is available on the server.
 
-    ``initialize()`` runs ``CREATE EXTENSION IF NOT EXISTS timescaledb`` and
-    creates a hypertable, so a reachable server without TimescaleDB passes the
-    plain connectivity probe but fails on first use. This read-only check
-    queries ``pg_available_extensions`` — it installs nothing and changes no
-    schema — so callers can surface the problem before saving the config.
+    Advisory: TimescaleDB is optional — the Postgres store falls back to plain
+    PostgreSQL when the extension is missing, so callers must not treat a
+    ``MISSING_TIMESCALEDB`` result as fatal (the store's check_config /
+    check_connection translate it into an informative success). This read-only
+    check queries ``pg_available_extensions`` — it installs nothing and changes
+    no schema.
     """
     from sqlalchemy import text
 

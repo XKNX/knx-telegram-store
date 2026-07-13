@@ -180,6 +180,64 @@ async def test_probe_timescaledb_query_error_is_classified():
     assert result.kind is ConnectionErrorKind.UNKNOWN
 
 
+# --- TimescaleDB is optional: missing extension is an advisory, not an error --
+
+
+def test_timescale_advisory_available():
+    from knx_telegram_store.backends.postgres import _timescale_advisory
+    from knx_telegram_store.connection import ConnectionCheckResult
+
+    result = _timescale_advisory(ConnectionCheckResult.success())
+    assert result.ok
+    assert "TimescaleDB available" in result.message
+
+
+def test_timescale_advisory_missing_is_success():
+    from knx_telegram_store.backends.postgres import _timescale_advisory
+    from knx_telegram_store.connection import ConnectionCheckResult
+
+    missing = ConnectionCheckResult.failure(
+        ConnectionErrorKind.MISSING_TIMESCALEDB,
+        "The TimescaleDB extension is not available on the database server",
+    )
+    result = _timescale_advisory(missing)
+    assert result.ok
+    assert result.kind is ConnectionErrorKind.OK
+    assert "plain PostgreSQL" in result.message
+
+
+def test_timescale_advisory_other_failures_pass_through():
+    from knx_telegram_store.backends.postgres import _timescale_advisory
+    from knx_telegram_store.connection import ConnectionCheckResult
+
+    failure = ConnectionCheckResult.failure(ConnectionErrorKind.TIMEOUT, "Connection timed out")
+    assert _timescale_advisory(failure) is failure
+
+
+async def test_postgres_check_connection_without_timescale_is_ok():
+    pytest.importorskip("asyncpg")
+    from knx_telegram_store.backends.postgres import PostgresStore
+
+    store = PostgresStore("postgresql://user:pw@localhost/db")
+    # Fake engine: SELECT 1 succeeds, extension query returns no row.
+    store.engine = _FakeEngine(row=None)
+    result = await store.check_connection()
+    assert result.ok
+    assert result.kind is ConnectionErrorKind.OK
+    assert "plain PostgreSQL" in result.message
+
+
+async def test_postgres_check_connection_with_timescale_is_ok():
+    pytest.importorskip("asyncpg")
+    from knx_telegram_store.backends.postgres import PostgresStore
+
+    store = PostgresStore("postgresql://user:pw@localhost/db")
+    store.engine = _FakeEngine(row=(1,))
+    result = await store.check_connection()
+    assert result.ok
+    assert "TimescaleDB available" in result.message
+
+
 # --- Postgres live check (opt-in via env var) -------------------------------
 
 
