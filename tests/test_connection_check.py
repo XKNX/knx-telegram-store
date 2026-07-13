@@ -192,6 +192,16 @@ async def test_postgres_check_config_live_ok():
     assert result.ok, result.message
 
 
+def test_postgres_build_engine_decodes_url_components():
+    pytest.importorskip("asyncpg")
+    from knx_telegram_store.backends.postgres import _build_engine
+
+    engine = _build_engine("postgresql://u%40x:p%40ss@host:5432/knx%3Fquery%23hash")
+    assert engine.url.username == "u@x"
+    assert engine.url.password == "p@ss"
+    assert engine.url.database == "knx?query#hash"
+
+
 async def test_postgres_check_config_unreachable():
     pytest.importorskip("asyncpg")
     from knx_telegram_store.backends.postgres import PostgresStore

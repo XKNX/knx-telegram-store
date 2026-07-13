@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from urllib.parse import unquote
 
 from sqlalchemy import inspect, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from ..connection import (
@@ -29,7 +31,13 @@ def _build_engine(dsn: str) -> AsyncEngine:
         # Default to no SSL if not explicitly requested, to avoid blocking cert loading
         connect_args["ssl"] = False
 
-    return create_async_engine(dsn, connect_args=connect_args)
+    url = make_url(dsn)
+    if url.database:
+        # libpq/asyncpg URIs percent-decode the database component, but
+        # SQLAlchemy's make_url leaves it encoded — decode it here so
+        # percent-encoded database names target the right database.
+        url = url.set(database=unquote(url.database))
+    return create_async_engine(url, connect_args=connect_args)
 
 
 class PostgresStore(BaseSQLStore):
