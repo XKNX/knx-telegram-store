@@ -404,3 +404,49 @@ async def test_compression_configured_and_queryable(timescale_dsn):
         assert await pg_store.count() == 5
     finally:
         await pg_store.close()
+
+
+async def test_reinitialize_with_compressed_legacy_rows(timescale_dsn):
+    """App restarts must survive the legacy-value backfill hitting compressed chunks.
+
+    An install upgraded to >=0.9.0 gets the compression policy; once chunks age
+    past the threshold and compress, the recurring value-backfill UPDATE used to
+    exceed TimescaleDB's per-transaction tuple decompression limit on every
+    subsequent startup and crash the host application
+    (ConfigurationLimitExceededError: tuple decompression limit exceeded).
+    """
+    store = PostgresStore(timescale_dsn)
+    await store.initialize()
+    base = datetime.now(UTC) - timedelta(days=30)
+    await store.store_many([make_telegram(base, i) for i in range(10)])
+    await store.close()
+
+    engine = _build_engine(timescale_dsn)
+    autocommit = engine.execution_options(isolation_level="AUTOCOMMIT")
+    try:
+        async with autocommit.connect() as conn:
+            # Simulate rows that predate the JSONB value column (value NULL,
+            # value_numeric set) — exactly what the startup backfill targets —
+            # then compress the chunk like the background policy would.
+            await conn.execute(text("UPDATE telegrams SET value = NULL"))
+            await conn.execute(
+                text("SELECT compress_chunk(c, if_not_compressed => TRUE) FROM show_chunks('telegrams') c")
+            )
+            # Make the decompression cap smaller than the pending backfill,
+            # like a large production history against the 100k default.
+            await conn.execute(
+                text("ALTER DATABASE knx SET timescaledb.max_tuples_decompressed_per_dml_transaction = 5")
+            )
+
+        # Re-initialize (= app restart): must not raise, and the backfill
+        # must complete by lifting the cap for its own transaction.
+        store2 = PostgresStore(timescale_dsn)
+        await store2.initialize()
+        result = await store2.query(TelegramQuery())
+        assert result.total_count == 10
+        assert all(t.value == 21.5 for t in result.telegrams)
+        await store2.close()
+    finally:
+        async with autocommit.connect() as conn:
+            await conn.execute(text("ALTER DATABASE knx RESET timescaledb.max_tuples_decompressed_per_dml_transaction"))
+        await engine.dispose()

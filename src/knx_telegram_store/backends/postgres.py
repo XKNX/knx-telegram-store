@@ -197,6 +197,21 @@ class PostgresStore(BaseSQLStore):
         if timescale:
             await self._setup_hypertable()
 
+        # 5. Legacy data backfills — separate transaction and never fatal:
+        # they only improve rows written by pre-library schemas, and on
+        # TimescaleDB they may be blocked by compressed chunks (DML
+        # restrictions / tuple decompression limits). A failure here must
+        # not prevent the host application from starting.
+        try:
+            async with self.engine.begin() as conn:
+                await conn.run_sync(lambda c: self._backfill_legacy_data(c, timescale=timescale))
+        except Exception as err:
+            _LOGGER.warning(
+                "Skipping legacy telegram data backfill (rows written by old schemas "
+                "may miss decoded values until it succeeds): %s",
+                err,
+            )
+
         self._timescale_enabled = timescale
         _LOGGER.info(
             "Postgres store initialized (%s)",
@@ -240,14 +255,24 @@ class PostgresStore(BaseSQLStore):
                 text("SELECT create_hypertable('telegrams', 'timestamp', if_not_exists => TRUE, migrate_data => TRUE)")
             )
             if self._compress_after_days is not None:
-                await conn.execute(
+                # Only configure compression once: re-running the ALTER after
+                # chunks have been compressed fails on older TimescaleDB with
+                # "cannot change configuration on already compressed chunks".
+                already_enabled = await conn.scalar(
                     text(
-                        "ALTER TABLE telegrams SET ("
-                        "timescaledb.compress, "
-                        "timescaledb.compress_orderby = 'timestamp DESC', "
-                        "timescaledb.compress_segmentby = 'destination_id')"
+                        "SELECT compression_enabled FROM timescaledb_information.hypertables "
+                        "WHERE hypertable_name = 'telegrams'"
                     )
                 )
+                if not already_enabled:
+                    await conn.execute(
+                        text(
+                            "ALTER TABLE telegrams SET ("
+                            "timescaledb.compress, "
+                            "timescaledb.compress_orderby = 'timestamp DESC', "
+                            "timescaledb.compress_segmentby = 'destination_id')"
+                        )
+                    )
                 await conn.execute(
                     text(
                         f"SELECT add_compression_policy('telegrams', "
@@ -366,11 +391,44 @@ class PostgresStore(BaseSQLStore):
                 connection.execute(text(f"ALTER TABLE telegrams ADD COLUMN {col_name} {col_type}"))
                 existing_columns.add(col_name)
 
-        # 4. Data migrations for old SpectrumKNX rows
+    def _backfill_legacy_data(self, connection, *, timescale: bool) -> None:
+        """Best-effort data backfills for rows written by pre-library schemas.
+
+        Runs in its own transaction, after DDL upgrades and hypertable setup.
+        Every pass is guarded so it only touches the database when there is
+        actually something to fix — on TimescaleDB, UPDATEs on compressed
+        chunks decompress data and are subject to DML restrictions, so the
+        common no-op case must stay read-only.
+        """
+        inspector = inspect(connection)
+        try:
+            columns = inspector.get_columns("telegrams")
+        except Exception:
+            return
+        existing_columns = {col["name"] for col in columns}
+
+        def _pending(where: str) -> bool:
+            return bool(connection.execute(text(f"SELECT EXISTS (SELECT 1 FROM telegrams WHERE {where})")).scalar())
+
+        def _lift_decompression_limit() -> None:
+            # TimescaleDB caps how many tuples one DML transaction may
+            # decompress (default 100k) — a large backfill over compressed
+            # chunks exceeds it. Lift the cap for this transaction only.
+            if not timescale:
+                return
+            guc = "timescaledb.max_tuples_decompressed_per_dml_transaction"
+            if connection.execute(text(f"SELECT 1 FROM pg_settings WHERE name = '{guc}'")).scalar():
+                connection.execute(text(f"SET LOCAL {guc} = 0"))
+
         # Old schema had value_numeric (FLOAT) and value_json (now payload),
         # but no value (JSONB) column. Populate value from value_numeric
         # so the library's query returns it correctly.
-        if "value" in existing_columns and "value_numeric" in existing_columns:
+        if (
+            "value" in existing_columns
+            and "value_numeric" in existing_columns
+            and _pending("(value IS NULL OR value::text = 'null') AND value_numeric IS NOT NULL")
+        ):
+            _lift_decompression_limit()
             connection.execute(
                 text(
                     "UPDATE telegrams SET value = to_jsonb(value_numeric) "
@@ -380,7 +438,12 @@ class PostgresStore(BaseSQLStore):
 
         # Handle edge case from intermediate migrations where value was
         # a FLOAT column renamed to value_legacy_float
-        if "value_legacy_float" in existing_columns and "value_numeric" in existing_columns:
+        if (
+            "value_legacy_float" in existing_columns
+            and "value_numeric" in existing_columns
+            and _pending("value_numeric IS NULL AND value_legacy_float IS NOT NULL")
+        ):
+            _lift_decompression_limit()
             connection.execute(
                 text(
                     "UPDATE telegrams SET value_numeric = value_legacy_float "
@@ -388,7 +451,14 @@ class PostgresStore(BaseSQLStore):
                 )
             )
 
-        # 5. Data unwrapping pass for legacy {"value": ...} wrapped structures
+        # Data unwrapping pass for legacy {"value": ...} wrapped structures.
+        # The store_metadata flag marks completion so the full-table scan
+        # doesn't run on every startup.
+        already_unwrapped = connection.execute(
+            text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")
+        ).scalar()
+        if already_unwrapped == "true":
+            return
         try:
             # Postgres supports casting JSONB to text, so we can cast value::text or payload::text
             rows = connection.execute(
@@ -402,6 +472,7 @@ class PostgresStore(BaseSQLStore):
             if rows:
                 import json
 
+                _lift_decompression_limit()
                 for row in rows:
                     timestamp = row[0]
                     source_id = row[1]
