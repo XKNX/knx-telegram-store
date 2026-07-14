@@ -257,6 +257,9 @@ class TelegramQuery:
     telegram_types: list[str] = field(default_factory=list)
     directions: list[str] = field(default_factory=list)
     dpt_mains: list[int] = field(default_factory=list)
+    # (main, sub) pairs; sub=None matches any subtype of that main.
+    # Forms one OR group together with dpt_mains.
+    dpts: list[tuple[int, int | None]] = field(default_factory=list)
 
     # ── Time range ────────────────────────────────────────────────
     start_time: datetime | None = None

@@ -16,6 +16,7 @@ from sqlalchemy import (
     Text,
     and_,
     func,
+    or_,
     select,
 )
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -313,8 +314,16 @@ class BaseSQLStore(TelegramStore):
                 self.string_lookup.c.category == "direction", self.string_lookup.c.value.in_(query.directions)
             )
             filters.append(self.telegrams.c.direction_id.in_(dir_ids))
+        dpt_conds: list[Any] = []
         if query.dpt_mains:
-            filters.append(self.telegrams.c.dpt_main.in_(query.dpt_mains))
+            dpt_conds.append(self.telegrams.c.dpt_main.in_(query.dpt_mains))
+        for main, sub in query.dpts:
+            if sub is None:
+                dpt_conds.append(self.telegrams.c.dpt_main == main)
+            else:
+                dpt_conds.append(and_(self.telegrams.c.dpt_main == main, self.telegrams.c.dpt_sub == sub))
+        if dpt_conds:
+            filters.append(or_(*dpt_conds))
 
         if query.start_time:
             filters.append(self.telegrams.c.timestamp >= query.start_time)

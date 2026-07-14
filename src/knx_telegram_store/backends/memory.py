@@ -75,8 +75,14 @@ class MemoryStore(TelegramStore):
             results = [t for t in results if t.telegramtype in query.telegram_types]
         if query.directions:
             results = [t for t in results if t.direction in query.directions]
-        if query.dpt_mains:
-            results = [t for t in results if t.dpt_main in query.dpt_mains]
+        if query.dpt_mains or query.dpts:
+
+            def dpt_match(t: StoredTelegram) -> bool:
+                if t.dpt_main in query.dpt_mains:
+                    return True
+                return any(t.dpt_main == main and sub in (None, t.dpt_sub) for main, sub in query.dpts)
+
+            results = [t for t in results if dpt_match(t)]
 
         # 2. Time range
         if query.start_time:

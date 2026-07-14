@@ -89,6 +89,52 @@ async def test_query_filters(store, sample_telegrams):
 
 
 @pytest.mark.asyncio
+async def test_query_dpt_pairs(store):
+    now = datetime.now(UTC)
+
+    def telegram(minutes_ago: int, dpt_main: int | None, dpt_sub: int | None) -> StoredTelegram:
+        return StoredTelegram(
+            timestamp=now - timedelta(minutes=minutes_ago),
+            source="1.1.1",
+            destination="1/1/1",
+            telegramtype="GroupValueWrite",
+            direction="Incoming",
+            dpt_main=dpt_main,
+            dpt_sub=dpt_sub,
+        )
+
+    await store.store_many(
+        [
+            telegram(5, 1, 1),
+            telegram(4, 1, 8),
+            telegram(3, 5, 1),
+            telegram(2, 9, None),
+            telegram(1, None, None),
+        ]
+    )
+
+    # Exact (main, sub) pair
+    result = await store.query(TelegramQuery(dpts=[(1, 1)]))
+    assert [(t.dpt_main, t.dpt_sub) for t in result.telegrams] == [(1, 1)]
+
+    # sub=None matches any subtype of that main, including sub NULL
+    result = await store.query(TelegramQuery(dpts=[(1, None)]))
+    assert len(result.telegrams) == 2
+    result = await store.query(TelegramQuery(dpts=[(9, None)]))
+    assert [(t.dpt_main, t.dpt_sub) for t in result.telegrams] == [(9, None)]
+
+    # OR within the DPT group: pairs together, and pairs with dpt_mains
+    result = await store.query(TelegramQuery(dpts=[(1, 1), (5, 1)]))
+    assert len(result.telegrams) == 2
+    result = await store.query(TelegramQuery(dpts=[(1, 8)], dpt_mains=[9]))
+    assert len(result.telegrams) == 2
+
+    # No match
+    result = await store.query(TelegramQuery(dpts=[(1, 2)]))
+    assert result.telegrams == []
+
+
+@pytest.mark.asyncio
 async def test_query_time_range(store, sample_telegrams):
     await store.store_many(sample_telegrams)
     now = datetime.now(UTC)
