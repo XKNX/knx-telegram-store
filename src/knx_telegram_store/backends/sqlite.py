@@ -217,13 +217,19 @@ class SqliteStore(BaseSQLStore):
             connection.execute(text(f"INSERT INTO telegrams ({cols_sql}) SELECT {cols_sql} FROM _telegrams_old"))
             connection.execute(text("DROP TABLE _telegrams_old"))
 
-        # 3.5. Populate value from value_numeric if it is missing/null (legacy SpectrumKNX schema)
-        if "value" in existing_columns and "value_numeric" in existing_columns:
-            connection.execute(
-                text(
-                    "UPDATE telegrams SET value = CAST(value_numeric AS TEXT) "
-                    "WHERE (value IS NULL OR value = 'null') AND value_numeric IS NOT NULL"
+        # 3.5. Populate value from value_numeric if it is missing/null (legacy SpectrumKNX
+        # schema). The store_metadata flag marks completion so the unindexed WHERE clause
+        # doesn't scan the whole telegrams table on every startup.
+        if not self._metadata_flag_set(connection, "nulls_recovered"):
+            if "value" in existing_columns and "value_numeric" in existing_columns:
+                connection.execute(
+                    text(
+                        "UPDATE telegrams SET value = CAST(value_numeric AS TEXT) "
+                        "WHERE (value IS NULL OR value = 'null') AND value_numeric IS NOT NULL"
+                    )
                 )
+            connection.execute(
+                text("INSERT OR REPLACE INTO store_metadata (key, value) VALUES ('nulls_recovered', 'true')")
             )
 
         # 4. Data unwrapping pass for legacy {"value": ...} wrapped structures
@@ -343,8 +349,14 @@ class SqliteStore(BaseSQLStore):
             if col_name not in existing_columns and f"{col_name}_id" not in existing_columns:
                 return True
 
-        # 4.5. Check if there are any legacy 'null' values to recover from value_numeric
-        if "value" in existing_columns and "value_numeric" in existing_columns:
+        # 4.5. Check if there are any legacy 'null' values to recover from value_numeric.
+        # Skip this scan entirely once the nulls_recovered flag is set — with no matching
+        # rows (the common case) the unindexed LIMIT 1 probe scans the whole table.
+        if (
+            not self._metadata_flag_set(connection, "nulls_recovered")
+            and "value" in existing_columns
+            and "value_numeric" in existing_columns
+        ):
             try:
                 row = connection.execute(
                     text(
@@ -358,18 +370,7 @@ class SqliteStore(BaseSQLStore):
 
         # 5. Check if any rows contain legacy {"value": ...} wrapped values
         # Skip this scan entirely if the metadata table indicates we already unwrapped
-        is_unwrapped = False
-        try:
-            if inspector.has_table("store_metadata"):
-                row = connection.execute(
-                    text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")
-                ).fetchone()
-                if row and row[0] == "true":
-                    is_unwrapped = True
-        except Exception:
-            pass
-
-        if not is_unwrapped:
+        if not self._metadata_flag_set(connection, "data_unwrapped"):
             try:
                 row = connection.execute(
                     text(

@@ -149,6 +149,13 @@ async def test_sqlite_migration(old_schema_db):
     await store.initialize()
     assert await store.needs_migration() is False
 
+    # Migration records completion flags so the legacy data probes are skipped
+    # on subsequent startups.
+    async with store.engine.connect() as conn:
+        flags = dict((await conn.execute(select(store.store_metadata))).fetchall())
+    assert flags.get("nulls_recovered") == "true"
+    assert flags.get("data_unwrapped") == "true"
+
     # 3. Verify data via query (transparent)
     result = await store.query(TelegramQuery(order_descending=False))
     assert len(result.telegrams) == 5
@@ -206,5 +213,60 @@ async def test_sqlite_migration(old_schema_db):
         cols = await conn.run_sync(get_cols)
         assert "source_id" in cols
         assert "source" not in cols
+
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_nulls_recovered_flag_skips_probe_scan(tmp_path):
+    """The null-recovery probe is guarded by a store_metadata completion flag.
+
+    Without the flag, the unindexed ``LIMIT 1`` probe in needs_migration() scans
+    the whole telegrams table on every startup when no legacy rows exist.
+    """
+    from sqlalchemy import text
+
+    from knx_telegram_store import StoredTelegram
+
+    db_path = tmp_path / "telegrams.db"
+    store = SqliteStore(db_path)
+    assert await store.needs_migration() is False
+    await store.initialize()
+
+    # initialize() records completion of the null-recovery backfill
+    async with store.engine.connect() as conn:
+        row = (await conn.execute(text("SELECT value FROM store_metadata WHERE key = 'nulls_recovered'"))).fetchone()
+    assert row is not None
+    assert row[0] == "true"
+
+    # Craft a legacy-looking row (value missing, value_numeric present)
+    await store.store(
+        StoredTelegram(
+            timestamp=datetime.now(UTC),
+            source="1.1.1",
+            destination="1/1/1",
+            telegramtype="GroupValueWrite",
+            direction="Incoming",
+            value=20.0,
+            value_numeric=20.0,
+        )
+    )
+    async with store.engine.begin() as conn:
+        await conn.execute(text("UPDATE telegrams SET value = 'null'"))
+
+    # With the flag set the probe is skipped entirely — no migration reported
+    assert await store.needs_migration() is False
+
+    # Clearing the flag re-enables the probe, which detects the legacy row
+    async with store.engine.begin() as conn:
+        await conn.execute(text("DELETE FROM store_metadata WHERE key = 'nulls_recovered'"))
+    assert await store.needs_migration() is True
+
+    # initialize() recovers the row and restores the flag
+    await store.initialize()
+    assert await store.needs_migration() is False
+    async with store.engine.connect() as conn:
+        recovered = (await conn.execute(text("SELECT value FROM telegrams"))).scalar()
+    assert float(recovered) == 20.0
 
     await store.close()

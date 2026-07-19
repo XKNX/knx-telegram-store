@@ -16,8 +16,10 @@ from sqlalchemy import (
     Text,
     and_,
     func,
+    inspect,
     or_,
     select,
+    text,
 )
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -127,6 +129,22 @@ class BaseSQLStore(TelegramStore):
     def _needs_migration_sync(self, connection) -> bool:
         """Synchronously check if schema upgrades or legacy migrations are required."""
         return False
+
+    @staticmethod
+    def _metadata_flag_set(connection, key: str) -> bool:
+        """Return True if the store_metadata flag ``key`` is set to 'true'.
+
+        Used to skip one-time legacy data probes/backfills whose WHERE clauses
+        would otherwise scan the whole unindexed telegrams table on every
+        startup. Missing table or any error reads as "not set".
+        """
+        try:
+            if not inspect(connection).has_table("store_metadata"):
+                return False
+            row = connection.execute(text("SELECT value FROM store_metadata WHERE key = :key"), {"key": key}).fetchone()
+        except Exception:
+            return False
+        return row is not None and row[0] == "true"
 
     @wrap_store_errors
     async def initialize(self) -> None:

@@ -427,8 +427,11 @@ async def test_reinitialize_with_compressed_legacy_rows(timescale_dsn):
         async with autocommit.connect() as conn:
             # Simulate rows that predate the JSONB value column (value NULL,
             # value_numeric set) — exactly what the startup backfill targets —
-            # then compress the chunk like the background policy would.
+            # then compress the chunk like the background policy would. Such a
+            # database also predates the nulls_recovered completion flag, so
+            # clear it to make the backfill pending again.
             await conn.execute(text("UPDATE telegrams SET value = NULL"))
+            await conn.execute(text("DELETE FROM store_metadata WHERE key = 'nulls_recovered'"))
             await conn.execute(
                 text("SELECT compress_chunk(c, if_not_compressed => TRUE) FROM show_chunks('telegrams') c")
             )

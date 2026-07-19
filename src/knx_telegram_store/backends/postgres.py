@@ -422,17 +422,26 @@ class PostgresStore(BaseSQLStore):
 
         # Old schema had value_numeric (FLOAT) and value_json (now payload),
         # but no value (JSONB) column. Populate value from value_numeric
-        # so the library's query returns it correctly.
-        if (
-            "value" in existing_columns
-            and "value_numeric" in existing_columns
-            and _pending("(value IS NULL OR value::text = 'null') AND value_numeric IS NOT NULL")
-        ):
-            _lift_decompression_limit()
+        # so the library's query returns it correctly. The store_metadata flag
+        # marks completion so the unindexed _pending probe doesn't scan the
+        # whole telegrams table on every startup.
+        if not self._metadata_flag_set(connection, "nulls_recovered"):
+            if (
+                "value" in existing_columns
+                and "value_numeric" in existing_columns
+                and _pending("(value IS NULL OR value::text = 'null') AND value_numeric IS NOT NULL")
+            ):
+                _lift_decompression_limit()
+                connection.execute(
+                    text(
+                        "UPDATE telegrams SET value = to_jsonb(value_numeric) "
+                        "WHERE (value IS NULL OR value::text = 'null') AND value_numeric IS NOT NULL"
+                    )
+                )
             connection.execute(
                 text(
-                    "UPDATE telegrams SET value = to_jsonb(value_numeric) "
-                    "WHERE (value IS NULL OR value::text = 'null') AND value_numeric IS NOT NULL"
+                    "INSERT INTO store_metadata (key, value) VALUES ('nulls_recovered', 'true') "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
                 )
             )
 
@@ -618,8 +627,14 @@ class PostgresStore(BaseSQLStore):
             if col_name not in existing_columns:
                 return True
 
-        # 4.5. Check if there are any legacy 'null' values to recover from value_numeric
-        if "value" in existing_columns and "value_numeric" in existing_columns:
+        # 4.5. Check if there are any legacy 'null' values to recover from value_numeric.
+        # Skip this scan entirely once the nulls_recovered flag is set — with no matching
+        # rows (the common case) the unindexed LIMIT 1 probe scans the whole table.
+        if (
+            not self._metadata_flag_set(connection, "nulls_recovered")
+            and "value" in existing_columns
+            and "value_numeric" in existing_columns
+        ):
             try:
                 row = connection.execute(
                     text(
@@ -633,18 +648,7 @@ class PostgresStore(BaseSQLStore):
 
         # 5. Check if any rows contain legacy {"value": ...} wrapped values
         # Skip this scan entirely if the metadata table indicates we already unwrapped
-        is_unwrapped = False
-        try:
-            if inspector.has_table("store_metadata"):
-                row = connection.execute(
-                    text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")
-                ).fetchone()
-                if row and row[0] == "true":
-                    is_unwrapped = True
-        except Exception:
-            pass
-
-        if not is_unwrapped:
+        if not self._metadata_flag_set(connection, "data_unwrapped"):
             try:
                 row = connection.execute(
                     text(
