@@ -33,14 +33,17 @@ def _parse_dt(value: str | None) -> datetime | None:
         raise ValueError(f"Invalid ISO-8601 timestamp: {value!r}") from err
 
 
-def _iso_utc(dt: datetime | None) -> str | None:
+def _iso(dt: datetime) -> str:
     """ISO-8601 in UTC. The SQLite backend round-trips timestamps naive; they
     are UTC by convention, so tag them so consumers get an unambiguous offset."""
-    if dt is None:
-        return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt.isoformat()
+
+
+def _iso_opt(dt: datetime | None) -> str | None:
+    """As :func:`_iso`, but passes ``None`` through."""
+    return _iso(dt) if dt is not None else None
 
 
 def _format_dpt(dpt_main: int | None, dpt_sub: int | None) -> str | None:
@@ -54,7 +57,7 @@ def _format_dpt(dpt_main: int | None, dpt_sub: int | None) -> str | None:
 
 def _summarize(t: StoredTelegram) -> TelegramSummary:
     return TelegramSummary(
-        timestamp=_iso_utc(t.timestamp),
+        timestamp=_iso(t.timestamp),
         source=t.source,
         destination=t.destination,
         telegramtype=t.telegramtype,
@@ -107,8 +110,8 @@ async def get_store_stats(store: TelegramStore) -> StoreStatsResult:
     stats = await store.get_stats()
     return StoreStatsResult(
         telegram_count=stats.telegram_count,
-        oldest_timestamp=_iso_utc(stats.oldest_timestamp),
-        newest_timestamp=_iso_utc(stats.newest_timestamp),
+        oldest_timestamp=_iso_opt(stats.oldest_timestamp),
+        newest_timestamp=_iso_opt(stats.newest_timestamp),
         size_bytes=stats.size_bytes,
         backend=stats.backend,
         retention_days=stats.retention_days,
