@@ -207,6 +207,25 @@ with open("export.xml", "w", encoding="utf-8") as fh:
 A Gira-style `<!-- timezone offset +01:00 hour -->` comment is honored, and ETS's
 7-digit fractional seconds are normalized to microseconds.
 
+## MCP tools
+
+`knx_telegram_store.mcp` provides host-agnostic tool functions for exposing the
+store to AI agents over the Model Context Protocol. They are plain async
+functions over a `TelegramStore`, with frozen, JSON-serialisable dataclass
+inputs/outputs (timestamps are ISO-8601 UTC strings) and **no dependency on any
+MCP SDK or web framework** — each consumer wraps them into its own transport.
+
+```python
+from dataclasses import asdict
+from knx_telegram_store.mcp import query_telegrams, QueryTelegramsInput
+
+result = await query_telegrams(store, QueryTelegramsInput(destinations=["1/1/1"], limit=100))
+payload = asdict(result)  # ready to return as an MCP tool result
+```
+
+Available: `query_telegrams`, `get_last_values`, `get_store_stats`,
+`get_store_capabilities`, `count_telegrams`.
+
 ## License
 
 MIT
