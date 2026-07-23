@@ -4,6 +4,7 @@ import asyncio
 import logging
 from typing import Any
 
+from .backends.memory import MemoryStore
 from .backends.postgres import PostgresStore
 from .backends.sqlite import SqliteStore
 from .model import StoredTelegram
@@ -214,4 +215,21 @@ class BufferedPostgresStore(_BufferMixin, PostgresStore):
         dsn: PostgreSQL connection string.
         retention_days: Optional retention period in days.
         flush_interval: Seconds between automatic buffer flushes (default 1.0).
+    """
+
+
+class BufferedMemoryStore(_BufferMixin, MemoryStore):
+    """MemoryStore with transparent write-buffering.
+
+    A dependency-free, in-process store backed by a ``deque`` and sharing the
+    exact buffering, flushing and query semantics of the SQL-backed buffered
+    stores. Useful for tests and for callers that want telegram history without
+    a database. Nothing is persisted across process restarts.
+
+    Args:
+        max_telegrams: Maximum number of telegrams kept before the oldest are
+            dropped (default 500).
+        flush_interval: Seconds between automatic buffer flushes (default 1.0).
+        max_buffer_size: Maximum number of buffered writes before the oldest are
+            dropped (default 10000).
     """

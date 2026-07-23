@@ -3,7 +3,12 @@ from datetime import UTC, datetime
 
 import pytest
 
-from knx_telegram_store import BufferedSqliteStore, StoredTelegram, TelegramQuery
+from knx_telegram_store import (
+    BufferedMemoryStore,
+    BufferedSqliteStore,
+    StoredTelegram,
+    TelegramQuery,
+)
 
 
 @pytest.fixture
@@ -17,9 +22,12 @@ def sample_telegram():
     )
 
 
-@pytest.fixture
-async def buffered_store():
-    store = BufferedSqliteStore(":memory:", flush_interval=0.1)
+@pytest.fixture(params=["sqlite", "memory"])
+async def buffered_store(request):
+    if request.param == "sqlite":
+        store = BufferedSqliteStore(":memory:", flush_interval=0.1)
+    else:
+        store = BufferedMemoryStore(flush_interval=0.1)
     await store.initialize()
     return store
 
@@ -125,11 +133,20 @@ async def test_read_operations_pass_through(buffered_store, sample_telegram):
 
     assert await buffered_store.count() == 1
 
+
+@pytest.mark.asyncio
+async def test_eviction_passes_through_to_backend(sample_telegram):
+    # Time-based eviction is a SQL-backend capability; the memory backend prunes
+    # by max_telegrams instead and reports 0 here.
+    store = BufferedSqliteStore(":memory:", flush_interval=0.1)
+    await store.initialize()
+    await store.store_many([sample_telegram])
+
     cutoff = datetime.now(UTC)
-    deleted = await buffered_store.evict_older_than(cutoff, dry_run=True)
+    deleted = await store.evict_older_than(cutoff, dry_run=True)
     assert deleted == 1
 
-    deleted = await buffered_store.evict_expired(dry_run=True)
+    deleted = await store.evict_expired(dry_run=True)
     assert deleted == 0  # no retention_days configured
 
 
