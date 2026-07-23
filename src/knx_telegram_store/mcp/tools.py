@@ -46,6 +46,27 @@ def _iso_opt(dt: datetime | None) -> str | None:
     return _iso(dt) if dt is not None else None
 
 
+_TYPE_ALIASES = {
+    "write": "GroupValueWrite",
+    "read": "GroupValueRead",
+    "response": "GroupValueResponse",
+}
+
+
+def _normalize_type(telegram_type: str) -> str:
+    """Map the short "Write"/"Read"/"Response" aliases to full telegram-type
+    names; pass anything else (already a full name) through unchanged."""
+    return _TYPE_ALIASES.get(telegram_type.strip().lower(), telegram_type)
+
+
+def _parse_dpt(entry: str) -> tuple[int, int | None]:
+    """Parse a "main" or "main.sub" DPT string into a (main, sub|None) pair."""
+    main_str, sep, sub_str = entry.strip().partition(".")
+    if not main_str.isdigit() or (sep and not sub_str.isdigit()):
+        raise ValueError(f"Invalid DPT: {entry!r}")
+    return (int(main_str), int(sub_str) if sep else None)
+
+
 def _format_dpt(dpt_main: int | None, dpt_sub: int | None) -> str | None:
     """Render a DPT as ``main.sub`` (sub zero-padded), or just ``main``."""
     if dpt_main is None:
@@ -76,11 +97,14 @@ async def query_telegrams(store: TelegramStore, input: QueryTelegramsInput) -> Q
     query = TelegramQuery(
         sources=list(input.sources),
         destinations=list(input.destinations),
-        telegram_types=list(input.telegram_types),
+        telegram_types=[_normalize_type(t) for t in input.telegram_types],
         directions=list(input.directions),
         dpt_mains=list(input.dpt_mains),
+        dpts=[_parse_dpt(d) for d in input.dpts],
         start_time=_parse_dt(input.start_time),
         end_time=_parse_dt(input.end_time),
+        delta_before_ms=input.delta_before_ms,
+        delta_after_ms=input.delta_after_ms,
         limit=input.limit,
         offset=input.offset,
         order_descending=input.order_descending,

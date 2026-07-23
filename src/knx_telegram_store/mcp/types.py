@@ -23,9 +23,15 @@ class QueryTelegramsInput:
     end_time: str | None = None  # inclusive upper bound, ISO-8601
     sources: list[str] = field(default_factory=list)
     destinations: list[str] = field(default_factory=list)
+    # Accepts full names ("GroupValueWrite") or the short "Write"/"Read"/"Response".
     telegram_types: list[str] = field(default_factory=list)
     directions: list[str] = field(default_factory=list)
-    dpt_mains: list[int] = field(default_factory=list)
+    dpt_mains: list[int] = field(default_factory=list)  # match every subtype of a main
+    # Specific DPTs as "main" or "main.sub" strings, e.g. "9" or "9.001".
+    dpts: list[str] = field(default_factory=list)
+    # Time-delta context window around each matching telegram (milliseconds).
+    delta_before_ms: int = 0
+    delta_after_ms: int = 0
     limit: int = 100
     offset: int = 0
     order_descending: bool = True  # newest first by default

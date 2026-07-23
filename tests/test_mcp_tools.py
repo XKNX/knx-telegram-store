@@ -16,7 +16,7 @@ from knx_telegram_store.mcp import (
     get_store_stats,
     query_telegrams,
 )
-from knx_telegram_store.mcp.tools import _format_dpt, _parse_dt
+from knx_telegram_store.mcp.tools import _format_dpt, _normalize_type, _parse_dpt, _parse_dt
 
 NOW = datetime(2026, 7, 23, 12, 0, 0, tzinfo=UTC)
 
@@ -88,6 +88,39 @@ async def test_query_telegrams_time_range_and_z_suffix(store):
     assert result.telegrams[0].destination == "1/2/2"
 
 
+async def test_query_telegrams_dpt_subtype_filter(store):
+    await _seed(store)
+    # Specific subtype "9.001" matches only the two temperature telegrams.
+    result = await query_telegrams(store, QueryTelegramsInput(dpts=["9.001"]))
+    assert {t.destination for t in result.telegrams} == {"1/1/1"}
+    assert len(result.telegrams) == 2
+    # A bare main "1" matches every 1.x subtype.
+    result = await query_telegrams(store, QueryTelegramsInput(dpts=["1"]))
+    assert [t.destination for t in result.telegrams] == ["1/2/2"]
+
+
+async def test_query_telegrams_type_aliases(store):
+    await _seed(store)
+    # "Write" is an alias for GroupValueWrite (all three seeded rows are writes)...
+    writes = await query_telegrams(store, QueryTelegramsInput(telegram_types=["Write"]))
+    assert len(writes.telegrams) == 3
+    # ...and "Read" (GroupValueRead) matches none.
+    reads = await query_telegrams(store, QueryTelegramsInput(telegram_types=["Read"]))
+    assert reads.telegrams == []
+
+
+async def test_query_telegrams_delta_window(store):
+    await _seed(store)
+    # Pivot on the 1/2/2 telegram (1 min ago); a 2.5-min window pulls in the
+    # 1/1/1 telegram from 3 min ago (context), but not the one from 5 min ago.
+    result = await query_telegrams(
+        store,
+        QueryTelegramsInput(destinations=["1/2/2"], delta_before_ms=150_000, delta_after_ms=150_000),
+    )
+    assert {t.destination for t in result.telegrams} == {"1/1/1", "1/2/2"}
+    assert len(result.telegrams) == 2
+
+
 async def test_query_telegrams_limit_reached(store):
     await _seed(store)
     result = await query_telegrams(store, QueryTelegramsInput(limit=1))
@@ -144,3 +177,31 @@ def test_parse_dt_invalid():
     with pytest.raises(ValueError, match="Invalid ISO-8601"):
         _parse_dt("not-a-timestamp")
     assert _parse_dt(None) is None
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [("9", (9, None)), ("9.001", (9, 1)), ("1.0", (1, 0)), (" 14.056 ", (14, 56))],
+)
+def test_parse_dpt(entry, expected):
+    assert _parse_dpt(entry) == expected
+
+
+@pytest.mark.parametrize("entry", ["", "9.", ".1", "9.x", "abc"])
+def test_parse_dpt_invalid(entry):
+    with pytest.raises(ValueError, match="Invalid DPT"):
+        _parse_dpt(entry)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("Write", "GroupValueWrite"),
+        ("read", "GroupValueRead"),
+        ("RESPONSE", "GroupValueResponse"),
+        ("GroupValueWrite", "GroupValueWrite"),
+        ("Something", "Something"),
+    ],
+)
+def test_normalize_type(value, expected):
+    assert _normalize_type(value) == expected
