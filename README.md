@@ -38,6 +38,7 @@ from datetime import datetime
 from knx_telegram_store import StoredTelegram, TelegramQuery
 from knx_telegram_store.backends.memory import MemoryStore
 
+
 async def main():
     store = MemoryStore(max_size=1000)
     await store.initialize()
@@ -49,14 +50,14 @@ async def main():
         telegramtype="GroupValueWrite",
         direction="Incoming",
         value=22.5,
-        unit="°C"
+        unit="°C",
     )
 
     await store.store(telegram)
 
     query = TelegramQuery(destinations=["1/1/1"])
     result = await store.query(query)
-    
+
     for t in result.telegrams:
         print(f"{t.timestamp}: {t.source} -> {t.destination} | {t.value} {t.unit}")
 
@@ -73,8 +74,9 @@ store = SqliteStore("/data/telegrams.db", retention_days=90)
 await store.initialize()
 
 stats = await store.get_stats()
-print(f"{stats.telegram_count} telegrams, {stats.size_bytes} bytes, "
-      f"{stats.oldest_timestamp} .. {stats.newest_timestamp}")
+print(
+    f"{stats.telegram_count} telegrams, {stats.size_bytes} bytes, {stats.oldest_timestamp} .. {stats.newest_timestamp}"
+)
 
 cutoff = datetime.now(UTC) - timedelta(days=30)
 would_delete = await store.evict_older_than(cutoff, dry_run=True)  # preview only
@@ -92,7 +94,7 @@ database; you only want to read it:
 
 ```python
 store = SqliteStore("/homeassistant/.storage/knx/telegrams.db", read_only=True)
-await store.initialize()   # never runs DDL/migrations against a foreign schema
+await store.initialize()  # never runs DDL/migrations against a foreign schema
 
 if await store.needs_migration():
     ...  # schema is older/newer than this library version — surface a warning
@@ -146,8 +148,7 @@ compressed by a background policy once they age past `compress_after_days`
 on plain PostgreSQL tables; queries, retention and stats behave identically.
 
 ```python
-store = PostgresStore("postgresql://user:pw@host:5432/knx",
-                      retention_days=90, compress_after_days=7)
+store = PostgresStore("postgresql://user:pw@host:5432/knx", retention_days=90, compress_after_days=7)
 await store.initialize()
 print(store.timescale_enabled)  # True / False (None before initialize())
 ```
