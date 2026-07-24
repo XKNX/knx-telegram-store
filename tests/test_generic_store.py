@@ -48,7 +48,6 @@ def sample_telegrams():
     ]
 
 
-@pytest.mark.asyncio
 async def test_store_and_count(store, sample_telegrams):
     await store.store(sample_telegrams[0])
     assert await store.count() == 1
@@ -57,7 +56,6 @@ async def test_store_and_count(store, sample_telegrams):
     assert await store.count() == 4
 
 
-@pytest.mark.asyncio
 async def test_query_all(store, sample_telegrams):
     await store.store_many(sample_telegrams)
     result = await store.query(TelegramQuery())
@@ -67,7 +65,6 @@ async def test_query_all(store, sample_telegrams):
     assert result.telegrams[0].timestamp > result.telegrams[-1].timestamp
 
 
-@pytest.mark.asyncio
 async def test_query_filters(store, sample_telegrams):
     await store.store_many(sample_telegrams)
 
@@ -88,7 +85,6 @@ async def test_query_filters(store, sample_telegrams):
     assert len(result.telegrams) == 3
 
 
-@pytest.mark.asyncio
 async def test_query_dpt_pairs(store):
     now = datetime.now(UTC)
 
@@ -134,7 +130,6 @@ async def test_query_dpt_pairs(store):
     assert result.telegrams == []
 
 
-@pytest.mark.asyncio
 async def test_query_time_range(store, sample_telegrams):
     await store.store_many(sample_telegrams)
     now = datetime.now(UTC)
@@ -148,7 +143,6 @@ async def test_query_time_range(store, sample_telegrams):
     assert len(result.telegrams) == 2
 
 
-@pytest.mark.asyncio
 async def test_query_time_delta(store, sample_telegrams):
     await store.store_many(sample_telegrams)
 
@@ -167,7 +161,6 @@ async def test_query_time_delta(store, sample_telegrams):
     assert len(result.telegrams) == 3
 
 
-@pytest.mark.asyncio
 async def test_pagination(store, sample_telegrams):
     await store.store_many(sample_telegrams)
 
@@ -180,7 +173,6 @@ async def test_pagination(store, sample_telegrams):
     assert result.limit_reached is False
 
 
-@pytest.mark.asyncio
 async def test_clear(store, sample_telegrams):
     await store.store_many(sample_telegrams)
     assert await store.count() == 4
@@ -188,7 +180,6 @@ async def test_clear(store, sample_telegrams):
     assert await store.count() == 0
 
 
-@pytest.mark.asyncio
 async def test_eviction(store, sample_telegrams):
     await store.store_many(sample_telegrams)
     assert await store.count() == 4
@@ -217,7 +208,6 @@ async def test_eviction(store, sample_telegrams):
         assert await store.count() == 2
 
 
-@pytest.mark.asyncio
 async def test_evict_expired(store, sample_telegrams):
     await store.store_many(sample_telegrams)
 
@@ -228,14 +218,12 @@ async def test_evict_expired(store, sample_telegrams):
     assert await store.count() == 4
 
 
-@pytest.mark.asyncio
 async def test_store_empty(store):
     """Test storing an empty list of telegrams."""
     await store.store_many([])
     assert await store.count() == 0
 
 
-@pytest.mark.asyncio
 async def test_query_directions(store, sample_telegrams):
     """Test filtering by direction."""
     await store.store_many(sample_telegrams)
@@ -245,7 +233,6 @@ async def test_query_directions(store, sample_telegrams):
     assert len(result.telegrams) == 1
 
 
-@pytest.mark.asyncio
 async def test_query_order(store, sample_telegrams):
     """Test query ordering."""
     await store.store_many(sample_telegrams)
@@ -257,7 +244,6 @@ async def test_query_order(store, sample_telegrams):
     assert result_desc.telegrams[0].timestamp == result_asc.telegrams[-1].timestamp
 
 
-@pytest.mark.asyncio
 async def test_evict_no_retention(store):
     """Test eviction when no retention is configured."""
     # Memory store has no retention_days configured in conftest
@@ -265,7 +251,6 @@ async def test_evict_no_retention(store):
         assert await store.evict_expired() == 0
 
 
-@pytest.mark.asyncio
 async def test_get_last_unique_telegrams(store, sample_telegrams):
     """Test get_last_unique_telegrams method."""
     await store.store_many(sample_telegrams)
@@ -284,7 +269,6 @@ async def test_get_last_unique_telegrams(store, sample_telegrams):
     assert dest_map["1/1/2"].value is None
 
 
-@pytest.mark.asyncio
 async def test_exception_wrapping(store):
     """Test that underlying database/engine exceptions are wrapped in KnxTelegramStoreException."""
     from unittest.mock import patch

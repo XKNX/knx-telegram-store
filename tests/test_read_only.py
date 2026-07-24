@@ -30,7 +30,6 @@ async def writer_db(tmp_path):
     await writer.close()
 
 
-@pytest.mark.asyncio
 async def test_writer_enables_wal(writer_db):
     db_path, writer = writer_db
     async with writer.engine.connect() as conn:
@@ -38,7 +37,6 @@ async def test_writer_enables_wal(writer_db):
     assert mode == "wal"
 
 
-@pytest.mark.asyncio
 async def test_read_only_queries(writer_db):
     db_path, _writer = writer_db
     reader = SqliteStore(db_path, read_only=True)
@@ -63,7 +61,6 @@ async def test_read_only_queries(writer_db):
         await reader.close()
 
 
-@pytest.mark.asyncio
 async def test_read_only_rejects_mutations(writer_db):
     db_path, _writer = writer_db
     reader = SqliteStore(db_path, read_only=True)
@@ -87,7 +84,6 @@ async def test_read_only_rejects_mutations(writer_db):
         await reader.close()
 
 
-@pytest.mark.asyncio
 async def test_read_only_sees_concurrent_writes(writer_db):
     """Reader on a second engine sees rows the writer commits afterwards."""
     db_path, writer = writer_db
@@ -103,7 +99,6 @@ async def test_read_only_sees_concurrent_writes(writer_db):
         await reader.close()
 
 
-@pytest.mark.asyncio
 async def test_read_only_never_creates_file(tmp_path):
     missing = tmp_path / "does" / "not" / "exist.db"
     reader = SqliteStore(missing, read_only=True)
@@ -132,7 +127,6 @@ def test_check_config_read_only(tmp_path):
     assert result.ok is False
 
 
-@pytest.mark.asyncio
 async def test_query_accepts_flush_first_noop(store):
     """Unbuffered stores accept flush_first for buffered-store signature parity."""
     await store.store(make_telegram(1))
