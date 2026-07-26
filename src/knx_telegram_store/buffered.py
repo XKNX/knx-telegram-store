@@ -47,6 +47,8 @@ class _BufferMixin:
         self.flush_interval = flush_interval
         self.max_buffer_size = max_buffer_size
         self._buffer_full_warned = False
+        self._flush_lock = asyncio.Lock()
+        self._flush_trigger = asyncio.Event()
 
     # --- Lifecycle ---
 
@@ -68,15 +70,26 @@ class _BufferMixin:
                 pass
             self._flush_task = None
 
-        await self._flush()
+        async with self._flush_lock:
+            await self._flush()
         await self.close()  # type: ignore[attr-defined]
 
     async def _flush_loop(self) -> None:
         """Periodic flush loop."""
         while not self._closing:
             try:
-                await asyncio.sleep(self.flush_interval)
-                await self._flush()
+                try:
+                    await asyncio.wait_for(
+                        self._flush_trigger.wait(),
+                        timeout=self.flush_interval,
+                    )
+                    self._flush_trigger.clear()
+                except asyncio.TimeoutError:
+                    pass
+
+                if not self._closing:
+                    async with self._flush_lock:
+                        await self._flush()
             except asyncio.CancelledError:
                 break
             except Exception as err:
@@ -126,19 +139,23 @@ class _BufferMixin:
         try:
             await self.store_many(batch)  # type: ignore[attr-defined]
             self._buffer_full_warned = False
-        except Exception as err:
-            _LOGGER.error("Error flushing telegram buffer: %s", err)
+        except BaseException as err:
             # Re-prepend the batch so it's retried before any newer items
             self._buffer[0:0] = batch
-            if len(self._buffer) > self.max_buffer_size:
-                if not self._buffer_full_warned:
-                    _LOGGER.warning(
-                        "Telegram store buffer exceeded limit (%d items) after failed flush, dropping %d oldest telegrams",
-                        self.max_buffer_size,
-                        len(self._buffer) - self.max_buffer_size,
-                    )
-                    self._buffer_full_warned = True
-                self._buffer = self._buffer[-self.max_buffer_size :]
+            if isinstance(err, Exception):
+                _LOGGER.error("Error flushing telegram buffer: %s", err)
+                if len(self._buffer) > self.max_buffer_size:
+                    if not self._buffer_full_warned:
+                        _LOGGER.warning(
+                            "Telegram store buffer exceeded limit (%d items) after failed flush, dropping %d oldest telegrams",
+                            self.max_buffer_size,
+                            len(self._buffer) - self.max_buffer_size,
+                        )
+                        self._buffer_full_warned = True
+                    self._buffer = self._buffer[-self.max_buffer_size :]
+            else:
+                # Re-raise CancelledError / BaseException
+                raise
 
     @wrap_store_errors
     async def flush(self) -> None:
@@ -148,11 +165,10 @@ class _BufferMixin:
         flush_interval seconds from now, avoiding a near-immediate double-flush
         when flush() is called close to a scheduled tick.
         """
-        await self._flush()
-        # Reset the periodic timer so the next auto-flush starts fresh
-        if self._flush_task is not None and not self._closing:
-            self._flush_task.cancel()
-            self._flush_task = asyncio.create_task(self._flush_loop())
+        async with self._flush_lock:
+            await self._flush()
+        # Reset the periodic timer by triggering the event
+        self._flush_trigger.set()
 
     # --- Read path override (flush_first support) ---
 

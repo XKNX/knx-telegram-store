@@ -239,3 +239,32 @@ async def test_buffer_limit_failed_flush(sample_telegram, monkeypatch):
     assert store._buffer[0].source == "1.1.1"
     assert store._buffer[1].source == "1.1.2"
     assert store._buffer[2].source == "1.1.3"
+
+
+async def test_cancellation_during_flush_does_not_lose_data(buffered_store, sample_telegram, monkeypatch):
+    # Simulate a slow store_many that blocks/sleeps
+    async def _slow_store_many(self, telegrams):
+        await asyncio.sleep(1.0)
+
+    monkeypatch.setattr(type(buffered_store), "store_many", _slow_store_many)
+
+    # Put a telegram in the store and trigger flush
+    await buffered_store.store(sample_telegram)
+
+    # We start flush as a task, which will wait in _slow_store_many
+    flush_task = asyncio.create_task(buffered_store.flush())
+
+    # Wait a bit so the flush task starts and enters store_many
+    await asyncio.sleep(0.05)
+
+    # Cancel the flush task
+    flush_task.cancel()
+    try:
+        await flush_task
+    except asyncio.CancelledError:
+        pass
+
+    # The telegram should be returned/prepended back to the buffer and NOT lost!
+    assert len(buffered_store._buffer) == 1
+    assert buffered_store._buffer[0] == sample_telegram
+
