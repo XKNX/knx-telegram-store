@@ -1,4 +1,5 @@
-from .buffered import BufferedPostgresStore, BufferedSqliteStore
+from .backends.memory import MemoryStore
+from .buffered import BufferedMemoryStore, BufferedPostgresStore, BufferedSqliteStore
 from .connection import ConnectionCheckResult, ConnectionErrorKind
 from .model import StoredTelegram
 from .query import TelegramQuery, TelegramQueryResult
@@ -11,8 +12,10 @@ __all__ = [
     "StoreCapabilities",
     "StoreStats",
     "TelegramStore",
+    "MemoryStore",
     "BufferedSqliteStore",
     "BufferedPostgresStore",
+    "BufferedMemoryStore",
     "KnxTelegramStoreException",
     "ConnectionCheckResult",
     "ConnectionErrorKind",
