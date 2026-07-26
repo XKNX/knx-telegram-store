@@ -51,7 +51,6 @@ def old_schema_db(tmp_path):
     return db_path, telegrams, metadata
 
 
-@pytest.mark.asyncio
 async def test_sqlite_migration(old_schema_db):
     db_path, old_table, metadata = old_schema_db
     url = f"sqlite+aiosqlite:///{db_path}"
@@ -217,7 +216,6 @@ async def test_sqlite_migration(old_schema_db):
     await store.close()
 
 
-@pytest.mark.asyncio
 async def test_nulls_recovered_flag_skips_probe_scan(tmp_path):
     """The null-recovery probe is guarded by a store_metadata completion flag.
 

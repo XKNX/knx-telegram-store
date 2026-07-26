@@ -40,7 +40,6 @@ async def lookup_table(sqlite_engine):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_warm_populates_cache(sqlite_engine, lookup_table):
     """warm() should pre-load all existing rows into the cache."""
     # Seed the DB directly
@@ -60,7 +59,6 @@ async def test_warm_populates_cache(sqlite_engine, lookup_table):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_all_pairs_cached_no_db_queries(sqlite_engine, lookup_table):
     """If every pair is already in cache, the DB is never queried (line 80 early return)."""
     cache = LookupCache()
@@ -74,7 +72,6 @@ async def test_all_pairs_cached_no_db_queries(sqlite_engine, lookup_table):
     assert result == {("source", "1.1.1"): 42, ("destination", "1/1/1"): 99}
 
 
-@pytest.mark.asyncio
 async def test_partial_cache_hit(sqlite_engine, lookup_table):
     """Cached pairs are resolved immediately; only uncached ones go to the DB."""
     cache = LookupCache()
@@ -94,7 +91,6 @@ async def test_partial_cache_hit(sqlite_engine, lookup_table):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_sqlite_insert_new_pairs(sqlite_engine, lookup_table):
     """New pairs are inserted and their IDs returned (SQLite path)."""
     cache = LookupCache()
@@ -109,7 +105,6 @@ async def test_sqlite_insert_new_pairs(sqlite_engine, lookup_table):
     assert ("direction", "Incoming") in cache._cache
 
 
-@pytest.mark.asyncio
 async def test_sqlite_idempotent_on_duplicate(sqlite_engine, lookup_table):
     """Inserting the same pair twice should not raise and should return the same ID."""
     cache = LookupCache()
@@ -149,7 +144,6 @@ class _FakeConn:
         return await self._real.scalar(*args, **kwargs)
 
 
-@pytest.mark.asyncio
 async def test_generic_fallback_insert(sqlite_engine, lookup_table):
     """Lines 95-98: generic SELECT-then-INSERT fallback for unknown dialects."""
     cache = LookupCache()
@@ -167,7 +161,6 @@ async def test_generic_fallback_insert(sqlite_engine, lookup_table):
     assert ("telegramtype", "GroupValueWrite") in cache._cache
 
 
-@pytest.mark.asyncio
 async def test_generic_fallback_existing_row(sqlite_engine, lookup_table):
     """Lines 95-98: if the row already exists the SELECT returns it (no INSERT)."""
     # Pre-insert the row via the real path

@@ -1,7 +1,5 @@
 from datetime import UTC, datetime, timedelta
 
-import pytest
-
 from knx_telegram_store import BufferedSqliteStore, StoredTelegram
 from knx_telegram_store.backends.sqlite import SqliteStore
 
@@ -19,7 +17,6 @@ def make_telegram(minutes_ago: float, destination: str = "1/1/1", raw_data: str 
     )
 
 
-@pytest.mark.asyncio
 async def test_get_stats_empty(store):
     stats = await store.get_stats()
     assert stats.telegram_count == 0
@@ -28,7 +25,6 @@ async def test_get_stats_empty(store):
     assert stats.backend in ("memory", "sqlite")
 
 
-@pytest.mark.asyncio
 async def test_get_stats(store):
     telegrams = [make_telegram(5), make_telegram(3), make_telegram(1)]
     await store.store_many(telegrams)
@@ -57,7 +53,6 @@ async def test_get_stats(store):
     assert stats.retention_days == store.retention_days
 
 
-@pytest.mark.asyncio
 async def test_sqlite_optimize_reclaims_space(tmp_path):
     store = SqliteStore(tmp_path / "vacuum.db")
     await store.initialize()
@@ -83,14 +78,12 @@ async def test_sqlite_optimize_reclaims_space(tmp_path):
         await store.close()
 
 
-@pytest.mark.asyncio
 async def test_memory_optimize_is_noop(store):
     # optimize() must be safe to call on every backend
     await store.optimize()
     assert await store.count() == 0
 
 
-@pytest.mark.asyncio
 async def test_buffered_get_stats_flushes_first():
     store = BufferedSqliteStore(":memory:", flush_interval=60.0)
     await store.initialize()
@@ -105,7 +98,6 @@ async def test_buffered_get_stats_flushes_first():
         await store.close()
 
 
-@pytest.mark.asyncio
 async def test_capability_flags(store):
     caps = store.capabilities
     if hasattr(store, "engine"):

@@ -24,7 +24,6 @@ async def buffered_store():
     return store
 
 
-@pytest.mark.asyncio
 async def test_store_buffers_until_flush(buffered_store, sample_telegram):
     await buffered_store.store(sample_telegram)
     # Buffer has 1 entry; the DB should still be empty
@@ -36,7 +35,6 @@ async def test_store_buffers_until_flush(buffered_store, sample_telegram):
     assert await buffered_store.count() == 1
 
 
-@pytest.mark.asyncio
 async def test_store_sync_buffers_until_flush(buffered_store, sample_telegram):
     buffered_store.store_sync(sample_telegram)
     assert len(buffered_store._buffer) == 1
@@ -47,7 +45,6 @@ async def test_store_sync_buffers_until_flush(buffered_store, sample_telegram):
     assert await buffered_store.count() == 1
 
 
-@pytest.mark.asyncio
 async def test_periodic_flush(buffered_store, sample_telegram):
     buffered_store.start()
     await buffered_store.store(sample_telegram)
@@ -59,7 +56,6 @@ async def test_periodic_flush(buffered_store, sample_telegram):
     await buffered_store.stop()
 
 
-@pytest.mark.asyncio
 async def test_stop_flushes_remaining(buffered_store, sample_telegram):
     await buffered_store.store(sample_telegram)
     await buffered_store.stop()
@@ -69,7 +65,6 @@ async def test_stop_flushes_remaining(buffered_store, sample_telegram):
     assert len(buffered_store._buffer) == 0
 
 
-@pytest.mark.asyncio
 async def test_flush_failure_reprepends(buffered_store, sample_telegram, monkeypatch):
     async def _fail(telegrams):
         raise RuntimeError("DB error")
@@ -84,7 +79,6 @@ async def test_flush_failure_reprepends(buffered_store, sample_telegram, monkeyp
     assert buffered_store._buffer[0] == sample_telegram
 
 
-@pytest.mark.asyncio
 async def test_flush_failure_then_recovery(buffered_store, sample_telegram, monkeypatch):
     call_count = 0
 
@@ -107,7 +101,6 @@ async def test_flush_failure_then_recovery(buffered_store, sample_telegram, monk
     assert len(buffered_store._buffer) == 0
 
 
-@pytest.mark.asyncio
 async def test_store_many_passes_through(buffered_store, sample_telegram):
     """store_many bypasses the buffer and writes directly."""
     await buffered_store.store_many([sample_telegram])
@@ -115,7 +108,6 @@ async def test_store_many_passes_through(buffered_store, sample_telegram):
     assert await buffered_store.count() == 1
 
 
-@pytest.mark.asyncio
 async def test_read_operations_pass_through(buffered_store, sample_telegram):
     await buffered_store.store_many([sample_telegram])
 
@@ -133,13 +125,11 @@ async def test_read_operations_pass_through(buffered_store, sample_telegram):
     assert deleted == 0  # no retention_days configured
 
 
-@pytest.mark.asyncio
 async def test_flush_empty_buffer_is_noop(buffered_store):
     await buffered_store.flush()
     assert await buffered_store.count() == 0
 
 
-@pytest.mark.asyncio
 async def test_query_flush_first(buffered_store, sample_telegram):
     await buffered_store.store(sample_telegram)
 
@@ -151,7 +141,6 @@ async def test_query_flush_first(buffered_store, sample_telegram):
     assert len(result.telegrams) == 1
 
 
-@pytest.mark.asyncio
 async def test_query_no_flush_by_default(buffered_store, sample_telegram):
     await buffered_store.store(sample_telegram)
 
@@ -171,7 +160,6 @@ def test_properties():
     assert store.capabilities.supports_pagination is True
 
 
-@pytest.mark.asyncio
 async def test_buffer_limit(sample_telegram):
     store = BufferedSqliteStore(":memory:", max_buffer_size=3)
     await store.initialize()
@@ -194,7 +182,6 @@ async def test_buffer_limit(sample_telegram):
     assert store._buffer[2].source == "1.1.3"
 
 
-@pytest.mark.asyncio
 async def test_buffer_limit_failed_flush(sample_telegram, monkeypatch):
     store = BufferedSqliteStore(":memory:", max_buffer_size=3)
     await store.initialize()
