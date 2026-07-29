@@ -113,6 +113,8 @@ async def query_telegrams(store: TelegramStore, input: QueryTelegramsInput) -> Q
     return QueryTelegramsResult(
         telegrams=[_summarize(t) for t in result.telegrams],
         total_count=result.total_count,
+        offset=input.offset,
+        next_offset=(input.offset + len(result.telegrams) if result.limit_reached else None),
         limit_reached=result.limit_reached,
     )
 

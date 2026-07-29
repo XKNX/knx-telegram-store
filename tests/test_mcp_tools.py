@@ -126,6 +126,11 @@ async def test_query_telegrams_limit_reached(store):
     result = await query_telegrams(store, QueryTelegramsInput(limit=1))
     assert len(result.telegrams) == 1
     assert result.limit_reached is True
+    # Pagination is self-describing: next_offset points past the returned window.
+    assert result.offset == 0
+    assert result.next_offset == 1
+    full = await query_telegrams(store, QueryTelegramsInput(limit=100))
+    assert full.next_offset is None
 
 
 async def test_get_last_values(store):
