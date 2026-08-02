@@ -4,16 +4,16 @@ All fields are JSON-native (timestamps are ISO-8601 strings), so a consumer can
 build inputs directly from tool arguments and serialise outputs with
 :func:`dataclasses.asdict` without custom encoders.
 
-Input fields carry their human-readable description as :data:`typing.Annotated`
-metadata (a plain string). This keeps the library free of any schema/validation
-dependency while letting a consumer surface per-parameter descriptions in its
-tool schema via ``typing.get_type_hints(..., include_extras=True)``.
+Input fields carry their human-readable description as ``dataclasses.field``
+metadata under the ``"description"`` key. This keeps the library free of any
+schema/validation dependency while letting a consumer surface per-parameter
+descriptions in its tool schema via ``dataclasses.fields(...)`` metadata.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Annotated, Any
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,32 +24,72 @@ class QueryTelegramsInput:
     An empty list means "no restriction".
     """
 
-    start_time: Annotated[str | None, "Inclusive lower time bound, ISO-8601."] = None
-    end_time: Annotated[str | None, "Inclusive upper time bound, ISO-8601."] = None
-    sources: Annotated[list[str], "Source individual addresses to match."] = field(default_factory=list)
-    destinations: Annotated[list[str], "Destination group addresses to match."] = field(default_factory=list)
-    telegram_types: Annotated[
-        list[str],
-        'Telegram types: full names ("GroupValueWrite") or short "Write"/"Read"/"Response".',
-    ] = field(default_factory=list)
-    directions: Annotated[list[str], 'Directions to match, e.g. "Incoming"/"Outgoing".'] = field(default_factory=list)
-    dpt_mains: Annotated[list[int], "DPT main numbers; matches every subtype of each."] = field(default_factory=list)
-    dpts: Annotated[list[str], 'Specific DPTs as "main" or "main.sub" strings, e.g. "9" or "9.001".'] = field(
-        default_factory=list
+    start_time: str | None = field(
+        default=None,
+        metadata={"description": "Inclusive lower bound timestamp in ISO-8601 format."},
     )
-    delta_before_ms: Annotated[int, "Include telegrams up to this many ms before each match (context window)."] = 0
-    delta_after_ms: Annotated[int, "Include telegrams up to this many ms after each match (context window)."] = 0
-    limit: Annotated[int, "Maximum number of telegrams to return."] = 100
-    offset: Annotated[int, "Number of telegrams to skip, for pagination."] = 0
-    order_descending: Annotated[bool, "Newest first when true."] = True
+    end_time: str | None = field(
+        default=None,
+        metadata={"description": "Inclusive upper bound timestamp in ISO-8601 format."},
+    )
+    sources: list[str] = field(
+        default_factory=list,
+        metadata={"description": "Filter by source individual address(es)."},
+    )
+    destinations: list[str] = field(
+        default_factory=list,
+        metadata={"description": "Filter by destination group address(es)."},
+    )
+    telegram_types: list[str] = field(
+        default_factory=list,
+        metadata={
+            "description": (
+                'Filter by telegram type, accepts full name ("GroupValueWrite") or '
+                'short name ("Write"/"Read"/"Response").'
+            )
+        },
+    )
+    directions: list[str] = field(
+        default_factory=list,
+        metadata={"description": 'Filter by direction ("Incoming" or "Outgoing").'},
+    )
+    dpt_mains: list[int] = field(
+        default_factory=list,
+        metadata={"description": "Filter by DPT main number(s), e.g. [9]; matches every subtype of each."},
+    )
+    dpts: list[str] = field(
+        default_factory=list,
+        metadata={"description": 'Filter by specific DPT main or main.sub strings, e.g. ["9.001"].'},
+    )
+    delta_before_ms: int = field(
+        default=0,
+        metadata={"description": "Time-delta context window before each matching telegram in milliseconds."},
+    )
+    delta_after_ms: int = field(
+        default=0,
+        metadata={"description": "Time-delta context window after each matching telegram in milliseconds."},
+    )
+    limit: int = field(
+        default=100,
+        metadata={"description": "Maximum number of results to return."},
+    )
+    offset: int = field(
+        default=0,
+        metadata={"description": "Number of results to skip, for pagination."},
+    )
+    order_descending: bool = field(
+        default=True,
+        metadata={"description": "Whether to order results newest first (default: True)."},
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class LastValuesInput:
     """Filter for :func:`~knx_telegram_store.mcp.tools.get_last_values`."""
 
-    destinations: Annotated[list[str], "Restrict to these destination group addresses; empty means all."] = field(
-        default_factory=list
+    destinations: list[str] = field(
+        default_factory=list,
+        metadata={"description": "Restrict to these destination group addresses; empty means all."},
     )
 
 
