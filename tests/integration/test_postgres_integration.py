@@ -20,6 +20,7 @@ Or manually:
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import UTC, datetime, timedelta
 
@@ -29,7 +30,12 @@ pytest.importorskip("asyncpg")
 
 from sqlalchemy import text  # noqa: E402
 
-from knx_telegram_store import BufferedPostgresStore, StoredTelegram, TelegramQuery  # noqa: E402
+from knx_telegram_store import (  # noqa: E402
+    BufferedPostgresStore,
+    KnxTelegramStoreException,
+    StoredTelegram,
+    TelegramQuery,
+)
 from knx_telegram_store.backends.postgres import PostgresStore, _build_engine  # noqa: E402
 
 pytestmark = pytest.mark.integration
@@ -307,6 +313,113 @@ async def test_evict_older_than(store):
 
     assert await pg_store.evict_older_than(cutoff) == 10
     assert await pg_store.count() == 5
+
+
+# --- Read-only + LISTEN/NOTIFY ---------------------------------------------------
+
+
+@pytest.fixture
+async def reader(backend):
+    """(name, writer, reader) - a read-only store against a DB a writer already initialized."""
+    name, dsn = backend
+    writer = PostgresStore(dsn, retention_days=30)
+    await writer.initialize()
+    pg_reader = PostgresStore(dsn, read_only=True)
+    await pg_reader.initialize()
+    yield name, writer, pg_reader
+    await pg_reader.close()
+    await writer.close()
+
+
+async def test_read_only_capabilities(reader):
+    _, _writer, pg_reader = reader
+    assert pg_reader.capabilities.read_only is True
+    assert pg_reader.capabilities.supports_optimize is False
+
+
+async def test_read_only_sees_writer_data(reader):
+    _, writer, pg_reader = reader
+    base = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+    await writer.store_many([make_telegram(base, i) for i in range(5)])
+    assert await pg_reader.count() == 5
+    result = await pg_reader.query(TelegramQuery())
+    assert result.total_count == 5
+
+
+async def test_read_only_rejects_mutations(reader):
+    _, _writer, pg_reader = reader
+    base = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+    with pytest.raises(KnxTelegramStoreException, match="read-only"):
+        await pg_reader.store(make_telegram(base))
+    with pytest.raises(KnxTelegramStoreException, match="read-only"):
+        await pg_reader.store_many([make_telegram(base)])
+    with pytest.raises(KnxTelegramStoreException, match="read-only"):
+        await pg_reader.evict_older_than(datetime.now(UTC))
+    with pytest.raises(KnxTelegramStoreException, match="read-only"):
+        await pg_reader.clear()
+    with pytest.raises(KnxTelegramStoreException, match="read-only"):
+        await pg_reader.optimize()
+    # Nothing was written or deleted.
+    assert await pg_reader.count() == 0
+
+
+async def test_read_only_never_runs_ddl(backend):
+    """A read-only store with no prior writer must fail, not create the schema."""
+    _, dsn = backend
+    pg_reader = PostgresStore(dsn, read_only=True)
+    try:
+        with pytest.raises(KnxTelegramStoreException):
+            await pg_reader.initialize()
+    finally:
+        await pg_reader.close()
+
+    engine = _build_engine(dsn)
+    try:
+        async with engine.connect() as conn:
+            exists = await conn.scalar(text("SELECT to_regclass('telegrams')"))
+        assert exists is None
+    finally:
+        await engine.dispose()
+
+
+async def test_listen_for_new_telegrams(reader):
+    _, writer, pg_reader = reader
+    listener = pg_reader.listen_for_new_telegrams()
+
+    task = asyncio.create_task(anext(listener))
+    await asyncio.sleep(0.2)  # let the LISTEN attach before the write
+
+    await writer.store(make_telegram(datetime.now(UTC), destination="7/7/7", value=12.5))
+
+    received = await asyncio.wait_for(task, timeout=5)
+    assert received.destination == "7/7/7"
+    assert received.value_numeric == 12.5
+    assert received.source_name == "Sensor"
+    await listener.aclose()
+
+
+async def test_listen_for_new_telegrams_batch(reader):
+    """A single store_many() call fires one notification per row, not per statement."""
+    _, writer, pg_reader = reader
+    listener = pg_reader.listen_for_new_telegrams()
+    received: list[StoredTelegram] = []
+
+    async def _collect(n: int) -> None:
+        async for t in listener:
+            received.append(t)
+            if len(received) >= n:
+                return
+
+    task = asyncio.create_task(_collect(3))
+    await asyncio.sleep(0.2)
+
+    base = datetime.now(UTC)
+    batch = [make_telegram(base, i, destination=f"1/2/{i}") for i in range(3)]
+    await writer.store_many(batch)
+
+    await asyncio.wait_for(task, timeout=5)
+    assert sorted(t.destination for t in received) == ["1/2/0", "1/2/1", "1/2/2"]
+    await listener.aclose()
 
 
 # --- Buffered store --------------------------------------------------------------
