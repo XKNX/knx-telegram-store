@@ -299,6 +299,7 @@ async def test_postgres_check_config_unreachable():
     assert not result.ok
     assert result.kind in {ConnectionErrorKind.HOST_UNREACHABLE, ConnectionErrorKind.TIMEOUT}
 
+
 def test_evaluate_sqlite_path_memory():
     # Test string and Path variants of ":memory:"
     from pathlib import Path
