@@ -13,6 +13,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     insert,
+    or_,
     select,
 )
 
@@ -89,20 +90,45 @@ class LookupCache:
             for cat, val in to_resolve:
                 await conn.execute(insert(table).values(category=cat, value=val).prefix_with("OR IGNORE"))
         else:
-            # Fallback
-            for cat, val in to_resolve:
-                existing = await conn.scalar(select(table.c.id).where(table.c.category == cat, table.c.value == val))
-                if existing is None:
-                    await conn.execute(insert(table).values(category=cat, value=val))
+            # Fallback (batch to avoid N+1 and parameter limits)
+            # We use dict.fromkeys to preserve order and remove duplicates
+            unique_to_resolve = list(dict.fromkeys(to_resolve))
+            batch_size = 100
+            for i in range(0, len(unique_to_resolve), batch_size):
+                batch = unique_to_resolve[i : i + batch_size]
+                conds = [(table.c.category == cat) & (table.c.value == val) for cat, val in batch]
+
+                existing_result = await conn.execute(
+                    select(table.c.category, table.c.value).where(or_(*conds))
+                )
+                existing_set = {(row[0], row[1]) for row in existing_result}
+
+                missing = [
+                    {"category": cat, "value": val}
+                    for cat, val in batch
+                    if (cat, val) not in existing_set
+                ]
+                if missing:
+                    await conn.execute(insert(table).values(missing))
 
         # Re-fetch the IDs for the ones we didn't have in cache
-        # We fetch one by one to keep it simple and robust across dialects for now,
-        # since to_resolve is usually small per batch.
-        for pair in to_resolve:
-            cat, val = pair
-            row_id = await conn.scalar(select(table.c.id).where(table.c.category == cat, table.c.value == val))
-            if row_id is not None:
+        # We fetch in batches to avoid N+1 queries.
+        unique_to_resolve = list(dict.fromkeys(to_resolve))
+        # Use a larger batch size (e.g. 500) since we only have up to 1000 items usually
+        batch_size = 400
+        for i in range(0, len(unique_to_resolve), batch_size):
+            batch = unique_to_resolve[i : i + batch_size]
+            conds = [(table.c.category == cat) & (table.c.value == val) for cat, val in batch]
+
+            result = await conn.execute(
+                select(table.c.category, table.c.value, table.c.id).where(or_(*conds))
+            )
+            for cat, val, row_id in result:
+                pair = (cat, val)
                 self._cache[pair] = row_id
-                resolved[pair] = row_id
+
+        for pair in to_resolve:
+            if pair in self._cache:
+                resolved[pair] = self._cache[pair]
 
         return resolved
