@@ -396,7 +396,6 @@ def test_evaluate_sqlite_path_no_existing_parent(monkeypatch, tmp_path):
     # Test the fallback where we reach the root and nothing exists.
     target = tmp_path / "a" / "b" / "c.db"
 
-    original_exists = Path.exists
     def mocked_exists(self):
         # Make everything look non-existent for this test
         return False
