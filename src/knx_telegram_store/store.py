@@ -139,13 +139,14 @@ class TelegramStore(ABC):
             retention_days=self.retention_days,
         )
 
-    async def optimize(self) -> None:  # noqa: B027 — intentional no-op default, not abstract
+    async def optimize(self) -> None:
         """Reclaim storage space after deletions (e.g. VACUUM).
 
         No-op by default; backends that support it set
         capabilities.supports_optimize and override. May block writers and
         take a long time on large databases.
         """
+        return
 
     @abstractmethod
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
