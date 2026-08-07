@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 from collections import deque
 from collections.abc import Sequence
 from datetime import datetime, timedelta
@@ -92,19 +93,20 @@ class MemoryStore(TelegramStore):
 
         # 3. Time-delta context window
         if query.delta_before_ms > 0 or query.delta_after_ms > 0:
-            pivot_timestamps = [t.timestamp for t in results]
+            pivot_timestamps = sorted(t.timestamp for t in results)
 
             delta_before = timedelta(milliseconds=query.delta_before_ms)
             delta_after = timedelta(milliseconds=query.delta_after_ms)
 
             # Re-collect all telegrams within any pivot's window
-            # This implementation is O(N*M) but N is small for MemoryStore (500)
             context_results = set()
             for t in self._telegrams:
-                for pivot_ts in pivot_timestamps:
-                    if (pivot_ts - delta_before) <= t.timestamp <= (pivot_ts + delta_after):
-                        context_results.add(t)
-                        break
+                low_bound = t.timestamp - delta_after
+                high_bound = t.timestamp + delta_before
+
+                idx = bisect.bisect_left(pivot_timestamps, low_bound)
+                if idx < len(pivot_timestamps) and pivot_timestamps[idx] <= high_bound:
+                    context_results.add(t)
             results = list(context_results)
 
         # 4. Ordering
