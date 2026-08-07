@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import replace
+from datetime import datetime
 from urllib.parse import unquote
 
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from ..connection import (
     ConnectionCheckResult,
@@ -15,8 +19,11 @@ from ..connection import (
     probe_engine,
     probe_timescaledb,
 )
+from ..model import StoredTelegram
 from ..store import wrap_store_errors
 from .base_sql import BaseSQLStore
+
+_NOTIFY_CHANNEL = "telegram_inserted"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -60,6 +67,27 @@ def _timescale_advisory(result: ConnectionCheckResult) -> ConnectionCheckResult:
     return result
 
 
+def _telegram_from_notify_payload(payload: str) -> StoredTelegram:
+    """Parse a NOTIFY payload (row_to_json of the resolved trigger query) into a StoredTelegram."""
+    data = json.loads(payload)
+    return StoredTelegram(
+        timestamp=datetime.fromisoformat(data["timestamp"]),
+        source=data["source"],
+        destination=data["destination"],
+        telegramtype=data["telegramtype"],
+        direction=data["direction"],
+        payload=data["payload"],
+        dpt_main=data["dpt_main"],
+        dpt_sub=data["dpt_sub"],
+        value=data["value"],
+        value_numeric=data["value_numeric"],
+        raw_data=data["raw_data"],
+        data_secure=data["data_secure"],
+        source_name=data["source_name"] or "",
+        destination_name=data["destination_name"] or "",
+    )
+
+
 class PostgresStore(BaseSQLStore):
     """PostgreSQL implementation of TelegramStore.
 
@@ -75,6 +103,7 @@ class PostgresStore(BaseSQLStore):
         retention_days: int | None = None,
         *,
         compress_after_days: int | None = 7,
+        read_only: bool = False,
     ) -> None:
         """Initialize the Postgres store.
 
@@ -84,9 +113,14 @@ class PostgresStore(BaseSQLStore):
             compress_after_days: When TimescaleDB is available, compress chunks
                 older than this many days (None disables compression setup).
                 Ignored on plain PostgreSQL.
+            read_only: With read_only=True the store never runs DDL/migrations
+                and rejects all mutating operations; only querying, stats and
+                ``listen_for_new_telegrams`` are available. Intended for
+                reading a database owned and written by another process (e.g.
+                Home Assistant's KNX integration).
         """
         engine = _build_engine(dsn)
-        super().__init__(engine, retention_days)
+        super().__init__(engine, retention_days, read_only=read_only)
         self._compress_after_days = compress_after_days
         self._timescale_enabled: bool | None = None
         # Plain VACUUM only marks dead tuples reusable — it does not return
@@ -180,7 +214,16 @@ class PostgresStore(BaseSQLStore):
         is converted to a hypertable (migrating existing rows in place) and
         native compression is configured; otherwise the store runs on plain
         PostgreSQL tables.
+
+        With read_only=True, no DDL/migrations run at all — another process
+        (the writer) owns the schema, including the notify trigger set up
+        below. Hosts should check needs_migration() and surface a version-skew
+        error instead of relying on this store to upgrade anything.
         """
+        if self._read_only:
+            await super().initialize()
+            return
+
         # 1. Detect (and if needed enable) the TimescaleDB extension. Runs on a
         # separate AUTOCOMMIT connection so a failed CREATE EXTENSION cannot
         # abort the schema transaction below.
@@ -192,6 +235,11 @@ class PostgresStore(BaseSQLStore):
 
             # 3. Perform column-level upgrades
             await conn.run_sync(self._upgrade_schema)
+
+            # 3.5. Notify trigger so a read-only listener learns about new
+            # rows via LISTEN/NOTIFY instead of polling. Always created,
+            # regardless of whether anything is listening.
+            await self._setup_notify_trigger(conn)
 
         # 4. Hypertable conversion + compression (idempotent)
         if timescale:
@@ -279,6 +327,91 @@ class PostgresStore(BaseSQLStore):
                         f"INTERVAL '{int(self._compress_after_days)} days', if_not_exists => TRUE)"
                     )
                 )
+
+    async def _setup_notify_trigger(self, conn: AsyncConnection) -> None:
+        """Create the NOTIFY trigger that lets a read-only store LISTEN for new rows.
+
+        A statement-level trigger with a transition table resolves the whole
+        inserted batch against string_lookup in a single join (one insert from
+        store_many can hold many rows), then emits one pg_notify per row so
+        each payload stays well under Postgres's 8000-byte limit. The payload
+        mirrors query()'s decoded shape (string source/destination/etc., not
+        the raw lookup ids), so a listener can build a StoredTelegram directly
+        without a follow-up query.
+        """
+        await conn.execute(
+            text(f"""
+                CREATE OR REPLACE FUNCTION knx_telegram_store_notify_insert() RETURNS trigger AS $$
+                DECLARE
+                  rec RECORD;
+                BEGIN
+                  FOR rec IN
+                    SELECT
+                      t.timestamp,
+                      s.value AS source,
+                      d.value AS destination,
+                      tt.value AS telegramtype,
+                      dir.value AS direction,
+                      sn.value AS source_name,
+                      dn.value AS destination_name,
+                      t.payload,
+                      t.dpt_main,
+                      t.dpt_sub,
+                      t.value,
+                      t.value_numeric,
+                      t.raw_data,
+                      t.data_secure
+                    FROM new_rows t
+                    JOIN string_lookup s ON s.id = t.source_id AND s.category = 'source'
+                    JOIN string_lookup d ON d.id = t.destination_id AND d.category = 'destination'
+                    JOIN string_lookup tt ON tt.id = t.telegramtype_id AND tt.category = 'telegramtype'
+                    JOIN string_lookup dir ON dir.id = t.direction_id AND dir.category = 'direction'
+                    LEFT JOIN string_lookup sn ON sn.id = t.source_name_id AND sn.category = 'source_name'
+                    LEFT JOIN string_lookup dn ON dn.id = t.destination_name_id AND dn.category = 'destination_name'
+                  LOOP
+                    PERFORM pg_notify('{_NOTIFY_CHANNEL}', row_to_json(rec)::text);
+                  END LOOP;
+                  RETURN NULL;
+                END;
+                $$ LANGUAGE plpgsql;
+            """)
+        )
+        await conn.execute(text("DROP TRIGGER IF EXISTS knx_telegram_store_notify ON telegrams"))
+        await conn.execute(
+            text("""
+                CREATE TRIGGER knx_telegram_store_notify
+                  AFTER INSERT ON telegrams
+                  REFERENCING NEW TABLE AS new_rows
+                  FOR EACH STATEMENT
+                  EXECUTE FUNCTION knx_telegram_store_notify_insert()
+            """)
+        )
+
+    async def listen_for_new_telegrams(self) -> AsyncIterator[StoredTelegram]:
+        """Yield telegrams as they are inserted by any writer, via LISTEN/NOTIFY.
+
+        Requires the writer-side schema migration to have created the notify
+        trigger (done automatically by a non-read-only PostgresStore's
+        initialize()) — this works whether or not *this* store is read_only.
+        Runs for as long as the returned async generator is iterated; breaking
+        out of (or closing) the loop releases the dedicated listen connection.
+        """
+        queue: asyncio.Queue[str] = asyncio.Queue()
+
+        def _on_notify(_connection: object, _pid: int, _channel: str, payload: str) -> None:
+            queue.put_nowait(payload)
+
+        async with self.engine.connect() as conn:
+            raw = await conn.get_raw_connection()
+            asyncpg_conn = raw.driver_connection
+            assert asyncpg_conn is not None
+            await asyncpg_conn.add_listener(_NOTIFY_CHANNEL, _on_notify)
+            try:
+                while True:
+                    payload = await queue.get()
+                    yield _telegram_from_notify_payload(payload)
+            finally:
+                await asyncpg_conn.remove_listener(_NOTIFY_CHANNEL, _on_notify)
 
     def _upgrade_schema(self, connection) -> None:
         """Synchronous part of schema upgrade (run via run_sync)."""
