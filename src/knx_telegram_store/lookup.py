@@ -98,16 +98,10 @@ class LookupCache:
                 batch = unique_to_resolve[i : i + batch_size]
                 conds = [(table.c.category == cat) & (table.c.value == val) for cat, val in batch]
 
-                existing_result = await conn.execute(
-                    select(table.c.category, table.c.value).where(or_(*conds))
-                )
+                existing_result = await conn.execute(select(table.c.category, table.c.value).where(or_(*conds)))
                 existing_set = {(row[0], row[1]) for row in existing_result}
 
-                missing = [
-                    {"category": cat, "value": val}
-                    for cat, val in batch
-                    if (cat, val) not in existing_set
-                ]
+                missing = [{"category": cat, "value": val} for cat, val in batch if (cat, val) not in existing_set]
                 if missing:
                     await conn.execute(insert(table).values(missing))
 
@@ -120,9 +114,7 @@ class LookupCache:
             batch = unique_to_resolve[i : i + batch_size]
             conds = [(table.c.category == cat) & (table.c.value == val) for cat, val in batch]
 
-            result = await conn.execute(
-                select(table.c.category, table.c.value, table.c.id).where(or_(*conds))
-            )
+            result = await conn.execute(select(table.c.category, table.c.value, table.c.id).where(or_(*conds)))
             for cat, val, row_id in result:
                 pair = (cat, val)
                 self._cache[pair] = row_id
