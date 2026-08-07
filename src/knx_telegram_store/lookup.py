@@ -99,10 +99,10 @@ class LookupCache:
         # Re-fetch the IDs for the ones we didn't have in cache
         # We fetch all at once to avoid N+1 queries.
         if to_resolve:
-            stmt = select(table.c.category, table.c.value, table.c.id).where(
+            select_stmt = select(table.c.category, table.c.value, table.c.id).where(
                 tuple_(table.c.category, table.c.value).in_(to_resolve)
             )
-            result = await conn.execute(stmt)
+            result = await conn.execute(select_stmt)
             for cat, val, row_id in result:
                 pair = (cat, val)
                 self._cache[pair] = row_id
