@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -16,7 +16,7 @@ from knx_telegram_store.mcp import (
     get_store_stats,
     query_telegrams,
 )
-from knx_telegram_store.mcp.tools import _format_dpt, _normalize_type, _parse_dpt, _parse_dt
+from knx_telegram_store.mcp.tools import _format_dpt, _iso, _normalize_type, _parse_dpt, _parse_dt
 
 NOW = datetime(2026, 7, 23, 12, 0, 0, tzinfo=UTC)
 
@@ -210,3 +210,18 @@ def test_parse_dpt_invalid(entry):
 )
 def test_normalize_type(value, expected):
     assert _normalize_type(value) == expected
+
+
+def test_iso():
+    # Naive datetime
+    naive_dt = datetime(2023, 1, 1, 12, 0, 0)
+    assert _iso(naive_dt) == "2023-01-01T12:00:00+00:00"
+
+    # Aware datetime (UTC)
+    utc_dt = datetime(2023, 1, 1, 12, 0, 0, tzinfo=UTC)
+    assert _iso(utc_dt) == "2023-01-01T12:00:00+00:00"
+
+    # Aware datetime (non-UTC)
+    tz = timezone(timedelta(hours=2))
+    aware_dt = datetime(2023, 1, 1, 12, 0, 0, tzinfo=tz)
+    assert _iso(aware_dt) == "2023-01-01T12:00:00+02:00"
