@@ -79,5 +79,6 @@ def test_parse_xxe_payload_raises():
 </CommunicationLog>
 """
     from defusedxml.common import EntitiesForbidden
+
     with pytest.raises(EntitiesForbidden):
         _parse(xxe_payload)
