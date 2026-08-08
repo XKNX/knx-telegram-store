@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Iterator
+from defusedxml.ElementTree import iterparse
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import IO
@@ -73,7 +74,7 @@ def iter_communication_log(source: str | IO[bytes]) -> Iterator[RawTelegramRecor
     from the (falsely "Z"-suffixed) local timestamps to yield true UTC.
     """
     utc_correction = timedelta(0)
-    for _, element in ET.iterparse(source, events=("end", "comment")):
+    for _, element in iterparse(source, events=("end", "comment")):
         if element.tag is ET.Comment:
             match = _TIMEZONE_COMMENT.search(element.text or "")
             if match:
