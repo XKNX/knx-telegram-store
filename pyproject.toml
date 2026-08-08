@@ -46,6 +46,7 @@ dev = [
     "ruff>=0.3",
     "mypy>=1.9",
     "aiosqlite>=0.20",
+    "types-defusedxml",
 ]
 
 [tool.ruff]
