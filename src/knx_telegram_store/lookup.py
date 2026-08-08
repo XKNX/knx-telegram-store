@@ -15,6 +15,7 @@ from sqlalchemy import (
     insert,
     or_,
     select,
+    tuple_,
 )
 
 if TYPE_CHECKING:
@@ -106,9 +107,9 @@ class LookupCache:
                     await conn.execute(insert(table).values(missing))
 
         # Re-fetch the IDs for the ones we didn't have in cache
-        # We fetch in batches to avoid N+1 queries.
+        # We fetch in batches to avoid N+1 queries and parameter limits.
         unique_to_resolve = list(dict.fromkeys(to_resolve))
-        # Use a larger batch size (e.g. 500) since we only have up to 1000 items usually
+        # Use a larger batch size (e.g. 400) since we only have up to 1000 items usually
         batch_size = 400
         for i in range(0, len(unique_to_resolve), batch_size):
             batch = unique_to_resolve[i : i + batch_size]
@@ -118,9 +119,6 @@ class LookupCache:
             for cat, val, row_id in result:
                 pair = (cat, val)
                 self._cache[pair] = row_id
-
-        for pair in to_resolve:
-            if pair in self._cache:
-                resolved[pair] = self._cache[pair]
+                resolved[pair] = row_id
 
         return resolved

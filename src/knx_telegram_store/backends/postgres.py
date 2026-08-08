@@ -492,7 +492,7 @@ class PostgresStore(BaseSQLStore):
                 )
 
             # Drop old columns
-            for old_col in list(cols_to_migrate.values()) + ["dpt_name", "unit"]:
+            for old_col in [*cols_to_migrate.values(), "dpt_name", "unit"]:
                 if old_col in existing_columns:
                     connection.execute(text(f'ALTER TABLE telegrams DROP COLUMN "{old_col}"'))
                     existing_columns.remove(old_col)

@@ -2,7 +2,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from knx_telegram_store import StoredTelegram, TelegramQuery
+from knx_telegram_store import KnxTelegramStoreException, StoredTelegram, TelegramQuery
+from knx_telegram_store.store import wrap_store_errors
 
 
 @pytest.fixture
@@ -308,3 +309,30 @@ async def test_exception_wrapping(store):
                 )
             # AttributeError should be raised and wrapped
             assert "Database error during store" in str(exc_info.value)
+
+
+async def test_wrap_store_errors():
+    """Test that the wrap_store_errors decorator behaves correctly."""
+
+    @wrap_store_errors
+    async def success_func():
+        return "success"
+
+    @wrap_store_errors
+    async def store_exception_func():
+        raise KnxTelegramStoreException("already wrapped")
+
+    @wrap_store_errors
+    async def other_exception_func():
+        raise ValueError("some other error")
+
+    # 1. Success case
+    assert await success_func() == "success"
+
+    # 2. Preserves existing KnxTelegramStoreException
+    with pytest.raises(KnxTelegramStoreException, match="already wrapped"):
+        await store_exception_func()
+
+    # 3. Wraps other exceptions
+    with pytest.raises(KnxTelegramStoreException, match="Database error during other_exception_func: some other error"):
+        await other_exception_func()
