@@ -11,11 +11,12 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Iterator
-from defusedxml.ElementTree import iterparse
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import IO
 from xml.sax.saxutils import quoteattr
+
+from defusedxml.ElementTree import iterparse
 
 KNX_TELEGRAM_NAMESPACE = "http://knx.org/xml/telegrams/01"
 _TELEGRAM_TAG = f"{{{KNX_TELEGRAM_NAMESPACE}}}Telegram"
