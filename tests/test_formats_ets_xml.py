@@ -67,3 +67,18 @@ def test_write_empty_log_is_valid():
     out = io.StringIO()
     assert write_communication_log([], out) == 0
     assert list(iter_communication_log(io.BytesIO(out.getvalue().encode()))) == []
+
+
+def test_parse_xxe_payload_raises():
+    xxe_payload = """<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE CommunicationLog [
+  <!ENTITY xxe SYSTEM "file:///etc/passwd">
+]>
+<CommunicationLog xmlns="http://knx.org/xml/telegrams/01">
+  <RecordStart Timestamp="2026-06-27T13:54:21.8676962Z" ConnectionName="&xxe;" Mode="LinkLayer" />
+</CommunicationLog>
+"""
+    from defusedxml.common import EntitiesForbidden
+
+    with pytest.raises(EntitiesForbidden):
+        _parse(xxe_payload)
