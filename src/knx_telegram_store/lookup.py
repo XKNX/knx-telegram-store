@@ -14,6 +14,7 @@ from sqlalchemy import (
     UniqueConstraint,
     insert,
     select,
+    tuple_,
 )
 
 if TYPE_CHECKING:
@@ -96,12 +97,14 @@ class LookupCache:
                     await conn.execute(insert(table).values(category=cat, value=val))
 
         # Re-fetch the IDs for the ones we didn't have in cache
-        # We fetch one by one to keep it simple and robust across dialects for now,
-        # since to_resolve is usually small per batch.
-        for pair in to_resolve:
-            cat, val = pair
-            row_id = await conn.scalar(select(table.c.id).where(table.c.category == cat, table.c.value == val))
-            if row_id is not None:
+        # We fetch all at once to avoid N+1 queries.
+        if to_resolve:
+            select_stmt = select(table.c.category, table.c.value, table.c.id).where(
+                tuple_(table.c.category, table.c.value).in_(to_resolve)
+            )
+            result = await conn.execute(select_stmt)
+            for cat, val, row_id in result:
+                pair = (cat, val)
                 self._cache[pair] = row_id
                 resolved[pair] = row_id
 
