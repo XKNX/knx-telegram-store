@@ -16,8 +16,6 @@ from datetime import UTC, datetime, timedelta
 from typing import IO
 from xml.sax.saxutils import quoteattr
 
-from defusedxml.ElementTree import iterparse
-
 KNX_TELEGRAM_NAMESPACE = "http://knx.org/xml/telegrams/01"
 _TELEGRAM_TAG = f"{{{KNX_TELEGRAM_NAMESPACE}}}Telegram"
 
@@ -75,7 +73,7 @@ def iter_communication_log(source: str | IO[bytes]) -> Iterator[RawTelegramRecor
     from the (falsely "Z"-suffixed) local timestamps to yield true UTC.
     """
     utc_correction = timedelta(0)
-    for _, element in iterparse(source, events=("end", "comment")):
+    for _, element in ET.iterparse(source, events=("end", "comment")):
         if element.tag is ET.Comment:
             match = _TIMEZONE_COMMENT.search(element.text or "")
             if match:

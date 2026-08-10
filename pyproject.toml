@@ -18,9 +18,7 @@ classifiers = [
     "Topic :: Home Automation",
     "Framework :: AsyncIO",
 ]
-dependencies = [
-    "defusedxml>=0.7.1",
-]
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/XKNX/knx-telegram-store"
@@ -46,7 +44,6 @@ dev = [
     "ruff>=0.3",
     "mypy>=1.9",
     "aiosqlite>=0.20",
-    "types-defusedxml",
 ]
 
 [tool.ruff]

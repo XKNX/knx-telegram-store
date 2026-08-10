@@ -119,6 +119,9 @@ class LookupCache:
             for cat, val, row_id in result:
                 pair = (cat, val)
                 self._cache[pair] = row_id
-                resolved[pair] = row_id
+
+        for pair in to_resolve:
+            if pair in self._cache:
+                resolved[pair] = self._cache[pair]
 
         return resolved

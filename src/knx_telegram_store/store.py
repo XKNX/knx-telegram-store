@@ -19,7 +19,7 @@ class KnxTelegramStoreException(Exception):
     """Base exception for all KNX telegram store operations."""
 
 
-def wrap_store_errors[**P, T](func: Callable[P, Awaitable[T]]) -> Callable[P, Coroutine[Any, Any, T]]:
+def wrap_store_errors(func: Callable[P, Awaitable[T]]) -> Callable[P, Coroutine[Any, Any, T]]:  # noqa: UP047
     """Wrap any exception thrown by a store operation in KnxTelegramStoreException."""
 
     @wraps(func)
