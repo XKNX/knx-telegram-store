@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -10,6 +11,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     Double,
+    Index,
     Integer,
     MetaData,
     Table,
@@ -27,6 +29,8 @@ from ..lookup import LookupCache, build_lookup_table
 from ..model import StoredTelegram
 from ..query import TelegramQuery, TelegramQueryResult
 from ..store import KnxTelegramStoreException, StoreCapabilities, StoreStats, TelegramStore, wrap_store_errors
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class BaseSQLStore(TelegramStore):
@@ -49,10 +53,10 @@ class BaseSQLStore(TelegramStore):
             "telegrams",
             self._metadata,
             Column("timestamp", DateTime(timezone=True), nullable=False, index=True),
-            Column("source_id", Integer, nullable=False),
+            Column("source_id", Integer, nullable=False, index=True),
             Column("destination_id", Integer, nullable=False, index=True),
-            Column("telegramtype_id", Integer, nullable=False),
-            Column("direction_id", Integer, nullable=False),
+            Column("telegramtype_id", Integer, nullable=False, index=True),
+            Column("direction_id", Integer, nullable=False, index=True),
             Column("source_name_id", Integer, nullable=True),
             Column("destination_name_id", Integer, nullable=True),
             Column("payload", JSON, nullable=True),
@@ -62,6 +66,13 @@ class BaseSQLStore(TelegramStore):
             Column("value_numeric", Double, nullable=True),
             Column("raw_data", Text, nullable=True),  # Hex encoded string
             Column("data_secure", Boolean, nullable=True),
+            # dpt_mains / dpts filters were the only ones left doing a
+            # sequential scan. Composite so a main-only filter uses the leading
+            # column and a main+sub filter uses both: 59 ms -> 6.6 ms and
+            # 45 ms -> 0.9 ms on a 2M-row hypertable. Insert cost is ~4% for a
+            # bulk load, and a KNX bus is nowhere near insert-bound
+            # (SpectrumKNX#450).
+            Index("ix_telegrams_dpt", "dpt_main", "dpt_sub"),
         )
         self.last_ga_telegrams = Table(
             "last_ga_telegrams",
@@ -240,6 +251,33 @@ class BaseSQLStore(TelegramStore):
                     )
                     await conn.execute(pg_upsert)
 
+    def ensure_indexes(self, connection) -> None:
+        """Create any declared index that the database is missing.
+
+        ``metadata.create_all`` skips tables that already exist, so an index
+        added to the model later never reaches an existing installation.
+
+        On a large TimescaleDB hypertable this takes a moment as it propagates
+        to every chunk — around 1-2.5 s per million rows in testing — so it logs
+        before starting, otherwise the first start after an upgrade looks like a
+        hang.
+        """
+        inspector = inspect(connection)
+        for table in (self.telegrams, self.last_ga_telegrams, self.string_lookup):
+            try:
+                existing = {index["name"] for index in inspector.get_indexes(table.name)}
+            except Exception:
+                # Table not created yet; create_all will have made the indexes.
+                continue
+            for index in table.indexes:
+                if index.name not in existing:
+                    _LOGGER.info(
+                        "Creating missing index %s on %s — this can take a moment on a large store",
+                        index.name,
+                        table.name,
+                    )
+                    index.create(connection, checkfirst=True)
+
     @wrap_store_errors
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
         """Delete all telegrams with timestamp < cutoff."""
@@ -372,13 +410,28 @@ class BaseSQLStore(TelegramStore):
                 )
 
             # Use EXISTS to find rows within range of any pivot
-            stmt = stmt.where(select(pivots).where(cond).exists())
+            where_clause: Any = select(pivots).where(cond).exists()
         else:
-            if filters:
-                stmt = stmt.where(and_(*filters))
+            where_clause = and_(*filters) if filters else None
+
+        if where_clause is not None:
+            stmt = stmt.where(where_clause)
 
         # 3. Total Count (before pagination)
-        count_stmt = select(func.count()).select_from(stmt.alias("unpaginated"))
+        #
+        # Counted straight off `telegrams` instead of wrapping the statement
+        # above in a subquery. The six string_lookup joins only *project*
+        # resolved names into the result rows — every filter is expressed
+        # against telegrams columns via id subqueries — so they cannot change
+        # which rows match, and they made an unfiltered count roughly 44x
+        # slower on a 2M-row hypertable: 1559 ms against 36 ms (SpectrumKNX#450).
+        #
+        # Equivalent rather than approximate: the four inner joins could in
+        # principle drop rows, but every *_id is interned under its own category
+        # when written (see store_many), so each one always has a match.
+        count_stmt = select(func.count()).select_from(self.telegrams)
+        if where_clause is not None:
+            count_stmt = count_stmt.where(where_clause)
 
         # 4. Ordering
         if query.order_descending:
