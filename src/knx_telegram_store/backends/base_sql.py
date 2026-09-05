@@ -11,6 +11,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     Double,
+    Index,
     Integer,
     MetaData,
     Table,
@@ -65,15 +66,22 @@ class BaseSQLStore(TelegramStore):
             Column("value_numeric", Double, nullable=True),
             Column("raw_data", Text, nullable=True),  # Hex encoded string
             Column("data_secure", Boolean, nullable=True),
+            # dpt_mains / dpts filters were the only ones left doing a
+            # sequential scan. Composite so a main-only filter uses the leading
+            # column and a main+sub filter uses both: 59 ms -> 6.6 ms and
+            # 45 ms -> 0.9 ms on a 2M-row hypertable. Insert cost is ~4% for a
+            # bulk load, and a KNX bus is nowhere near insert-bound
+            # (SpectrumKNX#450).
+            Index("ix_telegrams_dpt", "dpt_main", "dpt_sub"),
         )
         self.last_ga_telegrams = Table(
             "last_ga_telegrams",
             self._metadata,
             Column("destination_id", Integer, primary_key=True),
             Column("timestamp", DateTime(timezone=True), nullable=False),
-            Column("source_id", Integer, nullable=False, index=True),
-            Column("telegramtype_id", Integer, nullable=False, index=True),
-            Column("direction_id", Integer, nullable=False, index=True),
+            Column("source_id", Integer, nullable=False),
+            Column("telegramtype_id", Integer, nullable=False),
+            Column("direction_id", Integer, nullable=False),
             Column("source_name_id", Integer, nullable=True),
             Column("destination_name_id", Integer, nullable=True),
             Column("payload", JSON, nullable=True),

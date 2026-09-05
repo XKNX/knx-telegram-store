@@ -111,3 +111,29 @@ async def test_count_matches_paginated_rows_with_time_delta_context(populated_st
     result = await populated_store.query(query)
     assert result.total_count == len(result.telegrams)
     assert result.total_count >= 1
+
+
+def test_declared_indexes_cover_the_filterable_columns(tmp_path):
+    """Every column TelegramQuery can filter on should be indexed.
+
+    Audited by EXPLAIN against a 2M-row hypertable: without these, dpt filters
+    were the only ones still doing a sequential scan.
+    """
+    store = SqliteStore(str(tmp_path / "idx.db"))
+    indexed = {tuple(c.name for c in index.columns) for index in store.telegrams.indexes}
+
+    for column in ("timestamp", "source_id", "destination_id", "telegramtype_id", "direction_id"):
+        assert (column,) in indexed, f"{column} is filterable but not indexed"
+    # Composite so a dpt_main-only filter uses the leading column too.
+    assert ("dpt_main", "dpt_sub") in indexed
+
+
+def test_last_ga_telegrams_is_not_over_indexed(tmp_path):
+    """It holds one row per group address and is upserted on every telegram.
+
+    It is only ever read whole or by primary key, so extra indexes on it would
+    be write cost for no read benefit.
+    """
+    store = SqliteStore(str(tmp_path / "idx2.db"))
+    extra = {tuple(c.name for c in index.columns) for index in store.last_ga_telegrams.indexes}
+    assert extra == set(), f"unexpected indexes on the upsert hot path: {extra}"
