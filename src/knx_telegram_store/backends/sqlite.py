@@ -113,6 +113,9 @@ class SqliteStore(BaseSQLStore):
             # 2. Perform column-level upgrades
             await conn.run_sync(self._upgrade_schema)
 
+            # 2.1 Indexes the model declares but an existing database may lack (SpectrumKNX#450)
+            await conn.run_sync(self.ensure_indexes)
+
         # 3. Warm the cache
         await super().initialize()
 

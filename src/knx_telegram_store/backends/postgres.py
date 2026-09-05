@@ -236,6 +236,9 @@ class PostgresStore(BaseSQLStore):
             # 3. Perform column-level upgrades
             await conn.run_sync(self._upgrade_schema)
 
+            # 3.1 Indexes the model declares but an existing database may lack (SpectrumKNX#450)
+            await conn.run_sync(self.ensure_indexes)
+
             # 3.5. Notify trigger so a read-only listener learns about new
             # rows via LISTEN/NOTIFY instead of polling. Always created,
             # regardless of whether anything is listening.
