@@ -211,6 +211,25 @@ class BaseSQLStore(TelegramStore):
             return False
         return row is not None and row[0] == "true"
 
+    @staticmethod
+    def _set_metadata_value(connection, key: str, value: str) -> None:
+        """Write a store_metadata value (upsert, dialect-agnostic)."""
+        connection.execute(text("DELETE FROM store_metadata WHERE key = :key"), {"key": key})
+        connection.execute(
+            text("INSERT INTO store_metadata (key, value) VALUES (:key, :value)"), {"key": key, "value": value}
+        )
+
+    @staticmethod
+    def _metadata_value(connection, key: str) -> str | None:
+        """Read a store_metadata value, or None when absent/unreadable."""
+        try:
+            if not inspect(connection).has_table("store_metadata"):
+                return None
+            row = connection.execute(text("SELECT value FROM store_metadata WHERE key = :key"), {"key": key}).fetchone()
+        except Exception:
+            return None
+        return row[0] if row is not None else None
+
     @wrap_store_errors
     async def initialize(self) -> None:
         """Set up the store (create tables, upgrades)."""
