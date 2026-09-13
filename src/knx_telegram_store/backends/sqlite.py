@@ -80,13 +80,27 @@ def _offset_intervals(
 class SqliteStore(BaseSQLStore):
     """Async SQLite implementation of TelegramStore."""
 
-    def __init__(self, db_path: str | Path, retention_days: int | None = None, *, read_only: bool = False) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        retention_days: int | None = None,
+        *,
+        read_only: bool = False,
+        legacy_timestamp_timezone: tzinfo | None = None,
+    ) -> None:
         """Initialize the SQLite store.
 
         With read_only=True the file is opened with sqlite's ``mode=ro`` (writes
         are impossible at the driver level), no DDL/migrations are run, and all
         mutating operations raise. Intended for reading a database owned and
         written by another process (e.g. Home Assistant's telegram store).
+
+        ``legacy_timestamp_timezone`` is the timezone whose wall clock wrote the
+        rows of a database created before timestamps were normalised to UTC. Pass
+        it and initialize() converts them automatically, once. Callers that
+        always stored ``datetime.now(UTC)`` pass ``UTC``, which marks the
+        database converted without touching a row. Leave it unset and the
+        conversion is skipped and merely offered — see migrate_timestamps_to_utc().
         """
         self._is_memory = str(db_path) == ":memory:"
         if self._is_memory:
@@ -105,6 +119,7 @@ class SqliteStore(BaseSQLStore):
         # timeout is sqlite's busy timeout: with a concurrent writer (WAL or
         # rollback journal) readers wait instead of failing with SQLITE_BUSY.
         engine = create_async_engine(url, connect_args={"timeout": 10})
+        self._legacy_timestamp_timezone = legacy_timestamp_timezone
         super().__init__(engine, retention_days, read_only=read_only)
 
     @staticmethod
@@ -173,20 +188,30 @@ class SqliteStore(BaseSQLStore):
             # 2.2 Classify the timestamp convention (XKNX/knx-frontend#459)
             await conn.run_sync(self._classify_timestamp_convention)
 
-        # 3. Warm the cache
+        # 3. Convert pre-UTC timestamps, if the caller told us what wrote them.
+        #    Ahead of the cache warm below, which reads timestamps back.
+        if self._legacy_timestamp_timezone is not None:
+            await self.migrate_timestamps_to_utc(self._legacy_timestamp_timezone)
+
+        # 4. Warm the cache
         await super().initialize()
 
     # ── Timestamp convention (XKNX/knx-frontend#459) ─────────────────────────
     #
-    # Databases written before timestamps were normalised to UTC hold local
-    # wall-clock digits with no offset. Reading those as UTC shifts them by
-    # whatever offset wrote them, and this library cannot work out what that
-    # was: with Home Assistant it is HA's *configured* timezone, which need not
-    # match the host's. So the conversion is offered rather than guessed, and
-    # the caller supplies the timezone.
+    # Databases written before timestamps were normalised to UTC hold whatever
+    # wall clock the writer passed in, with no offset to say which. Reading
+    # those back as UTC shifts them by that offset. Which offset is not
+    # recoverable from the data, and it differs between hosts using this very
+    # library: Home Assistant writes its *configured* timezone (which need not
+    # match the host's), while SpectrumKNX writes datetime.now(UTC). Guessing
+    # from the system timezone would therefore fix the first and corrupt the
+    # second. So the host names the zone once, via the constructor, and the
+    # conversion then runs automatically on the next start like any other
+    # migration. Unset, it stays a no-op the host can trigger by hand.
 
     _UTC_FLAG = "timestamps_utc"
     _UTC_BOUNDARY = "timestamps_utc_from"
+    _UTC_SOURCE_ZONE = "timestamps_utc_source_zone"
 
     def _classify_timestamp_convention(self, connection) -> None:
         """Record whether this database's timestamps are already UTC.
@@ -211,7 +236,8 @@ class SqliteStore(BaseSQLStore):
             _LOGGER.warning(
                 "This database predates UTC timestamp normalisation, so existing rows hold local "
                 "wall-clock times and will read as UTC until converted. Telegrams stored from now "
-                "on are UTC. Call migrate_timestamps_to_utc() with the timezone that wrote them."
+                "on are UTC. Pass legacy_timestamp_timezone=<the zone that wrote them> to convert "
+                "the existing ones on the next start, or call migrate_timestamps_to_utc()."
             )
 
     async def needs_timestamp_migration(self) -> bool:
@@ -282,6 +308,9 @@ class SqliteStore(BaseSQLStore):
                         converted += result.rowcount or 0
 
             await conn.run_sync(lambda c: self._set_metadata_value(c, self._UTC_FLAG, "true"))
+            # Which zone was assumed, so a conversion done with the wrong one
+            # can be recognised afterwards rather than inferred from the damage.
+            await conn.run_sync(lambda c: self._set_metadata_value(c, self._UTC_SOURCE_ZONE, str(source_timezone)))
 
         _LOGGER.info("Converted %d telegram timestamps from %s to UTC", converted, source_timezone)
         return converted

@@ -203,3 +203,77 @@ async def test_read_only_store_refuses_to_migrate(tmp_path):
     with pytest.raises(Exception):  # noqa: B017 - the store's own error type
         await store.migrate_timestamps_to_utc(BERLIN)
     await store.close()
+
+
+async def test_initialize_converts_automatically_when_told_the_zone(tmp_path):
+    """The host names the zone once; the conversion then runs like any migration."""
+    path = tmp_path / "auto.db"
+    await _legacy_db(path, ["2026-01-15 12:00:00.000000", "2026-07-15 12:00:00.000000"])
+
+    store = SqliteStore(str(path), legacy_timestamp_timezone=BERLIN)
+    await store.initialize()
+
+    assert await store.needs_timestamp_migration() is False
+    stamps = sorted(t.timestamp for t in (await store.query(TelegramQuery(limit=10))).telegrams)
+    assert stamps[0] == datetime(2026, 1, 15, 11, 0, tzinfo=UTC)
+    assert stamps[1] == datetime(2026, 7, 15, 10, 0, tzinfo=UTC)
+    await store.close()
+
+
+async def test_automatic_conversion_runs_once_across_restarts(tmp_path):
+    """Re-opening the store must not shift the same rows again."""
+    path = tmp_path / "restart.db"
+    await _legacy_db(path, ["2026-07-15 12:00:00.000000"])
+
+    for _ in range(3):
+        store = SqliteStore(str(path), legacy_timestamp_timezone=BERLIN)
+        await store.initialize()
+        stamps = [t.timestamp for t in (await store.query(TelegramQuery(limit=10))).telegrams]
+        await store.close()
+
+    assert stamps == [datetime(2026, 7, 15, 10, 0, tzinfo=UTC)]
+
+
+async def test_a_utc_writer_declares_itself_and_nothing_moves(tmp_path):
+    """SpectrumKNX already stored datetime.now(UTC); its rows must not move."""
+    path = tmp_path / "already-utc.db"
+    await _legacy_db(path, ["2026-07-15 12:00:00.000000"])
+
+    store = SqliteStore(str(path), legacy_timestamp_timezone=UTC)
+    await store.initialize()
+
+    assert await store.needs_timestamp_migration() is False
+    stamps = [t.timestamp for t in (await store.query(TelegramQuery(limit=10))).telegrams]
+    assert stamps == [datetime(2026, 7, 15, 12, 0, tzinfo=UTC)], "declaring UTC must be a no-op"
+    await store.close()
+
+
+async def test_without_a_zone_nothing_is_guessed(tmp_path):
+    """A host that says nothing keeps its rows untouched, whatever the system zone."""
+    path = tmp_path / "unset.db"
+    await _legacy_db(path, ["2026-07-15 12:00:00.000000"])
+
+    store = SqliteStore(str(path))
+    await store.initialize()
+
+    assert await store.needs_timestamp_migration() is True
+    raw = sqlite3.connect(str(path)).execute("SELECT timestamp FROM telegrams").fetchone()[0]
+    assert raw.startswith("2026-07-15 12:00:00")
+    await store.close()
+
+
+async def test_the_assumed_zone_is_recorded(tmp_path):
+    """A conversion run with the wrong zone should be recognisable afterwards."""
+    path = tmp_path / "recorded.db"
+    await _legacy_db(path, ["2026-07-15 12:00:00.000000"])
+
+    store = SqliteStore(str(path), legacy_timestamp_timezone=BERLIN)
+    await store.initialize()
+    await store.close()
+
+    recorded = (
+        sqlite3.connect(str(path))
+        .execute("SELECT value FROM store_metadata WHERE key='timestamps_utc_source_zone'")
+        .fetchone()
+    )
+    assert recorded[0] == "Europe/Berlin"
