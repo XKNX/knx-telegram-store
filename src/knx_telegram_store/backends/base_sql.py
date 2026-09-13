@@ -59,14 +59,22 @@ class UtcDateTime(TypeDecorator):
     cache_ok = True
 
     def coerce_compared_value(self, op: Any, value: Any) -> Any:
-        """Let the underlying DateTime decide the type of a compared value.
+        """Keep datetimes on this type; let DateTime rule on anything else.
 
         A TypeDecorator otherwise types every comparison operand as itself,
         which breaks datetime arithmetic: the time-delta context window builds
         "timestamp - :delta" with a timedelta, and typing that as a timestamp
-        makes PostgreSQL reject "timestamptz >= interval". Delegating restores
-        DateTime's own rules, which map a timedelta to an Interval.
+        makes PostgreSQL reject "timestamptz >= interval". DateTime's own rules
+        map a timedelta to an Interval, so non-datetimes are delegated.
+
+        Datetimes must *not* be delegated, though. Doing so hands query bounds
+        to the plain DateTime, which on SQLite writes the digits and drops the
+        offset — the very bug this type exists to fix, reappearing on the read
+        side: a telegram stored at 12:00+02:00 would not be found by a range
+        from 11:00+02:00 to 13:00+02:00 (XKNX/knx-telegram-store#40 review).
         """
+        if isinstance(value, datetime):
+            return self
         return self.impl.coerce_compared_value(op, value)
 
     def process_bind_param(self, value: Any, dialect: Any) -> Any:

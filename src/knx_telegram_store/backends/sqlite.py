@@ -42,15 +42,43 @@ def _sql_ts(value: datetime) -> str:
     return value.strftime(_SQL_TS)
 
 
+def _offset_at(moment: datetime, zone: tzinfo) -> int:
+    """The zone's UTC offset in seconds at a naive local wall-clock time.
+
+    Ambiguous times (the repeated hour of a fall-back) resolve to the first
+    pass, and times in a spring-forward gap — which no telegram can carry —
+    to the offset still in force before it. Both follow from fold=0.
+    """
+    delta = moment.replace(tzinfo=zone).utcoffset() or timedelta(0)
+    return int(delta.total_seconds())
+
+
+def _transition_between(before: datetime, after: datetime, zone: tzinfo, offset: int) -> datetime:
+    """Bisect for the first second in (before, after] that no longer has ``offset``.
+
+    The coarse walk only tells us a transition happened somewhere inside an
+    hour. Several zones do not move on the hour — Pacific/Chatham changes at
+    03:45, Lord Howe at 02:00 by half an hour — so rounding the boundary to the
+    next hour would convert everything in between with the wrong offset.
+    """
+    while after - before > timedelta(seconds=1):
+        middle = before + (after - before) / 2
+        if _offset_at(middle, zone) == offset:
+            before = middle
+        else:
+            after = middle
+    return after.replace(microsecond=0)
+
+
 def _offset_intervals(
     oldest: datetime, newest: datetime, zone: tzinfo, *, step: timedelta = timedelta(hours=1)
 ) -> list[tuple[datetime, datetime, int]]:
     """Split [oldest, newest] into stretches of constant UTC offset.
 
     Walks the range and coalesces, so a zone with daylight saving yields a
-    couple of intervals per year rather than one entry per row. Hourly steps
-    because that is the granularity at which offsets change; anything coarser
-    would misplace telegrams either side of a transition.
+    couple of intervals per year rather than one entry per row. The walk is
+    hourly because no zone holds an offset for less than that, but each
+    boundary it finds is then bisected to the exact second.
 
     Returns (start, end_exclusive, offset_seconds) with the last interval
     extended past ``newest`` so the final rows are included.
@@ -60,15 +88,17 @@ def _offset_intervals(
     end = newest + step
     current_offset: int | None = None
     start = cursor
+    previous = cursor
 
     while cursor <= end:
-        delta = cursor.replace(tzinfo=zone).utcoffset() or timedelta(0)
-        offset = int(delta.total_seconds())
+        offset = _offset_at(cursor, zone)
         if current_offset is None:
             current_offset, start = offset, cursor
         elif offset != current_offset:
-            intervals.append((start, cursor, current_offset))
-            current_offset, start = offset, cursor
+            boundary = _transition_between(previous, cursor, zone, current_offset)
+            intervals.append((start, boundary, current_offset))
+            current_offset, start = offset, boundary
+        previous = cursor
         cursor += step
 
     if current_offset is not None:
@@ -225,8 +255,13 @@ class SqliteStore(BaseSQLStore):
         if self._metadata_flag_set(connection, self._UTC_FLAG):
             return
 
-        row_count = connection.execute(text("SELECT EXISTS (SELECT 1 FROM telegrams)")).scalar()
-        if not row_count:
+        # Both tables, because retention can empty telegrams while last values
+        # remain: treating that as an empty database would flag it converted
+        # and strand the rows that are left.
+        has_rows = connection.execute(
+            text("SELECT EXISTS (SELECT 1 FROM telegrams) OR EXISTS (SELECT 1 FROM last_ga_telegrams)")
+        ).scalar()
+        if not has_rows:
             self._set_metadata_value(connection, self._UTC_FLAG, "true")
             return
 
@@ -254,9 +289,9 @@ class SqliteStore(BaseSQLStore):
         UTC rows cannot shift them a second time. Idempotent: once finished the
         database is flagged and further calls do nothing.
 
-        The conversion is applied per interval of constant UTC offset rather
-        than per row, so a zone with daylight saving is handled correctly with a
-        handful of statements instead of one per telegram. Rows falling in a
+        Each table is rewritten by a single statement whose CASE carries one
+        branch per stretch of constant UTC offset, so daylight saving is handled
+        correctly and every row is read once and written once. Rows falling in a
         repeated hour are inherently ambiguous and resolve to the first pass.
         """
         self._ensure_writable()
@@ -265,47 +300,22 @@ class SqliteStore(BaseSQLStore):
 
         async with self.engine.begin() as conn:
             boundary_raw = await conn.run_sync(lambda c: self._metadata_value(c, self._UTC_BOUNDARY))
-            bounds = (await conn.execute(text("SELECT min(timestamp), max(timestamp) FROM telegrams"))).fetchone()
-            if bounds is None or bounds[0] is None:
-                await conn.run_sync(lambda c: self._set_metadata_value(c, self._UTC_FLAG, "true"))
-                return 0
-
-            oldest = _as_naive(bounds[0])
-            newest = _as_naive(bounds[1])
-
             # Rows at or after the boundary were written by this version and are
-            # already UTC. Every statement below is bounded by it, so they can
-            # never be shifted a second time — the interval walk deliberately
-            # overshoots its end to catch the final rows, which would otherwise
-            # reach past the cutoff.
-            upper = newest + timedelta(seconds=1)
+            # already UTC; every statement below is bounded by it so they can
+            # never be shifted a second time.
+            cutoff = None
             if boundary_raw:
                 cutoff = datetime.fromisoformat(boundary_raw).astimezone(UTC).replace(tzinfo=None)
-                upper = min(upper, cutoff)
-                if upper <= oldest:
-                    await conn.run_sync(lambda c: self._set_metadata_value(c, self._UTC_FLAG, "true"))
-                    return 0
-                newest = min(newest, cutoff)
 
             converted = 0
+            # last_ga_telegrams keeps one row per group address and is not subject
+            # to retention, so it can hold values older than anything left in
+            # telegrams — and can be non-empty when telegrams is empty. Its range
+            # is therefore measured on its own rather than borrowed.
             for table, count_rows in (("telegrams", True), ("last_ga_telegrams", False)):
-                for start, end, offset in _offset_intervals(oldest, newest, source_timezone):
-                    if not offset:
-                        continue  # this stretch was already UTC
-                    result = await conn.execute(
-                        text(
-                            f"UPDATE {table} SET timestamp = datetime(timestamp, :shift) "  # noqa: S608 - fixed names
-                            "WHERE timestamp >= :start AND timestamp < :end AND timestamp < :upper"
-                        ),
-                        {
-                            "shift": f"{-offset} seconds",
-                            "start": _sql_ts(start),
-                            "end": _sql_ts(end),
-                            "upper": _sql_ts(upper),
-                        },
-                    )
-                    if count_rows:
-                        converted += result.rowcount or 0
+                rows = await self._convert_table_to_utc(conn, table, source_timezone, cutoff)
+                if count_rows:
+                    converted += rows
 
             await conn.run_sync(lambda c: self._set_metadata_value(c, self._UTC_FLAG, "true"))
             # Which zone was assumed, so a conversion done with the wrong one
@@ -314,6 +324,63 @@ class SqliteStore(BaseSQLStore):
 
         _LOGGER.info("Converted %d telegram timestamps from %s to UTC", converted, source_timezone)
         return converted
+
+    async def _convert_table_to_utc(self, conn, table: str, zone: tzinfo, cutoff: datetime | None) -> int:
+        """Shift one table's pre-cutoff timestamps into UTC with a single UPDATE.
+
+        One statement rather than one per offset interval, because consecutive
+        statements read a column the previous one has already written: west of
+        UTC the shift moves timestamps *forward*, into the range a later
+        interval then matches, and the row is converted twice.
+        """
+        bounds = (await conn.execute(text(f"SELECT min(timestamp), max(timestamp) FROM {table}"))).fetchone()  # noqa: S608 - fixed names
+        if bounds is None or bounds[0] is None:
+            return 0
+
+        oldest, newest = _as_naive(bounds[0]), _as_naive(bounds[1])
+        upper = newest + timedelta(seconds=1)
+        if cutoff is not None:
+            upper = min(upper, cutoff)
+            if upper <= oldest:
+                return 0
+            newest = min(newest, cutoff)
+
+        intervals = _offset_intervals(oldest, newest, zone)
+        if not any(offset for _, _, offset in intervals):
+            return 0  # the whole range was already UTC
+
+        # SQLite's datetime() drops fractional seconds, so the shifted whole
+        # seconds are recombined with the original fraction. COALESCE keeps a
+        # row unchanged rather than nulling it should strftime reject the input.
+        params: dict[str, str] = {"upper": _sql_ts(upper)}
+
+        def shift_expr(index: int, offset: int) -> str:
+            if not offset:
+                return "timestamp"
+            params[f"shift_{index}"] = f"{-offset} seconds"
+            return f"strftime('%Y-%m-%d %H:%M:%S', timestamp, :shift_{index}) || substr(timestamp, 20)"
+
+        if len(intervals) == 1:
+            # A range with no transition in it needs no CASE at all, and would
+            # otherwise produce "CASE ELSE ... END", which SQLite rejects.
+            expression = shift_expr(0, intervals[0][2])
+        else:
+            branches = []
+            for index, (_, end_of, offset) in enumerate(intervals[:-1]):
+                params[f"end_{index}"] = _sql_ts(end_of)
+                branches.append(f"WHEN timestamp < :end_{index} THEN {shift_expr(index, offset)}")
+            last = len(intervals) - 1
+            branches.append(f"ELSE {shift_expr(last, intervals[last][2])}")  # the open-ended tail
+            expression = f"CASE {' '.join(branches)} END"
+
+        result = await conn.execute(
+            text(
+                f"UPDATE {table} SET timestamp = COALESCE({expression}, timestamp) "  # noqa: S608 - fixed names
+                "WHERE timestamp < :upper"
+            ),
+            params,
+        )
+        return result.rowcount or 0
 
     def _upgrade_schema(self, connection) -> None:
         """Synchronous part of schema upgrade (run via run_sync)."""

@@ -277,3 +277,100 @@ async def test_the_assumed_zone_is_recorded(tmp_path):
         .fetchone()
     )
     assert recorded[0] == "Europe/Berlin"
+
+
+# ── Review findings on PR #40 (philippwaller) ────────────────────────────────
+
+
+async def test_microseconds_survive_the_conversion(tmp_path):
+    """SQLite's datetime() drops the fraction, which would reorder a busy second."""
+    path = tmp_path / "micro.db"
+    await _legacy_db(path, ["2026-01-15 12:00:00.123456", "2026-07-15 12:00:00.654321"])
+
+    store = SqliteStore(str(path), legacy_timestamp_timezone=BERLIN)
+    await store.initialize()
+    await store.close()
+
+    raw = [r[0] for r in sqlite3.connect(str(path)).execute("SELECT timestamp FROM telegrams ORDER BY timestamp")]
+    assert raw == ["2026-01-15 11:00:00.123456", "2026-07-15 10:00:00.654321"]
+
+
+async def test_west_of_utc_rows_are_shifted_exactly_once(tmp_path):
+    """Shifting forward can push a row into a later interval's range.
+
+    With one statement per interval the row would then be converted a second
+    time, so a whole table has to be rewritten in a single pass.
+    """
+    path = tmp_path / "west.db"
+    new_york = ZoneInfo("America/New_York")
+    await _legacy_db(path, ["2026-03-08 01:00:00.000000", "2026-03-09 12:00:00.000000"])
+
+    store = SqliteStore(str(path), legacy_timestamp_timezone=new_york)
+    await store.initialize()
+
+    stamps = sorted(t.timestamp for t in (await store.query(TelegramQuery(limit=10))).telegrams)
+    assert stamps[0] == datetime(2026, 3, 8, 1, 0, tzinfo=new_york).astimezone(UTC), "EST row, shifted once"
+    assert stamps[1] == datetime(2026, 3, 9, 12, 0, tzinfo=new_york).astimezone(UTC), "EDT row, shifted once"
+    await store.close()
+
+
+async def test_last_values_older_than_any_telegram_are_converted(tmp_path):
+    """last_ga_telegrams escapes retention, so it can outlive the telegrams table."""
+    path = tmp_path / "stale-last.db"
+    await _legacy_db(path, ["2026-07-15 12:00:00.000000"])
+
+    con = sqlite3.connect(str(path))
+    ids = {row[0]: row[1] for row in con.execute("SELECT category, id FROM string_lookup")}
+    con.execute(
+        "INSERT INTO last_ga_telegrams (timestamp, source_id, destination_id, telegramtype_id, direction_id) "
+        "VALUES (?,?,?,?,?)",
+        ("2026-01-15 12:00:00.000000", ids["source"], ids["destination"], ids["telegramtype"], ids["direction"]),
+    )
+    con.commit()
+    con.close()
+
+    store = SqliteStore(str(path), legacy_timestamp_timezone=BERLIN)
+    await store.initialize()
+    await store.close()
+
+    stored = sqlite3.connect(str(path)).execute("SELECT timestamp FROM last_ga_telegrams").fetchone()[0]
+    assert stored.startswith("2026-01-15 11:00:00"), "outside the telegrams range, but still ours to convert"
+
+
+async def test_last_values_are_converted_when_telegrams_is_empty(tmp_path):
+    """Retention can empty telegrams entirely while last values remain."""
+    path = tmp_path / "only-last.db"
+    await _legacy_db(path, ["2026-07-15 12:00:00.000000"])
+
+    con = sqlite3.connect(str(path))
+    ids = {row[0]: row[1] for row in con.execute("SELECT category, id FROM string_lookup")}
+    con.execute(
+        "INSERT INTO last_ga_telegrams (timestamp, source_id, destination_id, telegramtype_id, direction_id) "
+        "VALUES (?,?,?,?,?)",
+        ("2026-07-15 12:00:00.000000", ids["source"], ids["destination"], ids["telegramtype"], ids["direction"]),
+    )
+    con.execute("DELETE FROM telegrams")
+    con.commit()
+    con.close()
+
+    store = SqliteStore(str(path), legacy_timestamp_timezone=BERLIN)
+    await store.initialize()
+    await store.close()
+
+    stored = sqlite3.connect(str(path)).execute("SELECT timestamp FROM last_ga_telegrams").fetchone()[0]
+    assert stored.startswith("2026-07-15 10:00:00"), "an empty telegrams table is not an empty database"
+
+
+async def test_transitions_that_do_not_fall_on_the_hour(tmp_path):
+    """Pacific/Chatham moves at 03:45; rounding to 04:00 misconverts the gap."""
+    path = tmp_path / "chatham.db"
+    chatham = ZoneInfo("Pacific/Chatham")
+    await _legacy_db(path, ["2026-04-05 03:30:00.000000", "2026-04-05 03:50:00.000000"])
+
+    store = SqliteStore(str(path), legacy_timestamp_timezone=chatham)
+    await store.initialize()
+
+    stamps = sorted(t.timestamp for t in (await store.query(TelegramQuery(limit=10))).telegrams)
+    assert stamps[0] == datetime(2026, 4, 5, 3, 30, tzinfo=chatham).astimezone(UTC), "before the 03:45 change"
+    assert stamps[1] == datetime(2026, 4, 5, 3, 50, tzinfo=chatham).astimezone(UTC), "after it"
+    await store.close()

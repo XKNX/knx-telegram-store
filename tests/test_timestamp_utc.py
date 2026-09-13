@@ -158,3 +158,31 @@ async def test_last_values_timestamps_are_also_utc_aware(store):
     (last,) = await store.get_last_unique_telegrams()
     assert last.timestamp.tzinfo is not None
     assert last.timestamp == datetime(2026, 9, 12, 10, 0, 0, tzinfo=UTC)
+
+
+async def test_query_bounds_carrying_an_offset_are_normalised(store):
+    """The read side of the same bug: bounds must be compared by instant.
+
+    A TypeDecorator that delegates coerce_compared_value for datetimes hands
+    query bounds to the plain DateTime, which drops the offset on SQLite — so
+    the range misses the very row it was written to match.
+    """
+    await store.store_many([_telegram(datetime(2026, 9, 12, 12, 0, 0, tzinfo=PLUS_TWO))])  # 10:00 UTC
+
+    result = await store.query(
+        TelegramQuery(
+            start_time=datetime(2026, 9, 12, 11, 0, 0, tzinfo=PLUS_TWO),  # 09:00 UTC
+            end_time=datetime(2026, 9, 12, 13, 0, 0, tzinfo=PLUS_TWO),  # 11:00 UTC
+            limit=10,
+        )
+    )
+    assert len(result.telegrams) == 1, "a bound written in +02:00 must match data stored from +02:00"
+
+    outside = await store.query(
+        TelegramQuery(
+            start_time=datetime(2026, 9, 12, 13, 0, 0, tzinfo=PLUS_TWO),  # 11:00 UTC
+            end_time=datetime(2026, 9, 12, 15, 0, 0, tzinfo=PLUS_TWO),  # 13:00 UTC
+            limit=10,
+        )
+    )
+    assert outside.telegrams == [], "and must not match a window the instant falls outside"
