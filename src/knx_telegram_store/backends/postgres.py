@@ -608,9 +608,10 @@ class PostgresStore(BaseSQLStore):
             "value::jsonb = jsonb_build_object('value', value::jsonb -> 'value') "
             "OR payload::jsonb = jsonb_build_object('value', payload::jsonb -> 'value')"
         )
-        if _pending(wrapped):
+        expected_rows = connection.execute(text(f"SELECT count(*) FROM telegrams WHERE {wrapped}")).scalar_one()
+        if expected_rows:
             _lift_decompression_limit()
-            connection.execute(
+            result = connection.execute(
                 text(
                     "UPDATE telegrams SET "
                     "value = CASE WHEN value::jsonb = jsonb_build_object('value', value::jsonb -> 'value') "
@@ -620,8 +621,11 @@ class PostgresStore(BaseSQLStore):
                     f"WHERE {wrapped}"
                 )
             )
-            if _pending(wrapped):
-                raise RuntimeError("Legacy telegram data unwrapping left wrapped rows")
+            # A decoded dictionary can itself be {"value": ...}; validate the
+            # update count, not its resulting shape. Skipped/raced rows must
+            # roll back the pass before recording completion.
+            if result.rowcount != expected_rows:
+                raise RuntimeError("Legacy telegram data unwrapping did not update the expected number of rows")
 
         # Record successful migration state in store_metadata
         connection.execute(

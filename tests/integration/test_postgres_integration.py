@@ -372,10 +372,14 @@ async def test_legacy_unwrap_preserves_duplicate_natural_keys(store):
         [
             make_telegram(timestamp, value=1.0),
             make_telegram(timestamp, value=2.0),
+            make_telegram(timestamp, value=3.0),
         ]
     )
 
     async with pg_store.engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE telegrams SET value = jsonb_build_object('value', value) WHERE value_numeric = 3")
+        )
         await conn.execute(
             text(
                 "UPDATE telegrams "
@@ -388,7 +392,15 @@ async def test_legacy_unwrap_preserves_duplicate_natural_keys(store):
     await pg_store.initialize()
     result = await pg_store.query(TelegramQuery())
 
-    assert sorted(telegram.value for telegram in result.telegrams) == [1.0, 2.0]
+    assert sorted(telegram.value for telegram in result.telegrams if isinstance(telegram.value, float)) == [1.0, 2.0]
+    assert [telegram.value for telegram in result.telegrams if isinstance(telegram.value, dict)] == [{"value": 3.0}]
+    assert all(telegram.payload == [12, 154] for telegram in result.telegrams)
+    async with pg_store.engine.connect() as conn:
+        assert await conn.scalar(text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")) == "true"
+
+    await pg_store.initialize()
+    result = await pg_store.query(TelegramQuery())
+    assert [telegram.value for telegram in result.telegrams if isinstance(telegram.value, dict)] == [{"value": 3.0}]
 
 
 async def test_legacy_unwrap_preserves_duplicates_in_compressed_chunk(timescale_dsn):
@@ -401,9 +413,13 @@ async def test_legacy_unwrap_preserves_duplicates_in_compressed_chunk(timescale_
                 make_telegram(timestamp, value=1.0),
                 make_telegram(timestamp, value=2.0),
                 make_telegram(timestamp, 1, value=3.0),
+                make_telegram(timestamp, value=4.0),
             ]
         )
         async with store.engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE telegrams SET value = jsonb_build_object('value', value) WHERE value_numeric = 4")
+            )
             await conn.execute(
                 text(
                     "UPDATE telegrams "
@@ -442,6 +458,7 @@ async def test_legacy_unwrap_preserves_duplicates_in_compressed_chunk(timescale_
             2.0,
         ]
         assert {"value": 3.0, "unit": "C"} in [telegram.value for telegram in result.telegrams]
+        assert {"value": 4.0} in [telegram.value for telegram in result.telegrams]
         assert all(telegram.payload == [12, 154] for telegram in result.telegrams)
     finally:
         await store.close()
@@ -531,7 +548,7 @@ async def test_legacy_unwrap_survives_concurrent_row_update(store):
         await backfill_connection.close()
 
     if backend_name == "timescale":
-        assert str(backfill_error) == "Legacy telegram data unwrapping left wrapped rows"
+        assert backfill_error is not None
         result = await pg_store.query(TelegramQuery())
         assert [telegram.value for telegram in result.telegrams] == [{"value": 1.0}]
         async with pg_store.engine.connect() as conn:
