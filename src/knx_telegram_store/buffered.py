@@ -75,7 +75,7 @@ class _BufferMixin:
 
     def start(self) -> None:
         """Start the periodic flush task."""
-        if self._flush_task is not None:
+        if self._closing or self._flush_task is not None:
             return
         self._flush_task = asyncio.create_task(self._flush_loop())
 
@@ -224,8 +224,9 @@ class _BufferMixin:
     @wrap_store_errors
     async def optimize(self) -> None:
         """Flush buffered writes, then reclaim space in the backing store."""
-        await self.flush()
-        await super().optimize()  # type: ignore[misc]
+        async with self._mutation():
+            await self.flush()
+            await super().optimize()  # type: ignore[misc]
 
     @wrap_store_errors
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
@@ -262,8 +263,10 @@ class _BufferMixin:
     @wrap_store_errors
     async def clear(self) -> None:
         """Clear both the in-memory buffer and the underlying table."""
-        self._buffer.clear()
-        await super().clear()  # type: ignore[misc]
+        async with self._mutation():
+            async with self._flush_lock:
+                self._buffer.clear()
+                await super().clear()  # type: ignore[misc]
 
 
 class BufferedSqliteStore(_BufferMixin, SqliteStore):
@@ -305,4 +308,5 @@ class BufferedMemoryStore(_BufferMixin, MemoryStore):
     @wrap_store_errors
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
         """Keep the memory backend's max-size-only retention semantics."""
-        return await MemoryStore.evict_older_than(self, cutoff, dry_run=dry_run)
+        async with self._mutation():
+            return await MemoryStore.evict_older_than(self, cutoff, dry_run=dry_run)

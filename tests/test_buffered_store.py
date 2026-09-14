@@ -36,6 +36,19 @@ async def buffered_store(request):
     return store
 
 
+async def _invoke_mutation(store, operation, sample_telegram):
+    if operation == "store_many":
+        await store.store_many([sample_telegram])
+    elif operation == "flush":
+        await store.flush()
+    elif operation == "evict":
+        await store.evict_older_than(sample_telegram.timestamp)
+    elif operation == "clear":
+        await store.clear()
+    else:
+        await store.optimize()
+
+
 async def test_store_buffers_until_flush(buffered_store, sample_telegram):
     await buffered_store.store(sample_telegram)
     # Buffer has 1 entry; the DB should still be empty
@@ -150,6 +163,37 @@ async def test_close_stops_periodic_task_and_is_idempotent(sample_telegram):
     assert await store.count() == 1
 
 
+@pytest.mark.parametrize("operation", ["store_many", "flush", "evict", "clear", "optimize"])
+async def test_mutations_are_rejected_after_close(sample_telegram, operation):
+    store = BufferedMemoryStore(flush_interval=60)
+    await store.initialize()
+    await store.close()
+
+    with pytest.raises(KnxTelegramStoreException, match="closing"):
+        await _invoke_mutation(store, operation, sample_telegram)
+
+
+async def test_start_after_close_does_not_create_periodic_task():
+    store = BufferedMemoryStore(flush_interval=60)
+    await store.initialize()
+    await store.close()
+
+    store.start()
+
+    assert store._flush_task is None
+
+
+async def test_single_stores_after_close_are_dropped(sample_telegram):
+    store = BufferedMemoryStore(flush_interval=60)
+    await store.initialize()
+    await store.close()
+
+    await store.store(sample_telegram)
+    store.store_sync(sample_telegram)
+
+    assert store._buffer == []
+
+
 async def test_stop_remains_close_alias(sample_telegram):
     store = BufferedMemoryStore()
     await store.initialize()
@@ -175,6 +219,27 @@ async def test_flush_failure_reprepends(buffered_store, sample_telegram, monkeyp
     # Buffer should still contain the telegram after failure
     assert len(buffered_store._buffer) == 1
     assert buffered_store._buffer[0] == sample_telegram
+
+
+async def test_cancelled_flush_restores_detached_batch(sample_telegram, monkeypatch):
+    store = BufferedMemoryStore(flush_interval=60)
+    await store.initialize()
+    write_started = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def _block_write(_telegrams):
+        write_started.set()
+        await never_release.wait()
+
+    monkeypatch.setattr(store, "store_many", _block_write)
+    await store.store(sample_telegram)
+    flush_task = asyncio.create_task(store.flush())
+    await asyncio.wait_for(write_started.wait(), timeout=1)
+    flush_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await flush_task
+    assert store._buffer == [sample_telegram]
 
 
 async def test_explicit_flush_failure_raises_and_restores_buffer(buffered_store, sample_telegram, monkeypatch):
@@ -307,16 +372,24 @@ async def test_close_rejects_eviction_queued_during_final_flush(sample_telegram,
     assert not backend_eviction_called.is_set()
 
 
-async def test_close_rejects_store_many_queued_during_shutdown(sample_telegram, tmp_path):
+async def test_close_rejects_store_many_queued_during_shutdown(sample_telegram, monkeypatch, tmp_path):
     db_path = tmp_path / "telegrams.db"
     store = BufferedSqliteStore(db_path, flush_interval=60)
     await store.initialize()
-    await store._mutation_lock.acquire()
+    original_close = SqliteStore.close
+    backend_close_started = asyncio.Event()
+    release_backend_close = asyncio.Event()
+
+    async def _pause_backend_close(self):
+        backend_close_started.set()
+        await release_backend_close.wait()
+        await original_close(self)
+
+    monkeypatch.setattr(SqliteStore, "close", _pause_backend_close)
     close_task = asyncio.create_task(store.close())
-    await asyncio.sleep(0)
+    await asyncio.wait_for(backend_close_started.wait(), timeout=1)
     queued_store_task = asyncio.create_task(store.store_many([sample_telegram]))
-    await asyncio.sleep(0)
-    store._mutation_lock.release()
+    release_backend_close.set()
 
     await close_task
     with pytest.raises(KnxTelegramStoreException, match="closing"):
@@ -324,8 +397,10 @@ async def test_close_rejects_store_many_queued_during_shutdown(sample_telegram, 
 
     reader = SqliteStore(db_path)
     await reader.initialize()
-    assert await reader.count() == 0
-    await reader.close()
+    try:
+        assert await reader.count() == 0
+    finally:
+        await reader.close()
 
 
 async def test_flush_failure_then_recovery(buffered_store, sample_telegram, monkeypatch):
