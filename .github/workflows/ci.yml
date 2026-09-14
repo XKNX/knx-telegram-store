@@ -50,6 +50,9 @@ jobs:
         uses: codecov/codecov-action@v7
         with:
           files: ./coverage.xml
+          disable_search: true
+          # Pure Python project: skip the gcov/xcode collectors.
+          plugins: noop
           flags: unit
           # Fork PRs receive no secrets, so a failed upload must not fail the build.
           fail_ci_if_error: false
@@ -116,6 +119,8 @@ jobs:
         uses: codecov/codecov-action@v7
         with:
           files: ./coverage.xml
+          disable_search: true
+          plugins: noop
           flags: integration
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
