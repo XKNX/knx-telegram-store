@@ -407,6 +407,42 @@ async def test_eviction_serializes_with_concurrent_store_many(sample_telegram, m
     assert await store.count() == 1
 
 
+async def test_cancellation_finishes_buffer_reconciliation_after_backend_eviction(sample_telegram, monkeypatch):
+    cutoff = sample_telegram.timestamp + timedelta(seconds=1)
+    persisted = replace(sample_telegram, source="1.1.2", value="persisted")
+    buffered = replace(sample_telegram, source="1.1.3", value="buffered")
+    store = BufferedSqliteStore(":memory:", flush_interval=60)
+    await store.initialize()
+    await SqliteStore.store_many(store, [persisted])
+    await store.store(buffered)
+    original_evict = SqliteStore.evict_older_than
+    backend_delete_committed = asyncio.Event()
+    release_backend_return = asyncio.Event()
+
+    async def _pause_after_backend_delete(self, cutoff, *, dry_run=False):
+        deleted = await original_evict(self, cutoff, dry_run=dry_run)
+        backend_delete_committed.set()
+        await release_backend_return.wait()
+        return deleted
+
+    monkeypatch.setattr(SqliteStore, "evict_older_than", _pause_after_backend_delete)
+    eviction_task = asyncio.create_task(store.evict_older_than(cutoff))
+    await asyncio.wait_for(backend_delete_committed.wait(), timeout=1)
+
+    eviction_task.cancel()
+    await asyncio.sleep(0)
+    operation_finishing = not eviction_task.done()
+    release_backend_return.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await eviction_task
+
+    await store.flush()
+    assert operation_finishing
+    assert store._buffer == []
+    assert await store.count() == 0
+
+
 async def test_buffered_memory_store_keeps_memory_retention_semantics(sample_telegram):
     cutoff = sample_telegram.timestamp + timedelta(seconds=1)
     store = BufferedMemoryStore(flush_interval=60)

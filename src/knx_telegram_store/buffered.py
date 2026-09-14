@@ -208,7 +208,16 @@ class _BufferMixin:
 
     @wrap_store_errors
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
-        """Evict matching persisted and buffered telegrams."""
+        """Evict matching persisted and buffered telegrams atomically on cancellation."""
+        task = asyncio.create_task(self._evict_older_than(cutoff, dry_run=dry_run))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+
+    async def _evict_older_than(self, cutoff: datetime, *, dry_run: bool) -> int:
+        """Finish backend eviction and buffer reconciliation as one operation."""
         async with self._flush_lock:
             async with self._store_lock:
                 backend_deleted = await super().evict_older_than(cutoff, dry_run=dry_run)  # type: ignore[misc]
