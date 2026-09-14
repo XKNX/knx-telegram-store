@@ -247,10 +247,12 @@ def start(self) -> None:
         return
     self._flush_task = asyncio.create_task(self._flush_loop())
 
+
 async def optimize(self) -> None:
     async with self._mutation():
         await self.flush()
         await super().optimize()
+
 
 async def clear(self) -> None:
     async with self._mutation():
