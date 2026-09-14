@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
@@ -45,13 +46,30 @@ class _BufferMixin:
         super().__init__(*args, **kwargs)
         self._buffer: list[StoredTelegram] = []
         self._flush_lock = asyncio.Lock()
-        self._store_lock = asyncio.Lock()
-        self._buffer_flush_task: asyncio.Task[Any] | None = None
+        self._mutation_lock = asyncio.Lock()
+        self._mutation_owner: asyncio.Task[Any] | None = None
         self._flush_task: asyncio.Task[None] | None = None
         self._closing = False
         self.flush_interval = flush_interval
         self.max_buffer_size = max_buffer_size
         self._buffer_full_warned = False
+
+    @asynccontextmanager
+    async def _mutation(self, *, allow_closing: bool = False) -> AsyncIterator[None]:
+        task = asyncio.current_task()
+        assert task is not None
+        if task is self._mutation_owner:
+            yield
+            return
+
+        async with self._mutation_lock:
+            if self._closing and not allow_closing:
+                raise RuntimeError("Store is closing")
+            self._mutation_owner = task
+            try:
+                yield
+            finally:
+                self._mutation_owner = None
 
     # --- Lifecycle ---
 
@@ -73,8 +91,8 @@ class _BufferMixin:
                 pass
             self._flush_task = None
 
-        await self._flush(raise_on_error=True)
-        async with self._store_lock:
+        async with self._mutation(allow_closing=True):
+            await self._flush(raise_on_error=True)
             await super().close()  # type: ignore[misc]
 
     @wrap_store_errors
@@ -129,41 +147,36 @@ class _BufferMixin:
     @wrap_store_errors
     async def store_many(self, telegrams: Sequence[StoredTelegram]) -> None:
         """Write a batch while excluding lifecycle operations."""
-        async with self._store_lock:
-            if self._closing and asyncio.current_task() is not self._buffer_flush_task:
-                _LOGGER.warning("Store is closing, dropping %d telegrams", len(telegrams))
-                return
+        async with self._mutation():
             await super().store_many(telegrams)  # type: ignore[misc]
 
     async def _flush(self, *, raise_on_error: bool) -> None:
         """Drain the buffer into the backing store (private implementation)."""
-        async with self._flush_lock:
-            if not self._buffer:
-                return
+        async with self._mutation():
+            async with self._flush_lock:
+                if not self._buffer:
+                    return
 
-            batch = self._buffer.copy()
-            self._buffer.clear()
+                batch = self._buffer.copy()
+                self._buffer.clear()
 
-            self._buffer_flush_task = asyncio.current_task()
-            try:
-                await self.store_many(batch)
-                self._buffer_full_warned = False
-            except BaseException as err:
-                self._buffer[0:0] = batch
-                if len(self._buffer) > self.max_buffer_size:
-                    if not self._buffer_full_warned:
-                        _LOGGER.warning(
-                            "Telegram store buffer exceeded limit (%d items) after failed flush, dropping %d oldest telegrams",
-                            self.max_buffer_size,
-                            len(self._buffer) - self.max_buffer_size,
-                        )
-                        self._buffer_full_warned = True
-                    self._buffer = self._buffer[-self.max_buffer_size :]
-                if not isinstance(err, Exception) or raise_on_error:
-                    raise
-                _LOGGER.error("Error flushing telegram buffer: %s", err)
-            finally:
-                self._buffer_flush_task = None
+                try:
+                    await self.store_many(batch)
+                    self._buffer_full_warned = False
+                except BaseException as err:
+                    self._buffer[0:0] = batch
+                    if len(self._buffer) > self.max_buffer_size:
+                        if not self._buffer_full_warned:
+                            _LOGGER.warning(
+                                "Telegram store buffer exceeded limit (%d items) after failed flush, dropping %d oldest telegrams",
+                                self.max_buffer_size,
+                                len(self._buffer) - self.max_buffer_size,
+                            )
+                            self._buffer_full_warned = True
+                        self._buffer = self._buffer[-self.max_buffer_size :]
+                    if not isinstance(err, Exception) or raise_on_error:
+                        raise
+                    _LOGGER.error("Error flushing telegram buffer: %s", err)
 
     @wrap_store_errors
     async def flush(self) -> None:
@@ -236,8 +249,8 @@ class _BufferMixin:
 
     async def _evict_older_than(self, cutoff: datetime, *, dry_run: bool) -> int:
         """Finish backend eviction and buffer reconciliation as one operation."""
-        async with self._flush_lock:
-            async with self._store_lock:
+        async with self._mutation():
+            async with self._flush_lock:
                 backend_deleted = await super().evict_older_than(cutoff, dry_run=dry_run)  # type: ignore[misc]
                 buffered_deleted = sum(telegram.timestamp < cutoff for telegram in self._buffer)
                 if not dry_run:

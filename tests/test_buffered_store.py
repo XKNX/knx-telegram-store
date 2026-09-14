@@ -275,19 +275,52 @@ async def test_close_waits_for_concurrent_store_many(sample_telegram, monkeypatc
     await reader.close()
 
 
-async def test_close_drops_store_many_queued_during_shutdown(sample_telegram, tmp_path):
+async def test_close_rejects_eviction_queued_during_final_flush(sample_telegram, monkeypatch):
+    store = BufferedSqliteStore(":memory:", flush_interval=60)
+    await store.initialize()
+    await store.store(sample_telegram)
+    original_store_many = SqliteStore.store_many
+    final_write_started = asyncio.Event()
+    release_final_write = asyncio.Event()
+    backend_eviction_called = asyncio.Event()
+
+    async def _pause_final_write(self, telegrams):
+        final_write_started.set()
+        await release_final_write.wait()
+        await original_store_many(self, telegrams)
+
+    async def _observe_eviction(self, cutoff, *, dry_run=False):
+        backend_eviction_called.set()
+        return 0
+
+    monkeypatch.setattr(SqliteStore, "store_many", _pause_final_write)
+    monkeypatch.setattr(SqliteStore, "evict_older_than", _observe_eviction)
+    close_task = asyncio.create_task(store.close())
+    await asyncio.wait_for(final_write_started.wait(), timeout=1)
+    eviction_task = asyncio.create_task(store.evict_older_than(sample_telegram.timestamp))
+    await asyncio.sleep(0)
+    release_final_write.set()
+
+    await close_task
+    with pytest.raises(KnxTelegramStoreException, match="closing"):
+        await eviction_task
+    assert not backend_eviction_called.is_set()
+
+
+async def test_close_rejects_store_many_queued_during_shutdown(sample_telegram, tmp_path):
     db_path = tmp_path / "telegrams.db"
     store = BufferedSqliteStore(db_path, flush_interval=60)
     await store.initialize()
-    await store._store_lock.acquire()
+    await store._mutation_lock.acquire()
     close_task = asyncio.create_task(store.close())
     await asyncio.sleep(0)
     queued_store_task = asyncio.create_task(store.store_many([sample_telegram]))
     await asyncio.sleep(0)
-    store._store_lock.release()
+    store._mutation_lock.release()
 
     await close_task
-    await queued_store_task
+    with pytest.raises(KnxTelegramStoreException, match="closing"):
+        await queued_store_task
 
     reader = SqliteStore(db_path)
     await reader.initialize()
