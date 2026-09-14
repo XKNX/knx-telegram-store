@@ -220,6 +220,20 @@ async def test_initialize_converts_automatically_when_told_the_zone(tmp_path):
     await store.close()
 
 
+async def test_automatic_conversion_includes_recent_legacy_rows_east_of_utc(tmp_path):
+    """The UTC cutoff must not exclude a legacy row's local wall clock."""
+    path = tmp_path / "recent-legacy.db"
+    legacy_timestamp = datetime.now(BERLIN).replace(microsecond=123456)
+    await _legacy_db(path, [legacy_timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")])
+
+    store = SqliteStore(str(path), legacy_timestamp_timezone=BERLIN)
+    await store.initialize()
+
+    (telegram,) = (await store.query(TelegramQuery(limit=1))).telegrams
+    assert telegram.timestamp == legacy_timestamp.astimezone(UTC)
+    await store.close()
+
+
 async def test_automatic_conversion_runs_once_across_restarts(tmp_path):
     """Re-opening the store must not shift the same rows again."""
     path = tmp_path / "restart.db"
