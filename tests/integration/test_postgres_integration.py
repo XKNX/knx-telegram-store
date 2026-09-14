@@ -362,6 +362,35 @@ async def test_last_unique_telegrams_ignores_older_and_equal_writes(store):
     assert result[0].value_numeric == 30.0
 
 
+# --- Legacy migration ----------------------------------------------------------
+
+
+async def test_legacy_unwrap_preserves_duplicate_natural_keys(store):
+    _, pg_store = store
+    timestamp = datetime(2026, 7, 1, 12, tzinfo=UTC)
+    await pg_store.store_many(
+        [
+            make_telegram(timestamp, value=1.0),
+            make_telegram(timestamp, value=2.0),
+        ]
+    )
+
+    async with pg_store.engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE telegrams "
+                "SET value = jsonb_build_object('value', value), "
+                "payload = jsonb_build_object('value', payload)"
+            )
+        )
+        await conn.execute(text("DELETE FROM store_metadata WHERE key = 'data_unwrapped'"))
+
+    await pg_store.initialize()
+    result = await pg_store.query(TelegramQuery())
+
+    assert sorted(telegram.value for telegram in result.telegrams) == [1.0, 2.0]
+
+
 # --- Stats ---------------------------------------------------------------------
 
 

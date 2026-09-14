@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import datetime
 from urllib.parse import unquote
 
-from sqlalchemy import inspect, text
+from sqlalchemy import String, bindparam, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
@@ -608,7 +608,7 @@ class PostgresStore(BaseSQLStore):
             # Postgres supports casting JSONB to text, so we can cast value::text or payload::text
             rows = connection.execute(
                 text(
-                    "SELECT timestamp, source_id, destination_id, value::text, payload::text FROM telegrams "
+                    "SELECT tableoid::bigint, ctid::text, value::text, payload::text FROM telegrams "
                     "WHERE (value::text LIKE '{\"value\":%' AND value IS NOT NULL) "
                     "OR (payload::text LIKE '{\"value\":%' AND payload IS NOT NULL)"
                 )
@@ -619,11 +619,10 @@ class PostgresStore(BaseSQLStore):
 
                 _lift_decompression_limit()
                 for row in rows:
-                    timestamp = row[0]
-                    source_id = row[1]
-                    destination_id = row[2]
-                    val_str = row[3]
-                    pay_str = row[4]
+                    table_oid = row[0]
+                    row_ctid = row[1]
+                    val_str = row[2]
+                    pay_str = row[3]
 
                     new_val = None
                     new_pay = None
@@ -680,14 +679,14 @@ class PostgresStore(BaseSQLStore):
                         connection.execute(
                             text(
                                 "UPDATE telegrams SET value = :value, payload = :payload "
-                                "WHERE timestamp = :timestamp AND source_id = :source_id AND destination_id = :destination_id"
-                            ),
+                                "WHERE tableoid = CAST(:table_oid AS oid) "
+                                "AND ctid = CAST(:row_ctid AS tid)"
+                            ).bindparams(bindparam("row_ctid", type_=String)),
                             {
                                 "value": json_val,
                                 "payload": json_pay,
-                                "timestamp": timestamp,
-                                "source_id": source_id,
-                                "destination_id": destination_id,
+                                "table_oid": table_oid,
+                                "row_ctid": row_ctid,
                             },
                         )
 
