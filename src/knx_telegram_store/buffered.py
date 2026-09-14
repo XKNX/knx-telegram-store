@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
@@ -44,6 +45,7 @@ class _BufferMixin:
         super().__init__(*args, **kwargs)
         self._buffer: list[StoredTelegram] = []
         self._flush_lock = asyncio.Lock()
+        self._store_lock = asyncio.Lock()
         self._flush_task: asyncio.Task[None] | None = None
         self._closing = False
         self.flush_interval = flush_interval
@@ -122,6 +124,12 @@ class _BufferMixin:
             self._buffer.pop(0)
         self._buffer.append(telegram)
 
+    @wrap_store_errors
+    async def store_many(self, telegrams: Sequence[StoredTelegram]) -> None:
+        """Write a batch while excluding lifecycle operations."""
+        async with self._store_lock:
+            await super().store_many(telegrams)  # type: ignore[misc]
+
     async def _flush(self, *, raise_on_error: bool) -> None:
         """Drain the buffer into the backing store (private implementation)."""
         async with self._flush_lock:
@@ -132,7 +140,7 @@ class _BufferMixin:
             self._buffer.clear()
 
             try:
-                await self.store_many(batch)  # type: ignore[attr-defined]
+                await self.store_many(batch)
                 self._buffer_full_warned = False
             except BaseException as err:
                 self._buffer[0:0] = batch
@@ -202,11 +210,12 @@ class _BufferMixin:
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
         """Evict matching persisted and buffered telegrams."""
         async with self._flush_lock:
-            backend_deleted = await super().evict_older_than(cutoff, dry_run=dry_run)  # type: ignore[misc]
-            buffered_deleted = sum(telegram.timestamp < cutoff for telegram in self._buffer)
-            if not dry_run:
-                self._buffer[:] = [telegram for telegram in self._buffer if telegram.timestamp >= cutoff]
-            return backend_deleted + buffered_deleted
+            async with self._store_lock:
+                backend_deleted = await super().evict_older_than(cutoff, dry_run=dry_run)  # type: ignore[misc]
+                buffered_deleted = sum(telegram.timestamp < cutoff for telegram in self._buffer)
+                if not dry_run:
+                    self._buffer[:] = [telegram for telegram in self._buffer if telegram.timestamp >= cutoff]
+                return backend_deleted + buffered_deleted
 
     # --- Clear overrride (wipe buffer + table) ---
 
@@ -252,3 +261,8 @@ class BufferedMemoryStore(_BufferMixin, MemoryStore):
         max_buffer_size: Maximum number of buffered writes before the oldest are
             dropped (default 10000).
     """
+
+    @wrap_store_errors
+    async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
+        """Keep the memory backend's max-size-only retention semantics."""
+        return await MemoryStore.evict_older_than(self, cutoff, dry_run=dry_run)

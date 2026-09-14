@@ -372,6 +372,54 @@ async def test_eviction_serializes_with_concurrent_flush(sample_telegram, monkey
     assert await store.count() == 0
 
 
+async def test_eviction_serializes_with_concurrent_store_many(sample_telegram, monkeypatch):
+    cutoff = sample_telegram.timestamp + timedelta(seconds=1)
+    store = BufferedSqliteStore(":memory:", flush_interval=60)
+    await store.initialize()
+    original_evict = SqliteStore.evict_older_than
+    original_store_many = SqliteStore.store_many
+    backend_delete_finished = asyncio.Event()
+    release_eviction = asyncio.Event()
+    backend_store_started = asyncio.Event()
+
+    async def _pause_after_backend_delete(self, cutoff, *, dry_run=False):
+        deleted = await original_evict(self, cutoff, dry_run=dry_run)
+        backend_delete_finished.set()
+        await release_eviction.wait()
+        return deleted
+
+    async def _observe_backend_store(self, telegrams):
+        backend_store_started.set()
+        await original_store_many(self, telegrams)
+
+    monkeypatch.setattr(SqliteStore, "evict_older_than", _pause_after_backend_delete)
+    monkeypatch.setattr(SqliteStore, "store_many", _observe_backend_store)
+    eviction_task = asyncio.create_task(store.evict_older_than(cutoff))
+    await asyncio.wait_for(backend_delete_finished.wait(), timeout=1)
+    store_task = asyncio.create_task(store.store_many([sample_telegram]))
+    await asyncio.sleep(0)
+
+    assert not backend_store_started.is_set()
+
+    release_eviction.set()
+    assert await eviction_task == 0
+    await store_task
+    assert await store.count() == 1
+
+
+async def test_buffered_memory_store_keeps_memory_retention_semantics(sample_telegram):
+    cutoff = sample_telegram.timestamp + timedelta(seconds=1)
+    store = BufferedMemoryStore(flush_interval=60)
+    await store.initialize()
+    await store.store(sample_telegram)
+
+    assert await store.evict_older_than(cutoff) == 0
+    assert store._buffer == [sample_telegram]
+
+    await store.flush()
+    assert await store.count() == 1
+
+
 async def test_flush_empty_buffer_is_noop(buffered_store):
     await buffered_store.flush()
     assert await buffered_store.count() == 0
