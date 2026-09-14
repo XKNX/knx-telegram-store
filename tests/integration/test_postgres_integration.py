@@ -464,6 +464,65 @@ async def test_legacy_unwrap_preserves_duplicates_in_compressed_chunk(timescale_
         await store.close()
 
 
+async def test_concurrent_legacy_backfills_unwrap_nested_value_once(store):
+    _, pg_store = store
+    await pg_store.store(make_telegram(datetime.now(UTC), value=3.0))
+    async with pg_store.engine.begin() as conn:
+        await conn.execute(text('UPDATE telegrams SET value = \'{"value": {"value": 3}}\'::jsonb'))
+        await conn.execute(text("DELETE FROM store_metadata WHERE key = 'data_unwrapped'"))
+        assert await conn.scalar(text("SELECT value FROM store_metadata WHERE key = 'nulls_recovered'")) == "true"
+
+    first = await pg_store.engine.connect()
+    second = await pg_store.engine.connect()
+    second_pid = await second.scalar(text("SELECT pg_backend_pid()"))
+    await second.rollback()
+    first_transaction = await first.begin()
+    second_task = None
+
+    def _backfill(connection):
+        pg_store._backfill_legacy_data(connection, timescale=pg_store.timescale_enabled is True)
+
+    try:
+        # Keep both the decoded value and completion marker uncommitted while
+        # the second transaction starts from the same pending migration state.
+        await first.run_sync(_backfill)
+
+        async def _second_backfill():
+            async with second.begin():
+                await second.run_sync(_backfill)
+
+        second_task = asyncio.create_task(_second_backfill())
+        async with pg_store.engine.connect() as observer:
+            async with asyncio.timeout(5):
+                while True:
+                    waiting = await observer.scalar(
+                        text("SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = :pid"),
+                        {"pid": second_pid},
+                    )
+                    if waiting:
+                        break
+                    if second_task.done():
+                        await second_task
+                        pytest.fail("Second migration finished before the first committed")
+                    await asyncio.sleep(0.01)
+
+        await first_transaction.commit()
+        await asyncio.wait_for(second_task, timeout=5)
+    finally:
+        if first_transaction.is_active:
+            await first_transaction.rollback()
+        if second_task is not None and not second_task.done():
+            second_task.cancel()
+            await asyncio.gather(second_task, return_exceptions=True)
+        await first.close()
+        await second.close()
+
+    result = await pg_store.query(TelegramQuery())
+    assert [telegram.value for telegram in result.telegrams] == [{"value": 3}]
+    async with pg_store.engine.connect() as conn:
+        assert await conn.scalar(text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")) == "true"
+
+
 async def test_legacy_unwrap_survives_concurrent_row_update(store):
     backend_name, pg_store = store
     await pg_store.store(make_telegram(datetime.now(UTC), value=1.0))

@@ -536,6 +536,11 @@ class PostgresStore(BaseSQLStore):
         chunks decompress data and are subject to DML restrictions, so the
         common no-op case must stay read-only.
         """
+        # Serialize legacy backfills before reading any completion marker.
+        # Database-scoped key: 0x4B4E5853 ("KNXS"), migration namespace 1.
+        # Transaction ownership releases the lock on commit or rollback; the
+        # next caller then reads the committed markers before unwrapping.
+        connection.execute(text("SELECT pg_advisory_xact_lock(1263425619, 1)"))
         inspector = inspect(connection)
         try:
             columns = inspector.get_columns("telegrams")
