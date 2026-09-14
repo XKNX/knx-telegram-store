@@ -676,7 +676,7 @@ class PostgresStore(BaseSQLStore):
                         json_val = to_json_str(val_str, new_val, val_str != new_val)
                         json_pay = to_json_str(pay_str, new_pay, pay_str != new_pay)
 
-                        connection.execute(
+                        result = connection.execute(
                             text(
                                 "UPDATE telegrams SET value = :value, payload = :payload "
                                 "WHERE tableoid = CAST(:table_oid AS oid) "
@@ -689,6 +689,8 @@ class PostgresStore(BaseSQLStore):
                                 "row_ctid": row_ctid,
                             },
                         )
+                        if result.rowcount != 1:
+                            raise RuntimeError("Legacy telegram row changed during data unwrapping")
 
             # Record successful migration state in store_metadata
             connection.execute(

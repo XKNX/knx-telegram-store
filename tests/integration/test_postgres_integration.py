@@ -391,6 +391,138 @@ async def test_legacy_unwrap_preserves_duplicate_natural_keys(store):
     assert sorted(telegram.value for telegram in result.telegrams) == [1.0, 2.0]
 
 
+async def test_legacy_unwrap_survives_concurrent_row_update(store):
+    _, pg_store = store
+    await pg_store.store(make_telegram(datetime.now(UTC), value=1.0))
+
+    async with pg_store.engine.begin() as conn:
+        await conn.execute(text("UPDATE telegrams SET value = jsonb_build_object('value', value)"))
+        await conn.execute(text("DELETE FROM store_metadata WHERE key = 'data_unwrapped'"))
+        await conn.execute(text("DELETE FROM store_metadata WHERE key = 'nulls_recovered'"))
+
+    metadata_connection = await pg_store.engine.connect()
+    row_connection = await pg_store.engine.connect()
+    backfill_connection = await pg_store.engine.connect()
+    await backfill_connection.execute(text("SELECT 1"))
+    await backfill_connection.rollback()
+    metadata_transaction = await metadata_connection.begin()
+    row_transaction = None
+    backfill_task = None
+    try:
+        await metadata_connection.execute(
+            text("INSERT INTO store_metadata (key, value) VALUES ('nulls_recovered', 'pending')")
+        )
+
+        async def _run_backfill() -> None:
+            async with backfill_connection.begin():
+                await backfill_connection.run_sync(
+                    lambda sync_conn: pg_store._backfill_legacy_data(
+                        sync_conn,
+                        timescale=pg_store.timescale_enabled is True,
+                    )
+                )
+
+        backfill_task = asyncio.create_task(_run_backfill())
+
+        async def _wait_for_blocked_query(observer, query_fragment: str) -> None:
+            for _ in range(500):
+                migration_is_blocked = await observer.scalar(
+                    text(
+                        "SELECT EXISTS ("
+                        "SELECT 1 FROM pg_stat_activity "
+                        "WHERE datname = current_database() "
+                        "AND pid <> pg_backend_pid() "
+                        "AND wait_event_type = 'Lock' "
+                        "AND query LIKE :query_pattern"
+                        ")"
+                    ),
+                    {"query_pattern": f"%{query_fragment}%"},
+                )
+                if migration_is_blocked:
+                    return
+                if backfill_task.done():
+                    await backfill_task
+                    raise AssertionError("backfill completed before reaching the expected lock")
+                await asyncio.sleep(0.01)
+            activities = (
+                await observer.execute(
+                    text(
+                        "SELECT state, wait_event_type, wait_event, query FROM pg_stat_activity "
+                        "WHERE datname = current_database() AND pid <> pg_backend_pid()"
+                    )
+                )
+            ).fetchall()
+            raise AssertionError((pg_store.engine.pool.status(), activities))
+
+        await _wait_for_blocked_query(row_connection, "")
+        await row_connection.rollback()
+        row_transaction = await row_connection.begin()
+        await row_connection.execute(text("UPDATE telegrams SET value = value"))
+        await metadata_transaction.commit()
+
+        await _wait_for_blocked_query(metadata_connection, "telegrams")
+        await row_transaction.commit()
+        await asyncio.wait_for(backfill_task, timeout=5)
+    finally:
+        if metadata_transaction.is_active:
+            await metadata_transaction.rollback()
+        if row_transaction is not None and row_transaction.is_active:
+            await row_transaction.rollback()
+        if backfill_task is not None and not backfill_task.done():
+            backfill_task.cancel()
+            await asyncio.gather(backfill_task, return_exceptions=True)
+        await metadata_connection.close()
+        await row_connection.close()
+        await backfill_connection.close()
+
+    result = await pg_store.query(TelegramQuery())
+    assert [telegram.value for telegram in result.telegrams] == [{"value": 1.0}]
+
+    async with pg_store.engine.connect() as conn:
+        assert await conn.scalar(text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")) is None
+
+    await pg_store.initialize()
+    result = await pg_store.query(TelegramQuery())
+    assert [telegram.value for telegram in result.telegrams] == [1.0]
+    async with pg_store.engine.connect() as conn:
+        assert await conn.scalar(text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")) == "true"
+
+
+async def test_legacy_unwrap_records_completion_only_after_every_update(store):
+    _, pg_store = store
+    await pg_store.store(make_telegram(datetime.now(UTC), value=1.0))
+
+    async with pg_store.engine.begin() as conn:
+        await conn.execute(text("UPDATE telegrams SET value = jsonb_build_object('value', value)"))
+        await conn.execute(text("DELETE FROM store_metadata WHERE key = 'data_unwrapped'"))
+        await conn.execute(
+            text(
+                "CREATE OR REPLACE FUNCTION skip_legacy_unwrap() RETURNS trigger "
+                "LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE TRIGGER skip_legacy_unwrap BEFORE UPDATE OF value, payload ON telegrams "
+                "FOR EACH ROW EXECUTE FUNCTION skip_legacy_unwrap()"
+            )
+        )
+
+    await pg_store.initialize()
+    result = await pg_store.query(TelegramQuery())
+    assert [telegram.value for telegram in result.telegrams] == [{"value": 1.0}]
+    async with pg_store.engine.connect() as conn:
+        assert await conn.scalar(text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")) is None
+
+    async with pg_store.engine.begin() as conn:
+        await conn.execute(text("DROP TRIGGER skip_legacy_unwrap ON telegrams"))
+        await conn.execute(text("DROP FUNCTION skip_legacy_unwrap()"))
+
+    await pg_store.initialize()
+    result = await pg_store.query(TelegramQuery())
+    assert [telegram.value for telegram in result.telegrams] == [1.0]
+
+
 # --- Stats ---------------------------------------------------------------------
 
 
