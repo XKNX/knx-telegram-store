@@ -1,8 +1,10 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from knx_telegram_store import KnxTelegramStoreException, StoredTelegram, TelegramQuery
+from knx_telegram_store.backends.sqlite import SqliteStore
 from knx_telegram_store.store import wrap_store_errors
 
 
@@ -55,6 +57,34 @@ async def test_store_and_count(store, sample_telegrams):
 
     await store.store_many(sample_telegrams[1:])
     assert await store.count() == 4
+
+
+async def test_failed_sql_store_does_not_publish_rolled_back_lookup_ids():
+    store = SqliteStore(":memory:")
+    await store.initialize()
+    bad = StoredTelegram(
+        timestamp=datetime.now(UTC),
+        source="9.9.9",
+        destination="9/9/9",
+        telegramtype="GroupValueWrite",
+        direction="Incoming",
+        value=object(),
+    )
+
+    try:
+        with pytest.raises(KnxTelegramStoreException):
+            await store.store(bad)
+
+        await store.store(replace(bad, value=1))
+        result = await store.query(TelegramQuery())
+
+        assert await store.count() == 1
+        assert len(result.telegrams) == 1
+        assert result.telegrams[0].source == "9.9.9"
+        assert result.telegrams[0].destination == "9/9/9"
+        assert result.telegrams[0].value == 1
+    finally:
+        await store.close()
 
 
 async def test_query_all(store, sample_telegrams):
