@@ -20,10 +20,11 @@ class BlockSQLAlchemy(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, BlockSQLAlchemy())
 
-from knx_telegram_store import MemoryStore, StoredTelegram, TelegramQuery
+from knx_telegram_store import BufferedMemoryStore, MemoryStore, StoredTelegram, TelegramQuery
 from knx_telegram_store.formats import RawTelegramRecord
 
 assert MemoryStore.__name__ == "MemoryStore"
+assert BufferedMemoryStore.__name__ == "BufferedMemoryStore"
 assert StoredTelegram.__name__ == "StoredTelegram"
 assert TelegramQuery.__name__ == "TelegramQuery"
 assert RawTelegramRecord.__name__ == "RawTelegramRecord"

@@ -6,15 +6,18 @@ from .model import StoredTelegram
 from .query import TelegramQuery, TelegramQueryResult
 from .store import KnxTelegramStoreException, StoreCapabilities, StoreStats, TelegramStore
 
-_BUFFERED_EXPORTS = {
-    "BufferedMemoryStore",
+_SQL_BUFFERED_EXPORTS = {
     "BufferedPostgresStore",
     "BufferedSqliteStore",
 }
 
 
 def __getattr__(name: str) -> Any:
-    if name in _BUFFERED_EXPORTS:
+    if name == "BufferedMemoryStore":
+        from .buffered_memory import BufferedMemoryStore
+
+        return BufferedMemoryStore
+    if name in _SQL_BUFFERED_EXPORTS:
         from . import buffered
 
         return getattr(buffered, name)
