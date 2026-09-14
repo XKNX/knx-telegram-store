@@ -307,3 +307,49 @@ async def test_initialize_reconciles_stale_last_ga_summary(tmp_path):
         assert last.value == "newest"
     finally:
         await upgraded.close()
+
+
+async def test_initialize_handles_unrecoverable_legacy_timestamp_ties(tmp_path):
+    """Keep an existing tie winner; use a canonical fallback for a missing one."""
+    db_path = tmp_path / "telegrams.db"
+    store = SqliteStore(db_path)
+    await store.initialize()
+
+    timestamp = datetime(2026, 9, 14, 12, tzinfo=UTC)
+    missing_first = StoredTelegram(
+        timestamp=timestamp,
+        source="1.1.1",
+        destination="1/1/1",
+        telegramtype="GroupValueWrite",
+        direction="Incoming",
+        value="same",
+        raw_data="ff",
+    )
+    missing_canonical = replace(missing_first, raw_data="00")
+    preserved_first = replace(missing_first, destination="2/2/2")
+    preserved_canonical = replace(missing_canonical, destination="2/2/2")
+    await store.store_many([missing_first, missing_canonical, preserved_first, preserved_canonical])
+
+    async with store.engine.begin() as conn:
+        missing_destination_id = await conn.scalar(
+            select(store.string_lookup.c.id).where(
+                store.string_lookup.c.category == "destination",
+                store.string_lookup.c.value == missing_first.destination,
+            )
+        )
+        await conn.execute(
+            store.last_ga_telegrams.delete().where(store.last_ga_telegrams.c.destination_id == missing_destination_id)
+        )
+        await conn.execute(
+            store.store_metadata.delete().where(store.store_metadata.c.key == "last_ga_newest_reconciled")
+        )
+    await store.close()
+
+    upgraded = SqliteStore(db_path)
+    try:
+        await upgraded.initialize()
+        by_destination = {telegram.destination: telegram for telegram in await upgraded.get_last_unique_telegrams()}
+        assert by_destination[missing_first.destination].raw_data == "00"
+        assert by_destination[preserved_first.destination].raw_data == "ff"
+    finally:
+        await upgraded.close()

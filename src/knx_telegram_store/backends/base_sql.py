@@ -17,6 +17,7 @@ from sqlalchemy import (
     Table,
     Text,
     and_,
+    cast,
     func,
     inspect,
     or_,
@@ -613,38 +614,24 @@ class BaseSQLStore(TelegramStore):
                 )
                 await conn.execute(self.last_ga_telegrams.delete().where(newer_telegram))
 
-            t2 = self.telegrams.alias("t2")
-            subq = (
-                select(
-                    t2.c.destination_id,
-                    func.max(t2.c.timestamp).label("max_ts"),
+            summary_columns = [column.name for column in self.last_ga_telegrams.columns]
+            tie_breaker = [
+                cast(self.telegrams.c[name], Text).asc().nulls_first()
+                for name in summary_columns
+                if name not in {"destination_id", "timestamp"}
+            ]
+            # Legacy rows have no insertion identity. Existing max-timestamp
+            # summaries survive above; missing ones use a stable fallback.
+            ranked = select(
+                *(self.telegrams.c[name] for name in summary_columns),
+                func.row_number()
+                .over(
+                    partition_by=self.telegrams.c.destination_id,
+                    order_by=[self.telegrams.c.timestamp.desc(), *tie_breaker],
                 )
-                .group_by(t2.c.destination_id)
-                .subquery()
-            )
-
-            select_stmt = select(
-                self.telegrams.c.destination_id,
-                self.telegrams.c.timestamp,
-                self.telegrams.c.source_id,
-                self.telegrams.c.telegramtype_id,
-                self.telegrams.c.direction_id,
-                self.telegrams.c.source_name_id,
-                self.telegrams.c.destination_name_id,
-                self.telegrams.c.payload,
-                self.telegrams.c.dpt_main,
-                self.telegrams.c.dpt_sub,
-                self.telegrams.c.value,
-                self.telegrams.c.value_numeric,
-                self.telegrams.c.raw_data,
-                self.telegrams.c.data_secure,
-            ).join(
-                subq,
-                and_(
-                    self.telegrams.c.destination_id == subq.c.destination_id,
-                    self.telegrams.c.timestamp == subq.c.max_ts,
-                ),
-            )
+                .label("candidate_rank"),
+            ).subquery()
+            select_stmt = select(*(ranked.c[name] for name in summary_columns)).where(ranked.c.candidate_rank == 1)
 
             summary_insert: Any
             metadata_upsert: Any
@@ -653,7 +640,7 @@ class BaseSQLStore(TelegramStore):
 
                 summary_insert = (
                     sqlite_insert(self.last_ga_telegrams)
-                    .from_select([c.name for c in select_stmt.selected_columns], select_stmt)
+                    .from_select(summary_columns, select_stmt)
                     .on_conflict_do_nothing()
                 )
                 metadata_upsert = sqlite_insert(self.store_metadata).values(key=_LAST_GA_RECONCILED_KEY, value="true")
@@ -661,9 +648,7 @@ class BaseSQLStore(TelegramStore):
                 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
                 summary_insert = (
-                    pg_insert(self.last_ga_telegrams)
-                    .from_select([c.name for c in select_stmt.selected_columns], select_stmt)
-                    .on_conflict_do_nothing()
+                    pg_insert(self.last_ga_telegrams).from_select(summary_columns, select_stmt).on_conflict_do_nothing()
                 )
                 metadata_upsert = pg_insert(self.store_metadata).values(key=_LAST_GA_RECONCILED_KEY, value="true")
 

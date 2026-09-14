@@ -29,7 +29,7 @@ import pytest
 
 pytest.importorskip("asyncpg")
 
-from sqlalchemy import text  # noqa: E402
+from sqlalchemy import select, text  # noqa: E402
 
 from knx_telegram_store import (  # noqa: E402
     BufferedPostgresStore,
@@ -189,6 +189,49 @@ async def test_initialize_idempotent_and_detects_mode(store):
         # Stock Postgres: the extension is not even installable.
         installed = await _scalar(dsn, "SELECT count(*) FROM pg_extension WHERE extname = 'timescaledb'")
         assert installed == 0
+
+
+async def test_initialize_reconciles_legacy_last_value_summaries(backend):
+    """Repair stale summaries and deterministically fill missing tied summaries."""
+    _, dsn = backend
+    original = PostgresStore(dsn)
+    await original.initialize()
+
+    timestamp = datetime(2026, 9, 14, 12, tzinfo=UTC)
+    newest = make_telegram(timestamp, value=30.0)
+    older = make_telegram(timestamp - timedelta(days=1), value=10.0)
+    tie_first = make_telegram(timestamp, destination="4/5/6", value=40.0)
+    tie_first = replace(tie_first, raw_data="ff")
+    tie_canonical = replace(tie_first, raw_data="00")
+    await original.store_many([newest, older, tie_first, tie_canonical])
+
+    columns = [column.name for column in original.last_ga_telegrams.columns]
+    older_row = select(*(original.telegrams.c[name] for name in columns)).where(
+        original.telegrams.c.timestamp == older.timestamp,
+        original.telegrams.c.destination_id
+        == select(original.string_lookup.c.id)
+        .where(
+            original.string_lookup.c.category == "destination",
+            original.string_lookup.c.value == newest.destination,
+        )
+        .scalar_subquery(),
+    )
+    async with original.engine.begin() as conn:
+        await conn.execute(original.last_ga_telegrams.delete())
+        await conn.execute(original.last_ga_telegrams.insert().from_select(columns, older_row))
+        await conn.execute(
+            original.store_metadata.delete().where(original.store_metadata.c.key == "last_ga_newest_reconciled")
+        )
+    await original.close()
+
+    upgraded = PostgresStore(dsn)
+    try:
+        await upgraded.initialize()
+        by_destination = {telegram.destination: telegram for telegram in await upgraded.get_last_unique_telegrams()}
+        assert by_destination[newest.destination].value_numeric == 30.0
+        assert by_destination[tie_first.destination].raw_data == "00"
+    finally:
+        await upgraded.close()
 
 
 async def test_timescale_enabled_unknown_before_initialize(backend):
