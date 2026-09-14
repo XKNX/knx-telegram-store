@@ -403,7 +403,7 @@ async def test_legacy_unwrap_survives_concurrent_row_update(store):
     metadata_connection = await pg_store.engine.connect()
     row_connection = await pg_store.engine.connect()
     backfill_connection = await pg_store.engine.connect()
-    await backfill_connection.execute(text("SELECT 1"))
+    backfill_pid = await backfill_connection.scalar(text("SELECT pg_backend_pid()"))
     await backfill_connection.rollback()
     metadata_transaction = await metadata_connection.begin()
     row_transaction = None
@@ -424,22 +424,16 @@ async def test_legacy_unwrap_survives_concurrent_row_update(store):
 
         backfill_task = asyncio.create_task(_run_backfill())
 
-        async def _wait_for_blocked_query(observer, query_fragment: str) -> None:
+        async def _wait_for_blocked_query(observer, previous_query=None):
             for _ in range(500):
-                migration_is_blocked = await observer.scalar(
-                    text(
-                        "SELECT EXISTS ("
-                        "SELECT 1 FROM pg_stat_activity "
-                        "WHERE datname = current_database() "
-                        "AND pid <> pg_backend_pid() "
-                        "AND wait_event_type = 'Lock' "
-                        "AND query LIKE :query_pattern"
-                        ")"
-                    ),
-                    {"query_pattern": f"%{query_fragment}%"},
-                )
-                if migration_is_blocked:
-                    return
+                activity = (
+                    await observer.execute(
+                        text("SELECT wait_event_type, query FROM pg_stat_activity WHERE pid = :pid"),
+                        {"pid": backfill_pid},
+                    )
+                ).one_or_none()
+                if activity is not None and activity[0] == "Lock" and activity[1] != previous_query:
+                    return activity[1]
                 if backfill_task.done():
                     await backfill_task
                     raise AssertionError("backfill completed before reaching the expected lock")
@@ -454,13 +448,13 @@ async def test_legacy_unwrap_survives_concurrent_row_update(store):
             ).fetchall()
             raise AssertionError((pg_store.engine.pool.status(), activities))
 
-        await _wait_for_blocked_query(row_connection, "")
+        first_blocked_query = await _wait_for_blocked_query(row_connection)
         await row_connection.rollback()
         row_transaction = await row_connection.begin()
         await row_connection.execute(text("UPDATE telegrams SET value = value"))
         await metadata_transaction.commit()
 
-        await _wait_for_blocked_query(metadata_connection, "telegrams")
+        await _wait_for_blocked_query(metadata_connection, first_blocked_query)
         await row_transaction.commit()
         await asyncio.wait_for(backfill_task, timeout=5)
     finally:
