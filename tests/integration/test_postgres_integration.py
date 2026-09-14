@@ -325,10 +325,19 @@ async def test_oversized_notify_payload_does_not_abort_batch(store):
         value=oversized_value,
     )
     normal = make_telegram(timestamp, destination="4/5/6", value=21.5)
+    listener = pg_store.listen_for_new_telegrams()
+    notification_task = asyncio.create_task(anext(listener))
+    await asyncio.sleep(0.2)
 
-    await pg_store.store_many([oversized, normal])
-    result = await pg_store.query(TelegramQuery())
+    try:
+        await pg_store.store_many([oversized, normal])
+        received = await asyncio.wait_for(notification_task, timeout=5)
+        result = await pg_store.query(TelegramQuery())
+    finally:
+        await listener.aclose()
 
+    assert received.destination == normal.destination
+    assert received.value == normal.value
     assert result.total_count == 2
     assert {telegram.value for telegram in result.telegrams} == {
         oversized_value,
