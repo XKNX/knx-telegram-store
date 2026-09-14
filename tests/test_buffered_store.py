@@ -1,5 +1,6 @@
 import asyncio
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -291,6 +292,84 @@ async def test_eviction_passes_through_to_backend(sample_telegram):
 
     deleted = await store.evict_expired(dry_run=True)
     assert deleted == 0  # no retention_days configured
+
+
+async def test_evict_older_than_prunes_matching_buffered_telegrams(sample_telegram):
+    cutoff = sample_telegram.timestamp
+    old = replace(sample_telegram, timestamp=cutoff - timedelta(days=2), value="old")
+    current = replace(
+        sample_telegram,
+        timestamp=cutoff + timedelta(seconds=1),
+        source="1.1.2",
+        value="current",
+    )
+    store = BufferedSqliteStore(":memory:", flush_interval=60)
+    await store.initialize()
+    await store.store(old)
+    await store.store(current)
+
+    deleted = await store.evict_older_than(cutoff)
+    await store.flush()
+    result = await store.query(TelegramQuery())
+
+    assert deleted == 1
+    assert [telegram.value for telegram in result.telegrams] == ["current"]
+
+
+async def test_evict_older_than_dry_run_counts_buffer_without_pruning(sample_telegram):
+    cutoff = sample_telegram.timestamp + timedelta(seconds=1)
+    store = BufferedSqliteStore(":memory:", flush_interval=60)
+    await store.initialize()
+    await store.store(sample_telegram)
+
+    deleted = await store.evict_older_than(cutoff, dry_run=True)
+
+    assert deleted == 1
+    assert store._buffer == [sample_telegram]
+
+
+async def test_evict_expired_prunes_expired_buffered_telegrams(sample_telegram):
+    now = datetime.now(UTC)
+    old = replace(sample_telegram, timestamp=now - timedelta(days=2), value="old")
+    current = replace(sample_telegram, timestamp=now, source="1.1.2", value="current")
+    store = BufferedSqliteStore(":memory:", retention_days=1, flush_interval=60)
+    await store.initialize()
+    await store.store(old)
+    await store.store(current)
+
+    deleted = await store.evict_expired()
+    await store.flush()
+    result = await store.query(TelegramQuery())
+
+    assert deleted == 1
+    assert [telegram.value for telegram in result.telegrams] == ["current"]
+
+
+async def test_eviction_serializes_with_concurrent_flush(sample_telegram, monkeypatch):
+    cutoff = sample_telegram.timestamp + timedelta(seconds=1)
+    store = BufferedSqliteStore(":memory:", flush_interval=60)
+    await store.initialize()
+    await store.store(sample_telegram)
+    original_evict = SqliteStore.evict_older_than
+    backend_delete_finished = asyncio.Event()
+    release_eviction = asyncio.Event()
+
+    async def _pause_after_backend_delete(self, cutoff, *, dry_run=False):
+        deleted = await original_evict(self, cutoff, dry_run=dry_run)
+        backend_delete_finished.set()
+        await release_eviction.wait()
+        return deleted
+
+    monkeypatch.setattr(SqliteStore, "evict_older_than", _pause_after_backend_delete)
+    eviction_task = asyncio.create_task(store.evict_older_than(cutoff))
+    await asyncio.wait_for(backend_delete_finished.wait(), timeout=1)
+    flush_task = asyncio.create_task(store.flush())
+    await asyncio.sleep(0)
+    release_eviction.set()
+
+    assert await eviction_task == 1
+    await flush_task
+    assert await store.count() == 0
 
 
 async def test_flush_empty_buffer_is_noop(buffered_store):

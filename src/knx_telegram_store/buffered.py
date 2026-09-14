@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any
 
 from .backends.memory import MemoryStore
@@ -196,6 +197,16 @@ class _BufferMixin:
         """Flush buffered writes, then reclaim space in the backing store."""
         await self.flush()
         await super().optimize()  # type: ignore[misc]
+
+    @wrap_store_errors
+    async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
+        """Evict matching persisted and buffered telegrams."""
+        async with self._flush_lock:
+            backend_deleted = await super().evict_older_than(cutoff, dry_run=dry_run)  # type: ignore[misc]
+            buffered_deleted = sum(telegram.timestamp < cutoff for telegram in self._buffer)
+            if not dry_run:
+                self._buffer[:] = [telegram for telegram in self._buffer if telegram.timestamp >= cutoff]
+            return backend_deleted + buffered_deleted
 
     # --- Clear overrride (wipe buffer + table) ---
 
