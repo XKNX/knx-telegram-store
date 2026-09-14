@@ -1,0 +1,28 @@
+coverage:
+  status:
+    # Informational until the coverage baseline has stabilised; flip to blocking afterwards.
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+flags:
+  unit:
+    paths:
+      - src/knx_telegram_store/
+    carryforward: true
+  integration:
+    paths:
+      - src/knx_telegram_store/
+    carryforward: true
+
+comment:
+  layout: "reach, diff, flags, files"
+  require_changes: true
+
+ignore:
+  - "tests/"
+  - "scripts/"
+  - "tools/"
