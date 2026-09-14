@@ -2,14 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Sequence
-from contextlib import asynccontextmanager
-from datetime import datetime
 from typing import Any
 
 from .backends.memory import MemoryStore
-from .backends.postgres import PostgresStore
-from .backends.sqlite import SqliteStore
 from .model import StoredTelegram
 from .query import TelegramQuery, TelegramQueryResult
 from .store import StoreStats, wrap_store_errors
@@ -25,8 +20,8 @@ class _BufferMixin:
         class BufferedSqliteStore(_BufferMixin, SqliteStore): ...
 
     The mixin intercepts store() / store_sync() and accumulates telegrams in an
-    in-memory list. A periodic background task drains the buffer through the
-    public store_many() dispatch under the lifecycle locks.
+    in-memory list.  A periodic background task (start/stop) drains the buffer
+    by calling self.store_many(), which resolves to the SQL backend via MRO.
 
     Behaviour:
     - store() / store_sync() are O(1) and never touch the database.
@@ -45,43 +40,23 @@ class _BufferMixin:
     ) -> None:
         super().__init__(*args, **kwargs)
         self._buffer: list[StoredTelegram] = []
-        self._flush_lock = asyncio.Lock()
-        self._mutation_lock = asyncio.Lock()
-        self._mutation_owner: asyncio.Task[Any] | None = None
         self._flush_task: asyncio.Task[None] | None = None
         self._closing = False
         self.flush_interval = flush_interval
         self.max_buffer_size = max_buffer_size
         self._buffer_full_warned = False
 
-    @asynccontextmanager
-    async def _mutation(self, *, allow_closing: bool = False) -> AsyncIterator[None]:
-        task = asyncio.current_task()
-        assert task is not None
-        if task is self._mutation_owner:
-            yield
-            return
-
-        async with self._mutation_lock:
-            if self._closing and not allow_closing:
-                raise RuntimeError("Store is closing")
-            self._mutation_owner = task
-            try:
-                yield
-            finally:
-                self._mutation_owner = None
-
     # --- Lifecycle ---
 
     def start(self) -> None:
         """Start the periodic flush task."""
-        if self._closing or self._flush_task is not None:
+        if self._flush_task is not None:
             return
         self._flush_task = asyncio.create_task(self._flush_loop())
 
     @wrap_store_errors
-    async def close(self) -> None:
-        """Stop periodic flushing, flush pending writes, and close the backend."""
+    async def stop(self) -> None:
+        """Stop the periodic flush task, perform a final flush, then close."""
         self._closing = True
         if self._flush_task is not None:
             self._flush_task.cancel()
@@ -91,21 +66,15 @@ class _BufferMixin:
                 pass
             self._flush_task = None
 
-        async with self._mutation(allow_closing=True):
-            await self._flush(raise_on_error=True)
-            await super().close()  # type: ignore[misc]
-
-    @wrap_store_errors
-    async def stop(self) -> None:
-        """Compatibility alias for close()."""
-        await self.close()
+        await self._flush()
+        await self.close()  # type: ignore[attr-defined]
 
     async def _flush_loop(self) -> None:
         """Periodic flush loop."""
         while not self._closing:
             try:
                 await asyncio.sleep(self.flush_interval)
-                await self._flush(raise_on_error=False)
+                await self._flush()
             except asyncio.CancelledError:
                 break
             except Exception as err:
@@ -144,39 +113,30 @@ class _BufferMixin:
             self._buffer.pop(0)
         self._buffer.append(telegram)
 
-    @wrap_store_errors
-    async def store_many(self, telegrams: Sequence[StoredTelegram]) -> None:
-        """Write a batch while excluding lifecycle operations."""
-        async with self._mutation():
-            await super().store_many(telegrams)  # type: ignore[misc]
-
-    async def _flush(self, *, raise_on_error: bool) -> None:
+    async def _flush(self) -> None:
         """Drain the buffer into the backing store (private implementation)."""
-        async with self._mutation():
-            async with self._flush_lock:
-                if not self._buffer:
-                    return
+        if not self._buffer:
+            return
 
-                batch = self._buffer.copy()
-                self._buffer.clear()
+        batch = self._buffer.copy()
+        self._buffer.clear()
 
-                try:
-                    await self.store_many(batch)
-                    self._buffer_full_warned = False
-                except BaseException as err:
-                    self._buffer[0:0] = batch
-                    if len(self._buffer) > self.max_buffer_size:
-                        if not self._buffer_full_warned:
-                            _LOGGER.warning(
-                                "Telegram store buffer exceeded limit (%d items) after failed flush, dropping %d oldest telegrams",
-                                self.max_buffer_size,
-                                len(self._buffer) - self.max_buffer_size,
-                            )
-                            self._buffer_full_warned = True
-                        self._buffer = self._buffer[-self.max_buffer_size :]
-                    if not isinstance(err, Exception) or raise_on_error:
-                        raise
-                    _LOGGER.error("Error flushing telegram buffer: %s", err)
+        try:
+            await self.store_many(batch)  # type: ignore[attr-defined]
+            self._buffer_full_warned = False
+        except Exception as err:
+            _LOGGER.error("Error flushing telegram buffer: %s", err)
+            # Re-prepend the batch so it's retried before any newer items
+            self._buffer[0:0] = batch
+            if len(self._buffer) > self.max_buffer_size:
+                if not self._buffer_full_warned:
+                    _LOGGER.warning(
+                        "Telegram store buffer exceeded limit (%d items) after failed flush, dropping %d oldest telegrams",
+                        self.max_buffer_size,
+                        len(self._buffer) - self.max_buffer_size,
+                    )
+                    self._buffer_full_warned = True
+                self._buffer = self._buffer[-self.max_buffer_size :]
 
     @wrap_store_errors
     async def flush(self) -> None:
@@ -186,7 +146,7 @@ class _BufferMixin:
         flush_interval seconds from now, avoiding a near-immediate double-flush
         when flush() is called close to a scheduled tick.
         """
-        await self._flush(raise_on_error=True)
+        await self._flush()
         # Reset the periodic timer so the next auto-flush starts fresh
         if self._flush_task is not None and not self._closing:
             self._flush_task.cancel()
@@ -224,75 +184,18 @@ class _BufferMixin:
     @wrap_store_errors
     async def optimize(self) -> None:
         """Flush buffered writes, then reclaim space in the backing store."""
-        async with self._mutation():
-            await self.flush()
-            await super().optimize()  # type: ignore[misc]
-
-    @wrap_store_errors
-    async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
-        """Evict matching persisted and buffered telegrams atomically on cancellation."""
-        async with self._mutation():
-            task = asyncio.create_task(self._evict_older_than(cutoff, dry_run=dry_run))
-            try:
-                return await asyncio.shield(task)
-            except asyncio.CancelledError as cancelled:
-                while not task.done():
-                    try:
-                        await asyncio.shield(task)
-                    except asyncio.CancelledError:
-                        continue
-                    except BaseException:
-                        break
-                try:
-                    task.result()
-                except BaseException as err:
-                    raise cancelled from err
-                raise cancelled
-
-    async def _evict_older_than(self, cutoff: datetime, *, dry_run: bool) -> int:
-        """Reconcile eviction while the caller retains the mutation gate."""
-        async with self._flush_lock:
-            backend_deleted = await super().evict_older_than(cutoff, dry_run=dry_run)  # type: ignore[misc]
-            buffered_deleted = sum(telegram.timestamp < cutoff for telegram in self._buffer)
-            if not dry_run:
-                self._buffer[:] = [telegram for telegram in self._buffer if telegram.timestamp >= cutoff]
-            return backend_deleted + buffered_deleted
-
-    @wrap_store_errors
-    async def evict_expired(self, *, dry_run: bool = False) -> int:
-        """Apply backend retention within the store lifecycle, including no-ops."""
-        async with self._mutation():
-            return await super().evict_expired(dry_run=dry_run)  # type: ignore[misc, no-any-return]
+        await self.flush()
+        await super().optimize()  # type: ignore[misc]
 
     # --- Clear overrride (wipe buffer + table) ---
 
     @wrap_store_errors
     async def clear(self) -> None:
         """Clear both the in-memory buffer and the underlying table."""
-        async with self._mutation():
-            async with self._flush_lock:
-                self._buffer.clear()
-                await super().clear()  # type: ignore[misc]
+        self._buffer.clear()
+        await super().clear()  # type: ignore[misc]
 
 
-class BufferedSqliteStore(_BufferMixin, SqliteStore):
-    """SqliteStore with transparent write-buffering.
-
-    Args:
-        db_path: Path to the SQLite database file, or ``:memory:``.
-        retention_days: Optional retention period in days.
-        flush_interval: Seconds between automatic buffer flushes (default 1.0).
-    """
-
-
-class BufferedPostgresStore(_BufferMixin, PostgresStore):
-    """PostgresStore with transparent write-buffering.
-
-    Args:
-        dsn: PostgreSQL connection string.
-        retention_days: Optional retention period in days.
-        flush_interval: Seconds between automatic buffer flushes (default 1.0).
-    """
 class BufferedMemoryStore(_BufferMixin, MemoryStore):
     """MemoryStore with transparent write-buffering.
 
@@ -308,9 +211,3 @@ class BufferedMemoryStore(_BufferMixin, MemoryStore):
         max_buffer_size: Maximum number of buffered writes before the oldest are
             dropped (default 10000).
     """
-
-    @wrap_store_errors
-    async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
-        """Keep the memory backend's max-size-only retention semantics."""
-        async with self._mutation():
-            return await MemoryStore.evict_older_than(self, cutoff, dry_run=dry_run)
