@@ -33,7 +33,10 @@ async def buffered_store(request):
     else:
         store = BufferedMemoryStore(flush_interval=0.1)
     await store.initialize()
-    return store
+    try:
+        yield store
+    finally:
+        await store.close()
 
 
 async def _invoke_mutation(store, operation, sample_telegram):
@@ -145,16 +148,18 @@ async def test_close_persists_pending_telegrams_to_file(tmp_path, sample_telegra
     db_path = tmp_path / "telegrams.db"
     store = BufferedSqliteStore(db_path, flush_interval=60)
     await store.initialize()
-    await store.store(sample_telegram)
-
-    await store.close()
-
-    reader = SqliteStore(db_path, read_only=True)
-    await reader.initialize()
     try:
-        assert await reader.count() == 1
+        await store.store(sample_telegram)
+        await store.close()
+
+        reader = SqliteStore(db_path, read_only=True)
+        await reader.initialize()
+        try:
+            assert await reader.count() == 1
+        finally:
+            await reader.close()
     finally:
-        await reader.close()
+        await store.close()
 
 
 async def test_close_stops_periodic_task_and_is_idempotent(sample_telegram):
@@ -218,18 +223,22 @@ async def test_stop_remains_close_alias(sample_telegram):
 
 
 async def test_flush_failure_reprepends(buffered_store, sample_telegram, monkeypatch):
+    original_store_many = buffered_store.store_many
+
     async def _fail(telegrams):
         raise RuntimeError("DB error")
 
     monkeypatch.setattr(buffered_store, "store_many", _fail)
+    try:
+        await buffered_store.store(sample_telegram)
+        with pytest.raises(KnxTelegramStoreException, match="DB error"):
+            await buffered_store.flush()
 
-    await buffered_store.store(sample_telegram)
-    with pytest.raises(KnxTelegramStoreException, match="DB error"):
-        await buffered_store.flush()
-
-    # Buffer should still contain the telegram after failure
-    assert len(buffered_store._buffer) == 1
-    assert buffered_store._buffer[0] == sample_telegram
+        # Buffer should still contain the telegram after failure
+        assert len(buffered_store._buffer) == 1
+        assert buffered_store._buffer[0] == sample_telegram
+    finally:
+        monkeypatch.setattr(buffered_store, "store_many", original_store_many)
 
 
 async def test_cancelled_flush_restores_detached_batch(sample_telegram, monkeypatch):
@@ -262,29 +271,39 @@ async def test_cancelled_flush_restores_detached_batch(sample_telegram, monkeypa
 
 
 async def test_explicit_flush_failure_raises_and_restores_buffer(buffered_store, sample_telegram, monkeypatch):
+    original_store_many = buffered_store.store_many
+
     async def _fail(_telegrams):
         raise RuntimeError("DB error")
 
     monkeypatch.setattr(buffered_store, "store_many", _fail)
-    await buffered_store.store(sample_telegram)
+    try:
+        await buffered_store.store(sample_telegram)
 
-    with pytest.raises(KnxTelegramStoreException, match="Database error during flush: DB error"):
-        await buffered_store.flush()
+        with pytest.raises(KnxTelegramStoreException, match="Database error during flush: DB error"):
+            await buffered_store.flush()
 
-    assert buffered_store._buffer == [sample_telegram]
+        assert buffered_store._buffer == [sample_telegram]
+    finally:
+        monkeypatch.setattr(buffered_store, "store_many", original_store_many)
 
 
 async def test_query_flush_first_propagates_flush_failure(buffered_store, sample_telegram, monkeypatch):
+    original_store_many = buffered_store.store_many
+
     async def _fail(_telegrams):
         raise RuntimeError("DB error")
 
     monkeypatch.setattr(buffered_store, "store_many", _fail)
-    await buffered_store.store(sample_telegram)
+    try:
+        await buffered_store.store(sample_telegram)
 
-    with pytest.raises(KnxTelegramStoreException, match="DB error"):
-        await buffered_store.query(TelegramQuery(), flush_first=True)
+        with pytest.raises(KnxTelegramStoreException, match="DB error"):
+            await buffered_store.query(TelegramQuery(), flush_first=True)
 
-    assert buffered_store._buffer == [sample_telegram]
+        assert buffered_store._buffer == [sample_telegram]
+    finally:
+        monkeypatch.setattr(buffered_store, "store_many", original_store_many)
 
 
 async def test_close_retries_failed_final_flush_before_closing(sample_telegram, monkeypatch):
@@ -331,6 +350,9 @@ async def test_close_waits_for_concurrent_store_many(sample_telegram, monkeypatc
     backend_store_started = asyncio.Event()
     release_store = asyncio.Event()
     backend_close_started = asyncio.Event()
+    store_task = None
+    close_task = None
+    reader = None
 
     async def _pause_backend_store(self, telegrams):
         backend_store_started.set()
@@ -343,20 +365,26 @@ async def test_close_waits_for_concurrent_store_many(sample_telegram, monkeypatc
 
     monkeypatch.setattr(SqliteStore, "store_many", _pause_backend_store)
     monkeypatch.setattr(SqliteStore, "close", _observe_backend_close)
-    store_task = asyncio.create_task(store.store_many([sample_telegram]))
-    await asyncio.wait_for(backend_store_started.wait(), timeout=1)
-    close_task = asyncio.create_task(store.close())
-    await asyncio.sleep(0)
-    close_started_before_store_finished = backend_close_started.is_set()
-    release_store.set()
-    await store_task
-    await close_task
+    try:
+        store_task = asyncio.create_task(store.store_many([sample_telegram]))
+        await asyncio.wait_for(backend_store_started.wait(), timeout=1)
+        close_task = asyncio.create_task(store.close())
+        await asyncio.sleep(0)
+        close_started_before_store_finished = backend_close_started.is_set()
+        release_store.set()
+        await store_task
+        await close_task
 
-    assert not close_started_before_store_finished
-    reader = SqliteStore(db_path)
-    await reader.initialize()
-    assert await reader.count() == 1
-    await reader.close()
+        assert not close_started_before_store_finished
+        reader = SqliteStore(db_path)
+        await reader.initialize()
+        assert await reader.count() == 1
+    finally:
+        release_store.set()
+        await _settle_tasks(store_task, close_task)
+        if reader is not None:
+            await reader.close()
+        await store.close()
 
 
 async def test_close_waits_for_concurrent_optimize(sample_telegram, monkeypatch):
@@ -405,9 +433,12 @@ async def test_close_rejects_eviction_queued_during_final_flush(sample_telegram,
     await store.initialize()
     await store.store(sample_telegram)
     original_store_many = SqliteStore.store_many
+    original_evict = SqliteStore.evict_older_than
     final_write_started = asyncio.Event()
     release_final_write = asyncio.Event()
     backend_eviction_called = asyncio.Event()
+    close_task = None
+    eviction_task = None
 
     async def _pause_final_write(self, telegrams):
         final_write_started.set()
@@ -420,16 +451,23 @@ async def test_close_rejects_eviction_queued_during_final_flush(sample_telegram,
 
     monkeypatch.setattr(SqliteStore, "store_many", _pause_final_write)
     monkeypatch.setattr(SqliteStore, "evict_older_than", _observe_eviction)
-    close_task = asyncio.create_task(store.close())
-    await asyncio.wait_for(final_write_started.wait(), timeout=1)
-    eviction_task = asyncio.create_task(store.evict_older_than(sample_telegram.timestamp))
-    await asyncio.sleep(0)
-    release_final_write.set()
+    try:
+        close_task = asyncio.create_task(store.close())
+        await asyncio.wait_for(final_write_started.wait(), timeout=1)
+        eviction_task = asyncio.create_task(store.evict_older_than(sample_telegram.timestamp))
+        await asyncio.sleep(0)
+        release_final_write.set()
 
-    await close_task
-    with pytest.raises(KnxTelegramStoreException, match="closing"):
-        await eviction_task
-    assert not backend_eviction_called.is_set()
+        await close_task
+        with pytest.raises(KnxTelegramStoreException, match="closing"):
+            await eviction_task
+        assert not backend_eviction_called.is_set()
+    finally:
+        release_final_write.set()
+        await _settle_tasks(close_task, eviction_task)
+        monkeypatch.setattr(SqliteStore, "store_many", original_store_many)
+        monkeypatch.setattr(SqliteStore, "evict_older_than", original_evict)
+        await store.close()
 
 
 async def test_close_rejects_store_many_queued_during_shutdown(sample_telegram, monkeypatch, tmp_path):
@@ -516,14 +554,17 @@ async def test_eviction_passes_through_to_backend(sample_telegram):
     # by max_telegrams instead and reports 0 here.
     store = BufferedSqliteStore(":memory:", flush_interval=0.1)
     await store.initialize()
-    await store.store_many([sample_telegram])
+    try:
+        await store.store_many([sample_telegram])
 
-    cutoff = datetime.now(UTC)
-    deleted = await store.evict_older_than(cutoff, dry_run=True)
-    assert deleted == 1
+        cutoff = datetime.now(UTC)
+        deleted = await store.evict_older_than(cutoff, dry_run=True)
+        assert deleted == 1
 
-    deleted = await store.evict_expired(dry_run=True)
-    assert deleted == 0  # no retention_days configured
+        deleted = await store.evict_expired(dry_run=True)
+        assert deleted == 0  # no retention_days configured
+    finally:
+        await store.close()
 
 
 async def test_evict_older_than_prunes_matching_buffered_telegrams(sample_telegram):
@@ -537,27 +578,33 @@ async def test_evict_older_than_prunes_matching_buffered_telegrams(sample_telegr
     )
     store = BufferedSqliteStore(":memory:", flush_interval=60)
     await store.initialize()
-    await store.store(old)
-    await store.store(current)
+    try:
+        await store.store(old)
+        await store.store(current)
 
-    deleted = await store.evict_older_than(cutoff)
-    await store.flush()
-    result = await store.query(TelegramQuery())
+        deleted = await store.evict_older_than(cutoff)
+        await store.flush()
+        result = await store.query(TelegramQuery())
 
-    assert deleted == 1
-    assert [telegram.value for telegram in result.telegrams] == ["current"]
+        assert deleted == 1
+        assert [telegram.value for telegram in result.telegrams] == ["current"]
+    finally:
+        await store.close()
 
 
 async def test_evict_older_than_dry_run_counts_buffer_without_pruning(sample_telegram):
     cutoff = sample_telegram.timestamp + timedelta(seconds=1)
     store = BufferedSqliteStore(":memory:", flush_interval=60)
     await store.initialize()
-    await store.store(sample_telegram)
+    try:
+        await store.store(sample_telegram)
 
-    deleted = await store.evict_older_than(cutoff, dry_run=True)
+        deleted = await store.evict_older_than(cutoff, dry_run=True)
 
-    assert deleted == 1
-    assert store._buffer == [sample_telegram]
+        assert deleted == 1
+        assert store._buffer == [sample_telegram]
+    finally:
+        await store.close()
 
 
 async def test_evict_expired_prunes_expired_buffered_telegrams(sample_telegram):
@@ -566,15 +613,18 @@ async def test_evict_expired_prunes_expired_buffered_telegrams(sample_telegram):
     current = replace(sample_telegram, timestamp=now, source="1.1.2", value="current")
     store = BufferedSqliteStore(":memory:", retention_days=1, flush_interval=60)
     await store.initialize()
-    await store.store(old)
-    await store.store(current)
+    try:
+        await store.store(old)
+        await store.store(current)
 
-    deleted = await store.evict_expired()
-    await store.flush()
-    result = await store.query(TelegramQuery())
+        deleted = await store.evict_expired()
+        await store.flush()
+        result = await store.query(TelegramQuery())
 
-    assert deleted == 1
-    assert [telegram.value for telegram in result.telegrams] == ["current"]
+        assert deleted == 1
+        assert [telegram.value for telegram in result.telegrams] == ["current"]
+    finally:
+        await store.close()
 
 
 async def test_eviction_serializes_with_concurrent_flush(sample_telegram, monkeypatch):
@@ -585,6 +635,8 @@ async def test_eviction_serializes_with_concurrent_flush(sample_telegram, monkey
     original_evict = SqliteStore.evict_older_than
     backend_delete_finished = asyncio.Event()
     release_eviction = asyncio.Event()
+    eviction_task = None
+    flush_task = None
 
     async def _pause_after_backend_delete(self, cutoff, *, dry_run=False):
         deleted = await original_evict(self, cutoff, dry_run=dry_run)
@@ -593,15 +645,21 @@ async def test_eviction_serializes_with_concurrent_flush(sample_telegram, monkey
         return deleted
 
     monkeypatch.setattr(SqliteStore, "evict_older_than", _pause_after_backend_delete)
-    eviction_task = asyncio.create_task(store.evict_older_than(cutoff))
-    await asyncio.wait_for(backend_delete_finished.wait(), timeout=1)
-    flush_task = asyncio.create_task(store.flush())
-    await asyncio.sleep(0)
-    release_eviction.set()
+    try:
+        eviction_task = asyncio.create_task(store.evict_older_than(cutoff))
+        await asyncio.wait_for(backend_delete_finished.wait(), timeout=1)
+        flush_task = asyncio.create_task(store.flush())
+        await asyncio.sleep(0)
+        release_eviction.set()
 
-    assert await eviction_task == 1
-    await flush_task
-    assert await store.count() == 0
+        assert await eviction_task == 1
+        await flush_task
+        assert await store.count() == 0
+    finally:
+        release_eviction.set()
+        await _settle_tasks(eviction_task, flush_task)
+        monkeypatch.setattr(SqliteStore, "evict_older_than", original_evict)
+        await store.close()
 
 
 async def test_eviction_serializes_with_concurrent_store_many(sample_telegram, monkeypatch):
@@ -613,6 +671,8 @@ async def test_eviction_serializes_with_concurrent_store_many(sample_telegram, m
     backend_delete_finished = asyncio.Event()
     release_eviction = asyncio.Event()
     backend_store_started = asyncio.Event()
+    eviction_task = None
+    store_task = None
 
     async def _pause_after_backend_delete(self, cutoff, *, dry_run=False):
         deleted = await original_evict(self, cutoff, dry_run=dry_run)
@@ -626,17 +686,24 @@ async def test_eviction_serializes_with_concurrent_store_many(sample_telegram, m
 
     monkeypatch.setattr(SqliteStore, "evict_older_than", _pause_after_backend_delete)
     monkeypatch.setattr(SqliteStore, "store_many", _observe_backend_store)
-    eviction_task = asyncio.create_task(store.evict_older_than(cutoff))
-    await asyncio.wait_for(backend_delete_finished.wait(), timeout=1)
-    store_task = asyncio.create_task(store.store_many([sample_telegram]))
-    await asyncio.sleep(0)
+    try:
+        eviction_task = asyncio.create_task(store.evict_older_than(cutoff))
+        await asyncio.wait_for(backend_delete_finished.wait(), timeout=1)
+        store_task = asyncio.create_task(store.store_many([sample_telegram]))
+        await asyncio.sleep(0)
 
-    assert not backend_store_started.is_set()
+        assert not backend_store_started.is_set()
 
-    release_eviction.set()
-    assert await eviction_task == 0
-    await store_task
-    assert await store.count() == 1
+        release_eviction.set()
+        assert await eviction_task == 0
+        await store_task
+        assert await store.count() == 1
+    finally:
+        release_eviction.set()
+        await _settle_tasks(eviction_task, store_task)
+        monkeypatch.setattr(SqliteStore, "evict_older_than", original_evict)
+        monkeypatch.setattr(SqliteStore, "store_many", original_store_many)
+        await store.close()
 
 
 @pytest.mark.parametrize("cancellation_count", [1, 2])
@@ -653,6 +720,7 @@ async def test_cancellation_finishes_buffer_reconciliation_after_backend_evictio
     original_evict = SqliteStore.evict_older_than
     backend_delete_committed = asyncio.Event()
     release_backend_return = asyncio.Event()
+    eviction_task = None
 
     async def _pause_after_backend_delete(self, cutoff, *, dry_run=False):
         deleted = await original_evict(self, cutoff, dry_run=dry_run)
@@ -661,22 +729,28 @@ async def test_cancellation_finishes_buffer_reconciliation_after_backend_evictio
         return deleted
 
     monkeypatch.setattr(SqliteStore, "evict_older_than", _pause_after_backend_delete)
-    eviction_task = asyncio.create_task(store.evict_older_than(cutoff))
-    await asyncio.wait_for(backend_delete_committed.wait(), timeout=1)
+    try:
+        eviction_task = asyncio.create_task(store.evict_older_than(cutoff))
+        await asyncio.wait_for(backend_delete_committed.wait(), timeout=1)
 
-    for _ in range(cancellation_count):
-        eviction_task.cancel()
-        await asyncio.sleep(0)
-    operation_finishing = not eviction_task.done()
-    release_backend_return.set()
+        for _ in range(cancellation_count):
+            eviction_task.cancel()
+            await asyncio.sleep(0)
+        operation_finishing = not eviction_task.done()
+        release_backend_return.set()
 
-    with pytest.raises(asyncio.CancelledError):
-        await eviction_task
+        with pytest.raises(asyncio.CancelledError):
+            await eviction_task
 
-    await store.flush()
-    assert operation_finishing
-    assert store._buffer == []
-    assert await store.count() == 0
+        await store.flush()
+        assert operation_finishing
+        assert store._buffer == []
+        assert await store.count() == 0
+    finally:
+        release_backend_return.set()
+        await _settle_tasks(eviction_task)
+        monkeypatch.setattr(SqliteStore, "evict_older_than", original_evict)
+        await store.close()
 
 
 async def test_cancellation_remains_primary_when_eviction_finishing_fails(sample_telegram, monkeypatch):
@@ -684,6 +758,7 @@ async def test_cancellation_remains_primary_when_eviction_finishing_fails(sample
     await store.initialize()
     eviction_started = asyncio.Event()
     release_failure = asyncio.Event()
+    eviction_task = None
 
     async def _fail_after_cancellation(self, cutoff, *, dry_run):
         eviction_started.set()
@@ -691,16 +766,21 @@ async def test_cancellation_remains_primary_when_eviction_finishing_fails(sample
         raise RuntimeError("eviction failed")
 
     monkeypatch.setattr(BufferedSqliteStore, "_evict_older_than", _fail_after_cancellation)
-    eviction_task = asyncio.create_task(store.evict_older_than(sample_telegram.timestamp))
-    await asyncio.wait_for(eviction_started.wait(), timeout=1)
-    eviction_task.cancel()
-    await asyncio.sleep(0)
-    release_failure.set()
+    try:
+        eviction_task = asyncio.create_task(store.evict_older_than(sample_telegram.timestamp))
+        await asyncio.wait_for(eviction_started.wait(), timeout=1)
+        eviction_task.cancel()
+        await asyncio.sleep(0)
+        release_failure.set()
 
-    with pytest.raises(asyncio.CancelledError) as cancelled:
-        await eviction_task
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await eviction_task
 
-    assert isinstance(cancelled.value.__cause__, RuntimeError)
+        assert isinstance(cancelled.value.__cause__, RuntimeError)
+    finally:
+        release_failure.set()
+        await _settle_tasks(eviction_task)
+        await store.close()
 
 
 async def test_buffered_memory_store_keeps_memory_retention_semantics(sample_telegram):
@@ -754,67 +834,73 @@ def test_properties():
 async def test_buffer_limit(sample_telegram):
     store = BufferedSqliteStore(":memory:", max_buffer_size=3)
     await store.initialize()
+    try:
+        # Store 4 telegrams
+        for i in range(4):
+            t = StoredTelegram(
+                timestamp=sample_telegram.timestamp,
+                source=f"1.1.{i}",
+                destination=sample_telegram.destination,
+                telegramtype=sample_telegram.telegramtype,
+                direction=sample_telegram.direction,
+            )
+            await store.store(t)
 
-    # Store 4 telegrams
-    for i in range(4):
-        t = StoredTelegram(
-            timestamp=sample_telegram.timestamp,
-            source=f"1.1.{i}",
-            destination=sample_telegram.destination,
-            telegramtype=sample_telegram.telegramtype,
-            direction=sample_telegram.direction,
-        )
-        await store.store(t)
-
-    # Buffer should be capped at 3, with the oldest (1.1.0) dropped
-    assert len(store._buffer) == 3
-    assert store._buffer[0].source == "1.1.1"
-    assert store._buffer[1].source == "1.1.2"
-    assert store._buffer[2].source == "1.1.3"
+        # Buffer should be capped at 3, with the oldest (1.1.0) dropped
+        assert len(store._buffer) == 3
+        assert store._buffer[0].source == "1.1.1"
+        assert store._buffer[1].source == "1.1.2"
+        assert store._buffer[2].source == "1.1.3"
+    finally:
+        await store.close()
 
 
 async def test_buffer_limit_failed_flush(sample_telegram, monkeypatch):
     store = BufferedSqliteStore(":memory:", max_buffer_size=3)
     await store.initialize()
+    original_store_many = store.store_many
 
     async def _fail(telegrams):
         raise RuntimeError("DB error")
 
     monkeypatch.setattr(store, "store_many", _fail)
+    try:
+        # Add 2 items, flush fails (they remain in buffer)
+        for i in range(2):
+            t = StoredTelegram(
+                timestamp=sample_telegram.timestamp,
+                source=f"1.1.{i}",
+                destination=sample_telegram.destination,
+                telegramtype=sample_telegram.telegramtype,
+                direction=sample_telegram.direction,
+            )
+            await store.store(t)
 
-    # Add 2 items, flush fails (they remain in buffer)
-    for i in range(2):
-        t = StoredTelegram(
-            timestamp=sample_telegram.timestamp,
-            source=f"1.1.{i}",
-            destination=sample_telegram.destination,
-            telegramtype=sample_telegram.telegramtype,
-            direction=sample_telegram.direction,
-        )
-        await store.store(t)
+        with pytest.raises(KnxTelegramStoreException, match="DB error"):
+            await store.flush()
+        assert len(store._buffer) == 2
 
-    with pytest.raises(KnxTelegramStoreException, match="DB error"):
-        await store.flush()
-    assert len(store._buffer) == 2
+        # Now add 2 more items
+        for i in range(2, 4):
+            t = StoredTelegram(
+                timestamp=sample_telegram.timestamp,
+                source=f"1.1.{i}",
+                destination=sample_telegram.destination,
+                telegramtype=sample_telegram.telegramtype,
+                direction=sample_telegram.direction,
+            )
+            await store.store(t)
 
-    # Now add 2 more items
-    for i in range(2, 4):
-        t = StoredTelegram(
-            timestamp=sample_telegram.timestamp,
-            source=f"1.1.{i}",
-            destination=sample_telegram.destination,
-            telegramtype=sample_telegram.telegramtype,
-            direction=sample_telegram.direction,
-        )
-        await store.store(t)
-
-    with pytest.raises(KnxTelegramStoreException, match="DB error"):
-        await store.flush()
-    # Should be capped at 3, with oldest ("1.1.0") dropped
-    assert len(store._buffer) == 3
-    assert store._buffer[0].source == "1.1.1"
-    assert store._buffer[1].source == "1.1.2"
-    assert store._buffer[2].source == "1.1.3"
+        with pytest.raises(KnxTelegramStoreException, match="DB error"):
+            await store.flush()
+        # Should be capped at 3, with oldest ("1.1.0") dropped
+        assert len(store._buffer) == 3
+        assert store._buffer[0].source == "1.1.1"
+        assert store._buffer[1].source == "1.1.2"
+        assert store._buffer[2].source == "1.1.3"
+    finally:
+        monkeypatch.setattr(store, "store_many", original_store_many)
+        await store.close()
 
 
 @pytest.mark.parametrize("operation", ["flush", "stop"])
