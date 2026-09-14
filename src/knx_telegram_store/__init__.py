@@ -1,3 +1,4 @@
+from importlib.util import find_spec
 from typing import Any
 
 from .backends.memory import MemoryStore
@@ -11,6 +12,11 @@ _SQL_BUFFERED_EXPORTS = {
     "BufferedPostgresStore",
     "BufferedSqliteStore",
 }
+
+try:
+    _SQLALCHEMY_AVAILABLE = find_spec("sqlalchemy") is not None
+except ModuleNotFoundError:
+    _SQLALCHEMY_AVAILABLE = False
 
 
 def __getattr__(name: str) -> Any:
@@ -34,3 +40,6 @@ __all__ = [
     "ConnectionCheckResult",
     "ConnectionErrorKind",
 ]
+
+if _SQLALCHEMY_AVAILABLE:
+    __all__.extend(sorted(_SQL_BUFFERED_EXPORTS))

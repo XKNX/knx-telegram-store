@@ -20,11 +20,11 @@ sys.meta_path.insert(0, BlockSQLAlchemy())
 """
 
 
-def _run_without_sqlalchemy(script: str) -> None:
+def _run_script(script: str) -> None:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(_PROJECT_ROOT / "src")
     result = subprocess.run(
-        [sys.executable, "-c", _BLOCK_SQLALCHEMY + script],
+        [sys.executable, "-c", script],
         cwd=_PROJECT_ROOT,
         env=env,
         capture_output=True,
@@ -32,6 +32,10 @@ def _run_without_sqlalchemy(script: str) -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def _run_without_sqlalchemy(script: str) -> None:
+    _run_script(_BLOCK_SQLALCHEMY + script)
 
 
 def test_base_imports_without_sqlalchemy() -> None:
@@ -60,6 +64,20 @@ assert MemoryStore.__name__ == "MemoryStore"
 assert BufferedMemoryStore.__name__ == "BufferedMemoryStore"
 assert "BufferedSqliteStore" not in globals()
 assert "BufferedPostgresStore" not in globals()
+"""
+    )
+
+
+def test_wildcard_import_with_sqlalchemy() -> None:
+    _run_script(
+        """
+
+from knx_telegram_store import *
+from knx_telegram_store import BufferedPostgresStore as ExplicitPostgresStore
+from knx_telegram_store import BufferedSqliteStore as ExplicitSqliteStore
+
+assert BufferedPostgresStore is ExplicitPostgresStore
+assert BufferedSqliteStore is ExplicitSqliteStore
 """
     )
 

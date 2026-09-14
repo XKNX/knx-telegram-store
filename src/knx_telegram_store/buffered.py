@@ -31,7 +31,7 @@ class _BufferMixin:
     - flush() atomically drains the buffer and delegates to store_many().
     - On flush failure the batch is re-prepended so no writes are lost.
     - query() accepts flush_first=True to guarantee read-your-writes consistency.
-    - clear() wipes both the in-memory buffer and the underlying table.
+    - clear() wipes both the in-memory buffer and the backing store.
     """
 
     def __init__(
