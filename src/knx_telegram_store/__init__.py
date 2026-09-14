@@ -1,6 +1,7 @@
 from typing import Any
 
 from .backends.memory import MemoryStore
+from .buffered import BufferedMemoryStore
 from .connection import ConnectionCheckResult, ConnectionErrorKind
 from .model import StoredTelegram
 from .query import TelegramQuery, TelegramQueryResult
@@ -13,14 +14,10 @@ _SQL_BUFFERED_EXPORTS = {
 
 
 def __getattr__(name: str) -> Any:
-    if name == "BufferedMemoryStore":
-        from .buffered_memory import BufferedMemoryStore
-
-        return BufferedMemoryStore
     if name in _SQL_BUFFERED_EXPORTS:
-        from . import buffered
+        from . import buffered_sql
 
-        return getattr(buffered, name)
+        return getattr(buffered_sql, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -32,8 +29,6 @@ __all__ = [
     "StoreStats",
     "TelegramStore",
     "MemoryStore",
-    "BufferedSqliteStore",
-    "BufferedPostgresStore",
     "BufferedMemoryStore",
     "KnxTelegramStoreException",
     "ConnectionCheckResult",

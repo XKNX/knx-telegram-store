@@ -8,8 +8,6 @@ from datetime import datetime
 from typing import Any
 
 from .backends.memory import MemoryStore
-from .backends.postgres import PostgresStore
-from .backends.sqlite import SqliteStore
 from .model import StoredTelegram
 from .query import TelegramQuery, TelegramQueryResult
 from .store import StoreStats, wrap_store_errors
@@ -275,24 +273,6 @@ class _BufferMixin:
                 await super().clear()  # type: ignore[misc]
 
 
-class BufferedSqliteStore(_BufferMixin, SqliteStore):
-    """SqliteStore with transparent write-buffering.
-
-    Args:
-        db_path: Path to the SQLite database file, or ``:memory:``.
-        retention_days: Optional retention period in days.
-        flush_interval: Seconds between automatic buffer flushes (default 1.0).
-    """
-
-
-class BufferedPostgresStore(_BufferMixin, PostgresStore):
-    """PostgresStore with transparent write-buffering.
-
-    Args:
-        dsn: PostgreSQL connection string.
-        retention_days: Optional retention period in days.
-        flush_interval: Seconds between automatic buffer flushes (default 1.0).
-    """
 class BufferedMemoryStore(_BufferMixin, MemoryStore):
     """MemoryStore with transparent write-buffering.
 
@@ -314,3 +294,17 @@ class BufferedMemoryStore(_BufferMixin, MemoryStore):
         """Keep the memory backend's max-size-only retention semantics."""
         async with self._mutation():
             return await MemoryStore.evict_older_than(self, cutoff, dry_run=dry_run)
+
+
+_SQL_BUFFERED_EXPORTS = {
+    "BufferedPostgresStore",
+    "BufferedSqliteStore",
+}
+
+
+def __getattr__(name: str) -> Any:
+    if name in _SQL_BUFFERED_EXPORTS:
+        from . import buffered_sql
+
+        return getattr(buffered_sql, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
