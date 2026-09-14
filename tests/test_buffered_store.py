@@ -65,6 +65,35 @@ async def test_periodic_flush(buffered_store, sample_telegram):
     await buffered_store.stop()
 
 
+async def test_periodic_flush_retries_after_failure(sample_telegram, monkeypatch):
+    store = BufferedMemoryStore(flush_interval=0.01)
+    await store.initialize()
+    original_store_many = store.store_many
+    retried = asyncio.Event()
+    call_count = 0
+
+    async def _fail_once(telegrams):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("DB error")
+        await original_store_many(telegrams)
+        retried.set()
+
+    monkeypatch.setattr(store, "store_many", _fail_once)
+    await store.store(sample_telegram)
+    store.start()
+
+    await asyncio.wait_for(retried.wait(), timeout=1)
+
+    assert call_count == 2
+    assert store._flush_task is not None
+    assert not store._flush_task.done()
+    assert store._buffer == []
+    assert await store.count() == 1
+    await store.stop()
+
+
 async def test_stop_flushes_remaining(buffered_store, sample_telegram):
     await buffered_store.store(sample_telegram)
     await buffered_store.stop()
