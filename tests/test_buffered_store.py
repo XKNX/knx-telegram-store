@@ -238,6 +238,43 @@ async def test_close_retries_failed_final_flush_before_closing(sample_telegram, 
     assert close_calls == 1
 
 
+async def test_close_waits_for_concurrent_store_many(sample_telegram, monkeypatch, tmp_path):
+    db_path = tmp_path / "telegrams.db"
+    store = BufferedSqliteStore(db_path, flush_interval=60)
+    await store.initialize()
+    original_store_many = SqliteStore.store_many
+    original_close = SqliteStore.close
+    backend_store_started = asyncio.Event()
+    release_store = asyncio.Event()
+    backend_close_started = asyncio.Event()
+
+    async def _pause_backend_store(self, telegrams):
+        backend_store_started.set()
+        await release_store.wait()
+        await original_store_many(self, telegrams)
+
+    async def _observe_backend_close(self):
+        backend_close_started.set()
+        await original_close(self)
+
+    monkeypatch.setattr(SqliteStore, "store_many", _pause_backend_store)
+    monkeypatch.setattr(SqliteStore, "close", _observe_backend_close)
+    store_task = asyncio.create_task(store.store_many([sample_telegram]))
+    await asyncio.wait_for(backend_store_started.wait(), timeout=1)
+    close_task = asyncio.create_task(store.close())
+    await asyncio.sleep(0)
+    close_started_before_store_finished = backend_close_started.is_set()
+    release_store.set()
+    await store_task
+    await close_task
+
+    assert not close_started_before_store_finished
+    reader = SqliteStore(db_path)
+    await reader.initialize()
+    assert await reader.count() == 1
+    await reader.close()
+
+
 async def test_flush_failure_then_recovery(buffered_store, sample_telegram, monkeypatch):
     call_count = 0
 

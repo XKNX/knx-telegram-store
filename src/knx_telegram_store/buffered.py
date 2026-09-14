@@ -73,7 +73,8 @@ class _BufferMixin:
             self._flush_task = None
 
         await self._flush(raise_on_error=True)
-        await super().close()  # type: ignore[misc]
+        async with self._store_lock:
+            await super().close()  # type: ignore[misc]
 
     @wrap_store_errors
     async def stop(self) -> None:
