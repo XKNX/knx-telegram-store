@@ -69,7 +69,7 @@ class _BufferMixin:
                 pass
             self._flush_task = None
 
-        await self._flush()
+        await self._flush(raise_on_error=True)
         await self.close()  # type: ignore[attr-defined]
 
     async def _flush_loop(self) -> None:
@@ -77,7 +77,7 @@ class _BufferMixin:
         while not self._closing:
             try:
                 await asyncio.sleep(self.flush_interval)
-                await self._flush()
+                await self._flush(raise_on_error=False)
             except asyncio.CancelledError:
                 break
             except Exception as err:
@@ -116,7 +116,7 @@ class _BufferMixin:
             self._buffer.pop(0)
         self._buffer.append(telegram)
 
-    async def _flush(self) -> None:
+    async def _flush(self, *, raise_on_error: bool) -> None:
         """Drain the buffer into the backing store (private implementation)."""
         async with self._flush_lock:
             if not self._buffer:
@@ -139,7 +139,7 @@ class _BufferMixin:
                         )
                         self._buffer_full_warned = True
                     self._buffer = self._buffer[-self.max_buffer_size :]
-                if not isinstance(err, Exception):
+                if not isinstance(err, Exception) or raise_on_error:
                     raise
                 _LOGGER.error("Error flushing telegram buffer: %s", err)
 
@@ -151,7 +151,7 @@ class _BufferMixin:
         flush_interval seconds from now, avoiding a near-immediate double-flush
         when flush() is called close to a scheduled tick.
         """
-        await self._flush()
+        await self._flush(raise_on_error=True)
         # Reset the periodic timer so the next auto-flush starts fresh
         if self._flush_task is not None and not self._closing:
             self._flush_task.cancel()

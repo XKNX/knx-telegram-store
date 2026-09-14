@@ -6,6 +6,7 @@ import pytest
 from knx_telegram_store import (
     BufferedMemoryStore,
     BufferedSqliteStore,
+    KnxTelegramStoreException,
     StoredTelegram,
     TelegramQuery,
 )
@@ -77,32 +78,83 @@ async def test_flush_failure_reprepends(buffered_store, sample_telegram, monkeyp
     async def _fail(telegrams):
         raise RuntimeError("DB error")
 
-    monkeypatch.setattr(type(buffered_store), "store_many", _fail)
+    monkeypatch.setattr(buffered_store, "store_many", _fail)
 
     await buffered_store.store(sample_telegram)
-    await buffered_store.flush()
+    with pytest.raises(KnxTelegramStoreException, match="DB error"):
+        await buffered_store.flush()
 
     # Buffer should still contain the telegram after failure
     assert len(buffered_store._buffer) == 1
     assert buffered_store._buffer[0] == sample_telegram
 
 
+async def test_explicit_flush_failure_raises_and_restores_buffer(buffered_store, sample_telegram, monkeypatch):
+    async def _fail(_telegrams):
+        raise RuntimeError("DB error")
+
+    monkeypatch.setattr(buffered_store, "store_many", _fail)
+    await buffered_store.store(sample_telegram)
+
+    with pytest.raises(KnxTelegramStoreException, match="Database error during flush: DB error"):
+        await buffered_store.flush()
+
+    assert buffered_store._buffer == [sample_telegram]
+
+
+async def test_query_flush_first_propagates_flush_failure(buffered_store, sample_telegram, monkeypatch):
+    async def _fail(_telegrams):
+        raise RuntimeError("DB error")
+
+    monkeypatch.setattr(buffered_store, "store_many", _fail)
+    await buffered_store.store(sample_telegram)
+
+    with pytest.raises(KnxTelegramStoreException, match="DB error"):
+        await buffered_store.query(TelegramQuery(), flush_first=True)
+
+    assert buffered_store._buffer == [sample_telegram]
+
+
+async def test_stop_propagates_final_flush_failure_without_closing(sample_telegram, monkeypatch):
+    store = BufferedMemoryStore()
+    await store.initialize()
+    closed = False
+
+    async def _fail(_telegrams):
+        raise RuntimeError("DB error")
+
+    async def _close():
+        nonlocal closed
+        closed = True
+
+    monkeypatch.setattr(store, "store_many", _fail)
+    monkeypatch.setattr(store, "close", _close)
+    await store.store(sample_telegram)
+
+    with pytest.raises(KnxTelegramStoreException, match="DB error"):
+        await store.stop()
+
+    assert store._buffer == [sample_telegram]
+    assert closed is False
+
+
 async def test_flush_failure_then_recovery(buffered_store, sample_telegram, monkeypatch):
     call_count = 0
 
-    original_store_many = type(buffered_store).store_many
+    original_store_many = buffered_store.store_many
 
-    async def _fail_once(self, telegrams):
+    async def _fail_once(telegrams):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
             raise RuntimeError("DB error")
-        await original_store_many(self, telegrams)
+        await original_store_many(telegrams)
 
-    monkeypatch.setattr(type(buffered_store), "store_many", _fail_once)
+    monkeypatch.setattr(buffered_store, "store_many", _fail_once)
 
     await buffered_store.store(sample_telegram)
-    await buffered_store.flush()
+    with pytest.raises(KnxTelegramStoreException, match="DB error"):
+        await buffered_store.flush()
     assert len(buffered_store._buffer) == 1
 
     await buffered_store.flush()
@@ -206,7 +258,7 @@ async def test_buffer_limit_failed_flush(sample_telegram, monkeypatch):
     async def _fail(telegrams):
         raise RuntimeError("DB error")
 
-    monkeypatch.setattr(type(store), "store_many", _fail)
+    monkeypatch.setattr(store, "store_many", _fail)
 
     # Add 2 items, flush fails (they remain in buffer)
     for i in range(2):
@@ -219,7 +271,8 @@ async def test_buffer_limit_failed_flush(sample_telegram, monkeypatch):
         )
         await store.store(t)
 
-    await store.flush()
+    with pytest.raises(KnxTelegramStoreException, match="DB error"):
+        await store.flush()
     assert len(store._buffer) == 2
 
     # Now add 2 more items
@@ -233,7 +286,8 @@ async def test_buffer_limit_failed_flush(sample_telegram, monkeypatch):
         )
         await store.store(t)
 
-    await store.flush()
+    with pytest.raises(KnxTelegramStoreException, match="DB error"):
+        await store.flush()
     # Should be capped at 3, with oldest ("1.1.0") dropped
     assert len(store._buffer) == 3
     assert store._buffer[0].source == "1.1.1"
