@@ -218,6 +218,8 @@ class _BufferMixin:
                     await asyncio.shield(task)
                 except asyncio.CancelledError:
                     continue
+                except BaseException:
+                    break
             try:
                 task.result()
             except BaseException as err:

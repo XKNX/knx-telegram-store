@@ -447,6 +447,30 @@ async def test_cancellation_finishes_buffer_reconciliation_after_backend_evictio
     assert await store.count() == 0
 
 
+async def test_cancellation_remains_primary_when_eviction_finishing_fails(sample_telegram, monkeypatch):
+    store = BufferedSqliteStore(":memory:", flush_interval=60)
+    await store.initialize()
+    eviction_started = asyncio.Event()
+    release_failure = asyncio.Event()
+
+    async def _fail_after_cancellation(self, cutoff, *, dry_run):
+        eviction_started.set()
+        await release_failure.wait()
+        raise RuntimeError("eviction failed")
+
+    monkeypatch.setattr(BufferedSqliteStore, "_evict_older_than", _fail_after_cancellation)
+    eviction_task = asyncio.create_task(store.evict_older_than(sample_telegram.timestamp))
+    await asyncio.wait_for(eviction_started.wait(), timeout=1)
+    eviction_task.cancel()
+    await asyncio.sleep(0)
+    release_failure.set()
+
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await eviction_task
+
+    assert isinstance(cancelled.value.__cause__, RuntimeError)
+
+
 async def test_buffered_memory_store_keeps_memory_retention_semantics(sample_telegram):
     cutoff = sample_telegram.timestamp + timedelta(seconds=1)
     store = BufferedMemoryStore(flush_interval=60)
