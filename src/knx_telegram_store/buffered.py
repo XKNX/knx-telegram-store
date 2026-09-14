@@ -231,32 +231,38 @@ class _BufferMixin:
     @wrap_store_errors
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
         """Evict matching persisted and buffered telegrams atomically on cancellation."""
-        task = asyncio.create_task(self._evict_older_than(cutoff, dry_run=dry_run))
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError as cancelled:
-            while not task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    continue
-                except BaseException:
-                    break
+        async with self._mutation():
+            task = asyncio.create_task(self._evict_older_than(cutoff, dry_run=dry_run))
             try:
-                task.result()
-            except BaseException as err:
-                raise cancelled from err
-            raise cancelled
+                return await asyncio.shield(task)
+            except asyncio.CancelledError as cancelled:
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        continue
+                    except BaseException:
+                        break
+                try:
+                    task.result()
+                except BaseException as err:
+                    raise cancelled from err
+                raise cancelled
 
     async def _evict_older_than(self, cutoff: datetime, *, dry_run: bool) -> int:
-        """Finish backend eviction and buffer reconciliation as one operation."""
+        """Reconcile eviction while the caller retains the mutation gate."""
+        async with self._flush_lock:
+            backend_deleted = await super().evict_older_than(cutoff, dry_run=dry_run)  # type: ignore[misc]
+            buffered_deleted = sum(telegram.timestamp < cutoff for telegram in self._buffer)
+            if not dry_run:
+                self._buffer[:] = [telegram for telegram in self._buffer if telegram.timestamp >= cutoff]
+            return backend_deleted + buffered_deleted
+
+    @wrap_store_errors
+    async def evict_expired(self, *, dry_run: bool = False) -> int:
+        """Apply backend retention within the store lifecycle, including no-ops."""
         async with self._mutation():
-            async with self._flush_lock:
-                backend_deleted = await super().evict_older_than(cutoff, dry_run=dry_run)  # type: ignore[misc]
-                buffered_deleted = sum(telegram.timestamp < cutoff for telegram in self._buffer)
-                if not dry_run:
-                    self._buffer[:] = [telegram for telegram in self._buffer if telegram.timestamp >= cutoff]
-                return backend_deleted + buffered_deleted
+            return await super().evict_expired(dry_run=dry_run)  # type: ignore[misc, no-any-return]
 
     # --- Clear overrride (wipe buffer + table) ---
 

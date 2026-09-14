@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -187,6 +188,25 @@ async def test_mutations_are_rejected_after_close(sample_telegram, operation):
 
     with pytest.raises(KnxTelegramStoreException, match="closing"):
         await _invoke_mutation(store, operation, sample_telegram)
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "sqlite_retention"])
+@pytest.mark.parametrize("dry_run", [False, True])
+async def test_evict_expired_is_rejected_after_close(backend, dry_run):
+    if backend == "memory":
+        store = BufferedMemoryStore(flush_interval=60)
+    else:
+        store = BufferedSqliteStore(
+            ":memory:", retention_days=1 if backend == "sqlite_retention" else None, flush_interval=60
+        )
+    await store.initialize()
+    try:
+        await store.close()
+
+        with pytest.raises(KnxTelegramStoreException, match="closing"):
+            await asyncio.wait_for(store.evict_expired(dry_run=dry_run), timeout=1)
+    finally:
+        await store.close()
 
 
 async def test_start_after_close_does_not_create_periodic_task():
@@ -607,7 +627,8 @@ async def test_evict_older_than_dry_run_counts_buffer_without_pruning(sample_tel
         await store.close()
 
 
-async def test_evict_expired_prunes_expired_buffered_telegrams(sample_telegram):
+@pytest.mark.parametrize("dry_run", [False, True])
+async def test_evict_expired_prunes_expired_buffered_telegrams(sample_telegram, dry_run):
     now = datetime.now(UTC)
     old = replace(sample_telegram, timestamp=now - timedelta(days=2), value="old")
     current = replace(sample_telegram, timestamp=now, source="1.1.2", value="current")
@@ -617,12 +638,12 @@ async def test_evict_expired_prunes_expired_buffered_telegrams(sample_telegram):
         await store.store(old)
         await store.store(current)
 
-        deleted = await store.evict_expired()
+        deleted = await asyncio.wait_for(store.evict_expired(dry_run=dry_run), timeout=1)
         await store.flush()
         result = await store.query(TelegramQuery())
 
         assert deleted == 1
-        assert [telegram.value for telegram in result.telegrams] == ["current"]
+        assert [telegram.value for telegram in result.telegrams] == (["current", "old"] if dry_run else ["current"])
     finally:
         await store.close()
 
@@ -702,6 +723,56 @@ async def test_eviction_serializes_with_concurrent_store_many(sample_telegram, m
         release_eviction.set()
         await _settle_tasks(eviction_task, store_task)
         monkeypatch.setattr(SqliteStore, "evict_older_than", original_evict)
+        monkeypatch.setattr(SqliteStore, "store_many", original_store_many)
+        await store.close()
+
+
+async def test_cancelled_eviction_waiting_for_admission_has_no_side_effects(sample_telegram, monkeypatch):
+    cutoff = sample_telegram.timestamp + timedelta(seconds=1)
+    persisted = replace(sample_telegram, value="persisted")
+    buffered = replace(sample_telegram, source="1.1.2", value="buffered")
+    store = BufferedSqliteStore(":memory:", flush_interval=60)
+    await store.initialize()
+    original_store_many = SqliteStore.store_many
+    original_mutation = store._mutation
+    holder_admitted = asyncio.Event()
+    release_holder = asyncio.Event()
+    eviction_queued = asyncio.Event()
+    holder_task = None
+    eviction_task = None
+
+    async def _hold_backend_write(self, telegrams):
+        holder_admitted.set()
+        await release_holder.wait()
+        await original_store_many(self, telegrams)
+
+    @asynccontextmanager
+    async def _observe_admission(**kwargs):
+        eviction_queued.set()
+        async with original_mutation(**kwargs):
+            yield
+
+    try:
+        await store.store_many([persisted])
+        await store.store(buffered)
+        monkeypatch.setattr(SqliteStore, "store_many", _hold_backend_write)
+        holder_task = asyncio.create_task(store.store_many([]))
+        await asyncio.wait_for(holder_admitted.wait(), timeout=1)
+        monkeypatch.setattr(store, "_mutation", _observe_admission)
+        eviction_task = asyncio.create_task(store.evict_older_than(cutoff))
+        await asyncio.wait_for(eviction_queued.wait(), timeout=1)
+
+        eviction_task.cancel()
+        release_holder.set()
+        await asyncio.wait_for(holder_task, timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(eviction_task, timeout=1)
+
+        assert (await store.count(), store._buffer) == (1, [buffered])
+    finally:
+        release_holder.set()
+        await _settle_tasks(holder_task, eviction_task)
+        monkeypatch.setattr(store, "_mutation", original_mutation)
         monkeypatch.setattr(SqliteStore, "store_many", original_store_many)
         await store.close()
 
