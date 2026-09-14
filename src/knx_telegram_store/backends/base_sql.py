@@ -31,6 +31,7 @@ from ..query import TelegramQuery, TelegramQueryResult
 from ..store import KnxTelegramStoreException, StoreCapabilities, StoreStats, TelegramStore, wrap_store_errors
 
 _LOGGER = logging.getLogger(__name__)
+_LAST_GA_RECONCILED_KEY = "last_ga_newest_reconciled"
 
 
 class BaseSQLStore(TelegramStore):
@@ -163,7 +164,7 @@ class BaseSQLStore(TelegramStore):
         # Subclasses should call this or implement their own with super().initialize()
         await self._lookup_cache.warm(self.engine, self.string_lookup)
         if not self._read_only:
-            await self._populate_last_ga_telegrams_if_empty()
+            await self._reconcile_last_ga_telegrams()
 
     @wrap_store_errors
     async def close(self) -> None:
@@ -587,59 +588,90 @@ class BaseSQLStore(TelegramStore):
             for row in rows
         ]
 
-    async def _populate_last_ga_telegrams_if_empty(self) -> None:
-        """Populate the last_ga_telegrams table from telegrams if it is empty."""
+    async def _reconcile_last_ga_telegrams(self) -> None:
+        """Populate missing summaries and repair stale rows once after upgrading."""
         async with self.engine.begin() as conn:
             count = await conn.scalar(select(func.count()).select_from(self.last_ga_telegrams))
-            if count == 0:
-                t2 = self.telegrams.alias("t2")
-                subq = (
-                    select(
-                        t2.c.destination_id,
-                        func.max(t2.c.timestamp).label("max_ts"),
-                    )
-                    .group_by(t2.c.destination_id)
-                    .subquery()
+            reconciled = (
+                await conn.scalar(
+                    select(self.store_metadata.c.value).where(self.store_metadata.c.key == _LAST_GA_RECONCILED_KEY)
                 )
+                == "true"
+            )
+            if count and reconciled:
+                return
 
-                select_stmt = select(
-                    self.telegrams.c.destination_id,
-                    self.telegrams.c.timestamp,
-                    self.telegrams.c.source_id,
-                    self.telegrams.c.telegramtype_id,
-                    self.telegrams.c.direction_id,
-                    self.telegrams.c.source_name_id,
-                    self.telegrams.c.destination_name_id,
-                    self.telegrams.c.payload,
-                    self.telegrams.c.dpt_main,
-                    self.telegrams.c.dpt_sub,
-                    self.telegrams.c.value,
-                    self.telegrams.c.value_numeric,
-                    self.telegrams.c.raw_data,
-                    self.telegrams.c.data_secure,
-                ).join(
-                    subq,
-                    and_(
-                        self.telegrams.c.destination_id == subq.c.destination_id,
-                        self.telegrams.c.timestamp == subq.c.max_ts,
-                    ),
+            if count:
+                newer_telegram = (
+                    select(1)
+                    .where(
+                        self.telegrams.c.destination_id == self.last_ga_telegrams.c.destination_id,
+                        self.telegrams.c.timestamp > self.last_ga_telegrams.c.timestamp,
+                    )
+                    .correlate(self.last_ga_telegrams)
+                    .exists()
                 )
+                await conn.execute(self.last_ga_telegrams.delete().where(newer_telegram))
 
-                if self.engine.dialect.name == "sqlite":
-                    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+            t2 = self.telegrams.alias("t2")
+            subq = (
+                select(
+                    t2.c.destination_id,
+                    func.max(t2.c.timestamp).label("max_ts"),
+                )
+                .group_by(t2.c.destination_id)
+                .subquery()
+            )
 
-                    sqlite_stmt = (
-                        sqlite_insert(self.last_ga_telegrams)
-                        .from_select([c.name for c in select_stmt.selected_columns], select_stmt)
-                        .on_conflict_do_nothing()
+            select_stmt = select(
+                self.telegrams.c.destination_id,
+                self.telegrams.c.timestamp,
+                self.telegrams.c.source_id,
+                self.telegrams.c.telegramtype_id,
+                self.telegrams.c.direction_id,
+                self.telegrams.c.source_name_id,
+                self.telegrams.c.destination_name_id,
+                self.telegrams.c.payload,
+                self.telegrams.c.dpt_main,
+                self.telegrams.c.dpt_sub,
+                self.telegrams.c.value,
+                self.telegrams.c.value_numeric,
+                self.telegrams.c.raw_data,
+                self.telegrams.c.data_secure,
+            ).join(
+                subq,
+                and_(
+                    self.telegrams.c.destination_id == subq.c.destination_id,
+                    self.telegrams.c.timestamp == subq.c.max_ts,
+                ),
+            )
+
+            summary_insert: Any
+            metadata_upsert: Any
+            if self.engine.dialect.name == "sqlite":
+                from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+                summary_insert = (
+                    sqlite_insert(self.last_ga_telegrams)
+                    .from_select([c.name for c in select_stmt.selected_columns], select_stmt)
+                    .on_conflict_do_nothing()
+                )
+                metadata_upsert = sqlite_insert(self.store_metadata).values(key=_LAST_GA_RECONCILED_KEY, value="true")
+            else:
+                from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                summary_insert = (
+                    pg_insert(self.last_ga_telegrams)
+                    .from_select([c.name for c in select_stmt.selected_columns], select_stmt)
+                    .on_conflict_do_nothing()
+                )
+                metadata_upsert = pg_insert(self.store_metadata).values(key=_LAST_GA_RECONCILED_KEY, value="true")
+
+            await conn.execute(summary_insert)
+            if not reconciled:
+                await conn.execute(
+                    metadata_upsert.on_conflict_do_update(
+                        index_elements=["key"],
+                        set_={"value": "true"},
                     )
-                    await conn.execute(sqlite_stmt)
-                else:
-                    from sqlalchemy.dialects.postgresql import insert as pg_insert
-
-                    pg_stmt = (
-                        pg_insert(self.last_ga_telegrams)
-                        .from_select([c.name for c in select_stmt.selected_columns], select_stmt)
-                        .on_conflict_do_nothing()
-                    )
-                    await conn.execute(pg_stmt)
+                )

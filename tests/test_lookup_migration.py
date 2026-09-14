@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -17,7 +18,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from knx_telegram_store import TelegramQuery
+from knx_telegram_store import StoredTelegram, TelegramQuery
 from knx_telegram_store.backends.sqlite import SqliteStore
 
 
@@ -268,3 +269,41 @@ async def test_nulls_recovered_flag_skips_probe_scan(tmp_path):
     assert float(recovered) == 20.0
 
     await store.close()
+
+
+async def test_initialize_reconciles_stale_last_ga_summary(tmp_path):
+    """An upgrade repairs summaries written by the old unconditional upsert."""
+    db_path = tmp_path / "telegrams.db"
+    store = SqliteStore(db_path)
+    await store.initialize()
+
+    newest = StoredTelegram(
+        timestamp=datetime(2026, 9, 14, 12, tzinfo=UTC),
+        source="1.1.1",
+        destination="1/1/1",
+        telegramtype="GroupValueWrite",
+        direction="Incoming",
+        value="newest",
+    )
+    older = replace(newest, timestamp=newest.timestamp - timedelta(days=1), value="older")
+    await store.store_many([newest, older])
+
+    columns = [column.name for column in store.last_ga_telegrams.columns]
+    older_row = select(*(store.telegrams.c[name] for name in columns)).where(
+        store.telegrams.c.timestamp == older.timestamp
+    )
+    async with store.engine.begin() as conn:
+        await conn.execute(store.last_ga_telegrams.delete())
+        await conn.execute(store.last_ga_telegrams.insert().from_select(columns, older_row))
+        await conn.execute(
+            store.store_metadata.delete().where(store.store_metadata.c.key == "last_ga_newest_reconciled")
+        )
+    await store.close()
+
+    upgraded = SqliteStore(db_path)
+    try:
+        await upgraded.initialize()
+        [last] = await upgraded.get_last_unique_telegrams()
+        assert last.value == "newest"
+    finally:
+        await upgraded.close()
