@@ -302,6 +302,23 @@ async def test_last_unique_telegrams(store):
     assert by_destination["4/5/6"].value_numeric == 3.0
 
 
+async def test_last_unique_telegrams_ignores_older_and_equal_writes(store):
+    _, pg_store = store
+    timestamp = datetime(2026, 9, 14, 12, tzinfo=UTC)
+    newest = make_telegram(timestamp, value=30.0)
+    older = make_telegram(timestamp - timedelta(days=1), value=10.0)
+    equal = make_telegram(timestamp, value=40.0)
+
+    await pg_store.store(newest)
+    await pg_store.store(older)
+    result = await pg_store.get_last_unique_telegrams()
+    assert result[0].value_numeric == 30.0
+
+    await pg_store.store(equal)
+    result = await pg_store.get_last_unique_telegrams()
+    assert result[0].value_numeric == 30.0
+
+
 # --- Stats ---------------------------------------------------------------------
 
 

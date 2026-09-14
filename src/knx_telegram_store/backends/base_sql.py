@@ -239,6 +239,7 @@ class BaseSQLStore(TelegramStore):
                     sqlite_upsert = sqlite_stmt.on_conflict_do_update(
                         index_elements=["destination_id"],
                         set_={col: sqlite_stmt.excluded[col] for col in upsert_values[0] if col != "destination_id"},
+                        where=sqlite_stmt.excluded.timestamp > self.last_ga_telegrams.c.timestamp,
                     )
                     await conn.execute(sqlite_upsert)
                 else:
@@ -248,6 +249,7 @@ class BaseSQLStore(TelegramStore):
                     pg_upsert = pg_stmt.on_conflict_do_update(
                         index_elements=["destination_id"],
                         set_={col: pg_stmt.excluded[col] for col in upsert_values[0] if col != "destination_id"},
+                        where=pg_stmt.excluded.timestamp > self.last_ga_telegrams.c.timestamp,
                     )
                     await conn.execute(pg_upsert)
 
