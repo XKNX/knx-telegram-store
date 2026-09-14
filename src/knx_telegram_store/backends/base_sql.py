@@ -615,19 +615,39 @@ class BaseSQLStore(TelegramStore):
                 await conn.execute(self.last_ga_telegrams.delete().where(newer_telegram))
 
             summary_columns = [column.name for column in self.last_ga_telegrams.columns]
+            latest_timestamps = (
+                select(
+                    self.telegrams.c.destination_id,
+                    func.max(self.telegrams.c.timestamp).label("max_timestamp"),
+                )
+                .group_by(self.telegrams.c.destination_id)
+                .subquery()
+            )
+            candidates = (
+                select(*(self.telegrams.c[name] for name in summary_columns))
+                .join(
+                    latest_timestamps,
+                    and_(
+                        self.telegrams.c.destination_id == latest_timestamps.c.destination_id,
+                        self.telegrams.c.timestamp == latest_timestamps.c.max_timestamp,
+                    ),
+                )
+                .subquery()
+            )
             tie_breaker = [
-                cast(self.telegrams.c[name], Text).asc().nulls_first()
+                cast(candidates.c[name], Text).asc().nulls_first()
                 for name in summary_columns
                 if name not in {"destination_id", "timestamp"}
             ]
             # Legacy rows have no insertion identity. Existing max-timestamp
-            # summaries survive above; missing ones use a stable fallback.
+            # summaries survive above; only tied latest candidates are ranked
+            # to choose a stable fallback for missing summaries.
             ranked = select(
-                *(self.telegrams.c[name] for name in summary_columns),
+                *(candidates.c[name] for name in summary_columns),
                 func.row_number()
                 .over(
-                    partition_by=self.telegrams.c.destination_id,
-                    order_by=[self.telegrams.c.timestamp.desc(), *tie_breaker],
+                    partition_by=candidates.c.destination_id,
+                    order_by=tie_breaker,
                 )
                 .label("candidate_rank"),
             ).subquery()

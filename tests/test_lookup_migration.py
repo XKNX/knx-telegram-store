@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    event,
     insert,
     select,
 )
@@ -20,6 +21,26 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from knx_telegram_store import StoredTelegram, TelegramQuery
 from knx_telegram_store.backends.sqlite import SqliteStore
+
+
+async def test_reconciliation_prefilters_latest_candidates_before_tie_ranking(tmp_path):
+    """Canonical tie ranking must not sort the complete telegram history."""
+    store = SqliteStore(tmp_path / "telegrams.db")
+    statements: list[str] = []
+
+    def capture_statement(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(" ".join(statement.lower().split()))
+
+    event.listen(store.engine.sync_engine, "before_cursor_execute", capture_statement)
+    try:
+        await store.initialize()
+    finally:
+        event.remove(store.engine.sync_engine, "before_cursor_execute", capture_statement)
+        await store.close()
+
+    [ranking_statement] = [statement for statement in statements if "row_number()" in statement]
+    assert "max(telegrams.timestamp)" in ranking_statement
+    assert "group by telegrams.destination_id" in ranking_statement
 
 
 @pytest.fixture
