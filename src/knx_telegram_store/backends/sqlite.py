@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import quote
 
-from sqlalchemy import inspect, text
+from sqlalchemy import URL, inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from ..connection import (
@@ -38,15 +39,20 @@ class SqliteStore(BaseSQLStore):
         if self._is_memory:
             if read_only:
                 raise ValueError("read_only is not supported for in-memory databases")
-            url = "sqlite+aiosqlite:///:memory:"
+            url = URL.create("sqlite+aiosqlite", database=":memory:")
         else:
             path = Path(db_path)
             if read_only:
-                url = f"sqlite+aiosqlite:///file:{path}?mode=ro&uri=true"
+                encoded_path = quote(str(path), safe="/:")
+                url = URL.create(
+                    "sqlite+aiosqlite",
+                    database=f"file:{encoded_path}",
+                    query={"mode": "ro", "uri": "true"},
+                )
             else:
                 # Ensure parent directory exists
                 path.parent.mkdir(parents=True, exist_ok=True)
-                url = f"sqlite+aiosqlite:///{path}"
+                url = URL.create("sqlite+aiosqlite", database=str(path))
 
         # timeout is sqlite's busy timeout: with a concurrent writer (WAL or
         # rollback journal) readers wait instead of failing with SQLITE_BUSY.

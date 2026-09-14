@@ -30,6 +30,26 @@ async def writer_db(tmp_path):
     await writer.close()
 
 
+@pytest.mark.parametrize("url_character", ["?", "#"])
+async def test_sqlite_paths_with_url_characters_are_literal(tmp_path, url_character):
+    db_path = tmp_path / f"tele{url_character}grams.db"
+    writer = SqliteStore(db_path)
+    await writer.initialize()
+    try:
+        await writer.store(make_telegram(0))
+    finally:
+        await writer.close()
+
+    assert db_path.is_file()
+
+    reader = SqliteStore(db_path, read_only=True)
+    await reader.initialize()
+    try:
+        assert await reader.count() == 1
+    finally:
+        await reader.close()
+
+
 async def test_writer_enables_wal(writer_db):
     db_path, writer = writer_db
     async with writer.engine.connect() as conn:
