@@ -24,8 +24,8 @@ class _BufferMixin:
         class BufferedSqliteStore(_BufferMixin, SqliteStore): ...
 
     The mixin intercepts store() / store_sync() and accumulates telegrams in an
-    in-memory list.  A periodic background task (start/stop) drains the buffer
-    by calling self.store_many(), which resolves to the SQL backend via MRO.
+    in-memory list. A periodic background task drains the buffer through the
+    public store_many() dispatch under the lifecycle locks.
 
     Behaviour:
     - store() / store_sync() are O(1) and never touch the database.
@@ -46,6 +46,7 @@ class _BufferMixin:
         self._buffer: list[StoredTelegram] = []
         self._flush_lock = asyncio.Lock()
         self._store_lock = asyncio.Lock()
+        self._buffer_flush_task: asyncio.Task[Any] | None = None
         self._flush_task: asyncio.Task[None] | None = None
         self._closing = False
         self.flush_interval = flush_interval
@@ -129,6 +130,9 @@ class _BufferMixin:
     async def store_many(self, telegrams: Sequence[StoredTelegram]) -> None:
         """Write a batch while excluding lifecycle operations."""
         async with self._store_lock:
+            if self._closing and asyncio.current_task() is not self._buffer_flush_task:
+                _LOGGER.warning("Store is closing, dropping %d telegrams", len(telegrams))
+                return
             await super().store_many(telegrams)  # type: ignore[misc]
 
     async def _flush(self, *, raise_on_error: bool) -> None:
@@ -140,6 +144,7 @@ class _BufferMixin:
             batch = self._buffer.copy()
             self._buffer.clear()
 
+            self._buffer_flush_task = asyncio.current_task()
             try:
                 await self.store_many(batch)
                 self._buffer_full_warned = False
@@ -157,6 +162,8 @@ class _BufferMixin:
                 if not isinstance(err, Exception) or raise_on_error:
                     raise
                 _LOGGER.error("Error flushing telegram buffer: %s", err)
+            finally:
+                self._buffer_flush_task = None
 
     @wrap_store_errors
     async def flush(self) -> None:

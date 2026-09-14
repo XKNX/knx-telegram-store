@@ -275,6 +275,26 @@ async def test_close_waits_for_concurrent_store_many(sample_telegram, monkeypatc
     await reader.close()
 
 
+async def test_close_drops_store_many_queued_during_shutdown(sample_telegram, tmp_path):
+    db_path = tmp_path / "telegrams.db"
+    store = BufferedSqliteStore(db_path, flush_interval=60)
+    await store.initialize()
+    await store._store_lock.acquire()
+    close_task = asyncio.create_task(store.close())
+    await asyncio.sleep(0)
+    queued_store_task = asyncio.create_task(store.store_many([sample_telegram]))
+    await asyncio.sleep(0)
+    store._store_lock.release()
+
+    await close_task
+    await queued_store_task
+
+    reader = SqliteStore(db_path)
+    await reader.initialize()
+    assert await reader.count() == 0
+    await reader.close()
+
+
 async def test_flush_failure_then_recovery(buffered_store, sample_telegram, monkeypatch):
     call_count = 0
 
