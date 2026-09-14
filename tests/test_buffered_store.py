@@ -407,7 +407,10 @@ async def test_eviction_serializes_with_concurrent_store_many(sample_telegram, m
     assert await store.count() == 1
 
 
-async def test_cancellation_finishes_buffer_reconciliation_after_backend_eviction(sample_telegram, monkeypatch):
+@pytest.mark.parametrize("cancellation_count", [1, 2])
+async def test_cancellation_finishes_buffer_reconciliation_after_backend_eviction(
+    sample_telegram, monkeypatch, cancellation_count
+):
     cutoff = sample_telegram.timestamp + timedelta(seconds=1)
     persisted = replace(sample_telegram, source="1.1.2", value="persisted")
     buffered = replace(sample_telegram, source="1.1.3", value="buffered")
@@ -429,8 +432,9 @@ async def test_cancellation_finishes_buffer_reconciliation_after_backend_evictio
     eviction_task = asyncio.create_task(store.evict_older_than(cutoff))
     await asyncio.wait_for(backend_delete_committed.wait(), timeout=1)
 
-    eviction_task.cancel()
-    await asyncio.sleep(0)
+    for _ in range(cancellation_count):
+        eviction_task.cancel()
+        await asyncio.sleep(0)
     operation_finishing = not eviction_task.done()
     release_backend_return.set()
 

@@ -212,9 +212,17 @@ class _BufferMixin:
         task = asyncio.create_task(self._evict_older_than(cutoff, dry_run=dry_run))
         try:
             return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            await task
-            raise
+        except asyncio.CancelledError as cancelled:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+            try:
+                task.result()
+            except BaseException as err:
+                raise cancelled from err
+            raise cancelled
 
     async def _evict_older_than(self, cutoff: datetime, *, dry_run: bool) -> int:
         """Finish backend eviction and buffer reconciliation as one operation."""
