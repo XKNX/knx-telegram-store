@@ -11,6 +11,7 @@ from knx_telegram_store import (
     TelegramQuery,
 )
 from knx_telegram_store.backends.memory import MemoryStore
+from knx_telegram_store.backends.sqlite import SqliteStore
 
 
 @pytest.fixture
@@ -113,6 +114,22 @@ async def test_close_flushes_pending_telegrams(sample_telegram):
 
     assert store._buffer == []
     assert await store.count() == 1
+
+
+async def test_close_persists_pending_telegrams_to_file(tmp_path, sample_telegram):
+    db_path = tmp_path / "telegrams.db"
+    store = BufferedSqliteStore(db_path, flush_interval=60)
+    await store.initialize()
+    await store.store(sample_telegram)
+
+    await store.close()
+
+    reader = SqliteStore(db_path, read_only=True)
+    await reader.initialize()
+    try:
+        assert await reader.count() == 1
+    finally:
+        await reader.close()
 
 
 async def test_close_stops_periodic_task_and_is_idempotent(sample_telegram):
