@@ -10,6 +10,9 @@ jobs:
   lint-and-test:
     name: Lint and Test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v7
 
@@ -43,14 +46,21 @@ jobs:
           python -m pytest --cov=knx_telegram_store --cov-report=xml tests/
 
       - name: Upload coverage to Codecov
+        if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v7
         with:
-          fail_ci_if_error: true
+          files: ./coverage.xml
+          flags: unit
+          # Fork PRs receive no secrets, so a failed upload must not fail the build.
+          fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
   integration:
     name: Integration Tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     services:
       timescaledb:
         image: timescale/timescaledb:latest-pg17
@@ -99,4 +109,13 @@ jobs:
           KNX_TEST_PG_DSN: postgresql://knx:knxtest@localhost:5434/knx
         run: |
           export PYTHONPATH=src
-          python -m pytest -m integration tests/integration -v
+          python -m pytest -m integration --cov=knx_telegram_store --cov-report=xml tests/integration -v
+
+      - name: Upload coverage to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v7
+        with:
+          files: ./coverage.xml
+          flags: integration
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
