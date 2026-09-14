@@ -1,9 +1,15 @@
 import io
+import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
 
 import pytest
 
-from knx_telegram_store.formats import RawTelegramRecord, iter_communication_log, write_communication_log
+from knx_telegram_store.formats import (
+    RawTelegramRecord,
+    format_telegram_element,
+    iter_communication_log,
+    write_communication_log,
+)
 
 ETS6_SAMPLE = """<?xml version="1.0" encoding="utf-8"?>
 <CommunicationLog xmlns="http://knx.org/xml/telegrams/01">
@@ -61,6 +67,20 @@ def test_write_round_trip():
     assert "ConnectionName='My \"Log\"'" in text
     reparsed = list(iter_communication_log(io.BytesIO(text.encode())))
     assert reparsed == records
+
+
+def test_write_escapes_service_and_frame_format_attributes():
+    record = RawTelegramRecord(
+        timestamp=datetime(2026, 9, 14, tzinfo=UTC),
+        service='L_Data&"ind',
+        frame_format='Common<"Emi',
+        raw_data=b"\x01",
+    )
+
+    element = ET.fromstring(format_telegram_element(record))
+
+    assert element.attrib["Service"] == record.service
+    assert element.attrib["FrameFormat"] == record.frame_format
 
 
 def test_write_empty_log_is_valid():
