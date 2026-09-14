@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import datetime
 from urllib.parse import unquote
 
-from sqlalchemy import String, bindparam, inspect, text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
@@ -604,103 +604,32 @@ class PostgresStore(BaseSQLStore):
         ).scalar()
         if already_unwrapped == "true":
             return
-        try:
-            # Postgres supports casting JSONB to text, so we can cast value::text or payload::text
-            rows = connection.execute(
-                text(
-                    "SELECT tableoid::bigint, ctid::text, value::text, payload::text FROM telegrams "
-                    "WHERE (value::text LIKE '{\"value\":%' AND value IS NOT NULL) "
-                    "OR (payload::text LIKE '{\"value\":%' AND payload IS NOT NULL)"
-                )
-            ).fetchall()
-
-            if rows:
-                import json
-
-                _lift_decompression_limit()
-                for row in rows:
-                    table_oid = row[0]
-                    row_ctid = row[1]
-                    val_str = row[2]
-                    pay_str = row[3]
-
-                    new_val = None
-                    new_pay = None
-                    needs_update = False
-
-                    def unwrap(s):
-                        if s is None:
-                            return None, False
-                        try:
-                            if isinstance(s, dict):
-                                d = s
-                            else:
-                                d = json.loads(s)
-                            if isinstance(d, dict) and "value" in d and len(d) == 1:
-                                return d["value"], True
-                        except Exception:
-                            pass
-                        return s, False
-
-                    if val_str is not None:
-                        unwrapped_val, unwrapped = unwrap(val_str)
-                        if unwrapped:
-                            new_val = unwrapped_val
-                            needs_update = True
-                        else:
-                            new_val = val_str
-
-                    if pay_str is not None:
-                        unwrapped_pay, unwrapped = unwrap(pay_str)
-                        if unwrapped:
-                            new_pay = unwrapped_pay
-                            needs_update = True
-                        else:
-                            new_pay = pay_str
-
-                    if needs_update:
-
-                        def to_json_str(orig_val, new_val_unwrapped, did_unwrap):
-                            if did_unwrap:
-                                return json.dumps(new_val_unwrapped)
-                            if orig_val is None:
-                                return None
-                            if isinstance(orig_val, dict | list | int | float | bool):
-                                return json.dumps(orig_val)
-                            try:
-                                json.loads(orig_val)
-                                return orig_val
-                            except Exception:
-                                return json.dumps(orig_val)
-
-                        json_val = to_json_str(val_str, new_val, val_str != new_val)
-                        json_pay = to_json_str(pay_str, new_pay, pay_str != new_pay)
-
-                        result = connection.execute(
-                            text(
-                                "UPDATE telegrams SET value = :value, payload = :payload "
-                                "WHERE tableoid = CAST(:table_oid AS oid) "
-                                "AND ctid = CAST(:row_ctid AS tid)"
-                            ).bindparams(bindparam("row_ctid", type_=String)),
-                            {
-                                "value": json_val,
-                                "payload": json_pay,
-                                "table_oid": table_oid,
-                                "row_ctid": row_ctid,
-                            },
-                        )
-                        if result.rowcount != 1:
-                            raise RuntimeError("Legacy telegram row changed during data unwrapping")
-
-            # Record successful migration state in store_metadata
+        wrapped = (
+            "value::jsonb = jsonb_build_object('value', value::jsonb -> 'value') "
+            "OR payload::jsonb = jsonb_build_object('value', payload::jsonb -> 'value')"
+        )
+        if _pending(wrapped):
+            _lift_decompression_limit()
             connection.execute(
                 text(
-                    "INSERT INTO store_metadata (key, value) VALUES ('data_unwrapped', 'true') "
-                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+                    "UPDATE telegrams SET "
+                    "value = CASE WHEN value::jsonb = jsonb_build_object('value', value::jsonb -> 'value') "
+                    "THEN value::jsonb -> 'value' ELSE value::jsonb END, "
+                    "payload = CASE WHEN payload::jsonb = jsonb_build_object('value', payload::jsonb -> 'value') "
+                    "THEN payload::jsonb -> 'value' ELSE payload::jsonb END "
+                    f"WHERE {wrapped}"
                 )
             )
-        except Exception:
-            pass
+            if _pending(wrapped):
+                raise RuntimeError("Legacy telegram data unwrapping left wrapped rows")
+
+        # Record successful migration state in store_metadata
+        connection.execute(
+            text(
+                "INSERT INTO store_metadata (key, value) VALUES ('data_unwrapped', 'true') "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+            )
+        )
 
     def _needs_migration_sync(self, connection) -> bool:
         """Synchronously check if legacy Postgres schema migration is required."""

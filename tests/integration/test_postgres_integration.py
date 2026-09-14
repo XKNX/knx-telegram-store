@@ -391,8 +391,64 @@ async def test_legacy_unwrap_preserves_duplicate_natural_keys(store):
     assert sorted(telegram.value for telegram in result.telegrams) == [1.0, 2.0]
 
 
+async def test_legacy_unwrap_preserves_duplicates_in_compressed_chunk(timescale_dsn):
+    store = PostgresStore(timescale_dsn)
+    await store.initialize()
+    timestamp = datetime(2026, 7, 1, 12, tzinfo=UTC)
+    try:
+        await store.store_many(
+            [
+                make_telegram(timestamp, value=1.0),
+                make_telegram(timestamp, value=2.0),
+                make_telegram(timestamp, 1, value=3.0),
+            ]
+        )
+        async with store.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE telegrams "
+                    "SET value = jsonb_build_object('value', value), "
+                    "payload = jsonb_build_object('value', payload) "
+                    "WHERE timestamp = :timestamp"
+                ),
+                {"timestamp": timestamp},
+            )
+            await conn.execute(
+                text(
+                    "UPDATE telegrams SET value = jsonb_build_object('value', value, 'unit', 'C') "
+                    "WHERE timestamp > :timestamp"
+                ),
+                {"timestamp": timestamp},
+            )
+            await conn.execute(text("DELETE FROM store_metadata WHERE key = 'data_unwrapped'"))
+            await conn.execute(
+                text("SELECT compress_chunk(c, if_not_compressed => TRUE) FROM show_chunks('telegrams') c")
+            )
+            assert (
+                await conn.scalar(
+                    text(
+                        "SELECT count(*) FROM timescaledb_information.chunks "
+                        "WHERE hypertable_name = 'telegrams' AND is_compressed"
+                    )
+                )
+                >= 1
+            )
+
+        await store.initialize()
+        result = await store.query(TelegramQuery())
+
+        assert sorted(telegram.value for telegram in result.telegrams if isinstance(telegram.value, float)) == [
+            1.0,
+            2.0,
+        ]
+        assert {"value": 3.0, "unit": "C"} in [telegram.value for telegram in result.telegrams]
+        assert all(telegram.payload == [12, 154] for telegram in result.telegrams)
+    finally:
+        await store.close()
+
+
 async def test_legacy_unwrap_survives_concurrent_row_update(store):
-    _, pg_store = store
+    backend_name, pg_store = store
     await pg_store.store(make_telegram(datetime.now(UTC), value=1.0))
 
     async with pg_store.engine.begin() as conn:
@@ -408,19 +464,24 @@ async def test_legacy_unwrap_survives_concurrent_row_update(store):
     metadata_transaction = await metadata_connection.begin()
     row_transaction = None
     backfill_task = None
+    backfill_error = None
     try:
         await metadata_connection.execute(
             text("INSERT INTO store_metadata (key, value) VALUES ('nulls_recovered', 'pending')")
         )
 
         async def _run_backfill() -> None:
-            async with backfill_connection.begin():
-                await backfill_connection.run_sync(
-                    lambda sync_conn: pg_store._backfill_legacy_data(
-                        sync_conn,
-                        timescale=pg_store.timescale_enabled is True,
+            nonlocal backfill_error
+            try:
+                async with backfill_connection.begin():
+                    await backfill_connection.run_sync(
+                        lambda sync_conn: pg_store._backfill_legacy_data(
+                            sync_conn,
+                            timescale=pg_store.timescale_enabled is True,
+                        )
                     )
-                )
+            except RuntimeError as err:
+                backfill_error = err
 
         backfill_task = asyncio.create_task(_run_backfill())
 
@@ -469,13 +530,16 @@ async def test_legacy_unwrap_survives_concurrent_row_update(store):
         await row_connection.close()
         await backfill_connection.close()
 
-    result = await pg_store.query(TelegramQuery())
-    assert [telegram.value for telegram in result.telegrams] == [{"value": 1.0}]
+    if backend_name == "timescale":
+        assert str(backfill_error) == "Legacy telegram data unwrapping left wrapped rows"
+        result = await pg_store.query(TelegramQuery())
+        assert [telegram.value for telegram in result.telegrams] == [{"value": 1.0}]
+        async with pg_store.engine.connect() as conn:
+            assert await conn.scalar(text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")) is None
+        await pg_store.initialize()
+    else:
+        assert backfill_error is None
 
-    async with pg_store.engine.connect() as conn:
-        assert await conn.scalar(text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")) is None
-
-    await pg_store.initialize()
     result = await pg_store.query(TelegramQuery())
     assert [telegram.value for telegram in result.telegrams] == [1.0]
     async with pg_store.engine.connect() as conn:
