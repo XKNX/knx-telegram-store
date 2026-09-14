@@ -312,6 +312,30 @@ async def test_roundtrip_time_range_pagination_ordering(store):
     assert await pg_store.count() == 50
 
 
+async def test_oversized_notify_payload_does_not_abort_batch(store):
+    _, pg_store = store
+    timestamp = datetime.now(UTC)
+    oversized_value = "x" * 9000
+    oversized = StoredTelegram(
+        timestamp=timestamp,
+        source="1.1.1",
+        destination="1/2/3",
+        telegramtype="GroupValueWrite",
+        direction="Incoming",
+        value=oversized_value,
+    )
+    normal = make_telegram(timestamp, destination="4/5/6", value=21.5)
+
+    await pg_store.store_many([oversized, normal])
+    result = await pg_store.query(TelegramQuery())
+
+    assert result.total_count == 2
+    assert {telegram.value for telegram in result.telegrams} == {
+        oversized_value,
+        21.5,
+    }
+
+
 async def test_time_delta_context_window(store):
     _, pg_store = store
     base = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
