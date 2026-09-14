@@ -374,3 +374,22 @@ async def test_initialize_handles_unrecoverable_legacy_timestamp_ties(tmp_path):
         assert by_destination[preserved_first.destination].raw_data == "ff"
     finally:
         await upgraded.close()
+
+
+async def test_data_unwrapped_flag_skips_initialize_scan(tmp_path):
+    db_path = tmp_path / "telegrams.db"
+    store = SqliteStore(db_path)
+    await store.initialize()
+    statements: list[str] = []
+
+    def capture_statement(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(store.engine.sync_engine, "before_cursor_execute", capture_statement)
+    try:
+        await store.initialize()
+    finally:
+        event.remove(store.engine.sync_engine, "before_cursor_execute", capture_statement)
+        await store.close()
+
+    assert not any("FROM telegrams" in statement and "LIKE '{\"value\":%'" in statement for statement in statements)
