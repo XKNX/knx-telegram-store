@@ -71,11 +71,11 @@ class QueryTelegramsInput:
     )
     limit: int = field(
         default=100,
-        metadata={"description": "Maximum number of results to return."},
+        metadata={"description": "Maximum number of results to return, from 1 through 1000."},
     )
     offset: int = field(
         default=0,
-        metadata={"description": "Number of results to skip, for pagination."},
+        metadata={"description": "Non-negative number of results to skip, for pagination."},
     )
     order_descending: bool = field(
         default=True,

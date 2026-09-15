@@ -22,6 +22,15 @@ from .types import (
     TelegramSummary,
 )
 
+MAX_QUERY_LIMIT = 1000
+
+
+def _validate_pagination(input: QueryTelegramsInput) -> None:
+    if not 1 <= input.limit <= MAX_QUERY_LIMIT:
+        raise ValueError(f"limit must be between 1 and {MAX_QUERY_LIMIT}")
+    if input.offset < 0:
+        raise ValueError("offset must be non-negative")
+
 
 def _parse_dt(value: str | None) -> datetime | None:
     """Parse an ISO-8601 timestamp, tolerating a trailing ``Z``."""
@@ -94,6 +103,7 @@ def _summarize(t: StoredTelegram) -> TelegramSummary:
 
 async def query_telegrams(store: TelegramStore, input: QueryTelegramsInput) -> QueryTelegramsResult:
     """Search historical telegrams with multi-field filtering."""
+    _validate_pagination(input)
     query = TelegramQuery(
         sources=list(input.sources),
         destinations=list(input.destinations),
@@ -114,7 +124,7 @@ async def query_telegrams(store: TelegramStore, input: QueryTelegramsInput) -> Q
         telegrams=[_summarize(t) for t in result.telegrams],
         total_count=result.total_count,
         offset=input.offset,
-        next_offset=(input.offset + len(result.telegrams) if result.limit_reached else None),
+        next_offset=(input.offset + input.limit if result.limit_reached else None),
         limit_reached=result.limit_reached,
     )
 
