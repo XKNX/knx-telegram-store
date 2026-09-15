@@ -234,6 +234,77 @@ async def test_automatic_conversion_includes_recent_legacy_rows_east_of_utc(tmp_
     await store.close()
 
 
+async def test_automatic_conversion_includes_legacy_last_values(tmp_path):
+    """Retention can empty telegrams and leave the last values behind.
+
+    Those rows are upserted per group address, so they carry no rowid order to
+    bound them by. Converting in the same start that finds the legacy database
+    is what keeps them correct: there is no boundary yet to exclude anything,
+    and east of UTC their local digits sit above the boundary instant.
+    """
+    path = tmp_path / "legacy-last-ga.db"
+    await _legacy_db(path, [])
+    legacy = datetime.now(BERLIN).replace(microsecond=123456)
+
+    con = sqlite3.connect(str(path))
+    ids = {row[0]: row[1] for row in con.execute("SELECT category, id FROM string_lookup")}
+    con.execute(
+        "INSERT INTO last_ga_telegrams (destination_id, timestamp, source_id, telegramtype_id, direction_id) "
+        "VALUES (?,?,?,?,?)",
+        (
+            ids["destination"],
+            legacy.strftime("%Y-%m-%d %H:%M:%S.%f"),
+            ids["source"],
+            ids["telegramtype"],
+            ids["direction"],
+        ),
+    )
+    con.commit()
+    con.close()
+
+    store = SqliteStore(str(path), legacy_timestamp_timezone=BERLIN)
+    await store.initialize()
+
+    (last,) = await store.get_last_unique_telegrams()
+    assert last.timestamp == legacy.astimezone(UTC)
+    await store.close()
+
+
+async def test_deferred_conversion_includes_recent_legacy_rows_east_of_utc(tmp_path):
+    """The rowid marker separates the two populations where a timestamp cannot.
+
+    East of UTC a legacy row's local digits can exceed the boundary instant, so
+    bounding `telegrams` by time would leave the hours right before the upgrade
+    unconverted while still flagging the database as converted.
+    """
+    path = tmp_path / "deferred-recent.db"
+    legacy = datetime.now(BERLIN).replace(microsecond=123456)
+    await _legacy_db(path, [legacy.strftime("%Y-%m-%d %H:%M:%S.%f")])
+
+    store = SqliteStore(str(path))
+    await store.initialize()  # records the boundary and the rowid marker
+    fresh = datetime.now(UTC)
+    await store.store_many(
+        [
+            StoredTelegram(
+                timestamp=fresh,
+                source="1.1.2",
+                destination="1/1/2",
+                telegramtype="GroupValueWrite",
+                direction="Incoming",
+                value=1.0,
+            )
+        ]
+    )
+
+    assert await store.migrate_timestamps_to_utc(BERLIN) == 1, "only the legacy row should be converted"
+
+    stamps = {t.source: t.timestamp for t in (await store.query(TelegramQuery(limit=10))).telegrams}
+    assert stamps["1.1.1"] == legacy.astimezone(UTC)
+    assert stamps["1.1.2"] == fresh, "an already-UTC row was shifted"
+    await store.close()
+
+
 async def test_automatic_conversion_runs_once_across_restarts(tmp_path):
     """Re-opening the store must not shift the same rows again."""
     path = tmp_path / "restart.db"
