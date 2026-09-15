@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -200,6 +201,28 @@ async def test_timescale_enabled_unknown_before_initialize(backend):
 
 
 # --- Write / read round-trip ---------------------------------------------------
+
+
+async def test_failed_store_does_not_publish_rolled_back_lookup_ids(store):
+    _, pg_store = store
+    bad = replace(
+        make_telegram(datetime.now(UTC)),
+        source="9.9.9",
+        destination="9/9/9",
+        value=object(),
+        value_numeric=None,
+    )
+
+    with pytest.raises(KnxTelegramStoreException):
+        await pg_store.store(bad)
+
+    await pg_store.store(replace(bad, value=1, value_numeric=1.0))
+    result = await pg_store.query(TelegramQuery())
+
+    assert await pg_store.count() == 1
+    assert len(result.telegrams) == 1
+    assert result.telegrams[0].destination == "9/9/9"
+    assert result.telegrams[0].value == 1
 
 
 async def test_roundtrip_time_range_pagination_ordering(store):

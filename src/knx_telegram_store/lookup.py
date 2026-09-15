@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
@@ -105,7 +105,10 @@ class LookupCache:
             result = await conn.execute(select_stmt)
             for cat, val, row_id in result:
                 pair = (cat, val)
-                self._cache[pair] = row_id
                 resolved[pair] = row_id
 
         return resolved
+
+    def publish(self, resolved: Mapping[tuple[str, str], int]) -> None:
+        """Publish lookup IDs after their transaction committed."""
+        self._cache.update(resolved)

@@ -251,6 +251,8 @@ class BaseSQLStore(TelegramStore):
                     )
                     await conn.execute(pg_upsert)
 
+        self._lookup_cache.publish(lookup_ids)
+
     def ensure_indexes(self, connection) -> None:
         """Create any declared index that the database is missing.
 
