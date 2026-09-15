@@ -609,6 +609,9 @@ class PostgresStore(BaseSQLStore):
         ).scalar()
         if already_unwrapped == "true":
             return
+        # Block legacy writers from creating wrapped rows between the final
+        # scan and the completion marker. Completed migrations remain lock-free.
+        connection.execute(text("LOCK TABLE telegrams IN SHARE ROW EXCLUSIVE MODE"))
         wrapped = (
             "value::jsonb = jsonb_build_object('value', value::jsonb -> 'value') "
             "OR payload::jsonb = jsonb_build_object('value', payload::jsonb -> 'value')"
