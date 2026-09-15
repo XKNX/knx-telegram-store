@@ -320,6 +320,40 @@ async def test_get_last_unique_telegrams(store, sample_telegrams):
     assert dest_map["1/1/2"].value is None
 
 
+async def test_last_unique_telegrams_ignores_older_writes(store, sample_telegrams):
+    newer = replace(
+        sample_telegrams[0],
+        timestamp=datetime(2026, 9, 14, 12, tzinfo=UTC),
+        value="new",
+    )
+    older = replace(
+        newer,
+        timestamp=datetime(2026, 9, 13, 12, tzinfo=UTC),
+        value="old",
+    )
+    await store.store(newer)
+    await store.store(older)
+
+    by_destination = {telegram.destination: telegram for telegram in await store.get_last_unique_telegrams()}
+
+    assert by_destination[newer.destination].value == "new"
+
+
+async def test_last_unique_telegrams_keeps_first_write_for_equal_timestamps(store, sample_telegrams):
+    first = replace(
+        sample_telegrams[0],
+        timestamp=datetime(2026, 9, 14, 12, tzinfo=UTC),
+        value="first",
+    )
+    second = replace(first, value="second")
+    await store.store(first)
+    await store.store(second)
+
+    by_destination = {telegram.destination: telegram for telegram in await store.get_last_unique_telegrams()}
+
+    assert by_destination[first.destination].value == "first"
+
+
 async def test_exception_wrapping(store):
     """Test that underlying database/engine exceptions are wrapped in KnxTelegramStoreException."""
     from unittest.mock import patch

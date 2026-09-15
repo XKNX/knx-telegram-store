@@ -159,8 +159,10 @@ class MemoryStore(TelegramStore):
     async def get_last_unique_telegrams(self) -> list[StoredTelegram]:
         """Retrieve the latest unique telegram for each destination group address."""
         last_ga: dict[str, StoredTelegram] = {}
-        for t in self._telegrams:
-            last_ga[t.destination] = t
+        for telegram in self._telegrams:
+            current = last_ga.get(telegram.destination)
+            if current is None or telegram.timestamp > current.timestamp:
+                last_ga[telegram.destination] = telegram
         return list(last_ga.values())
 
     @wrap_store_errors

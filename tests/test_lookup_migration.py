@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -12,13 +13,34 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    event,
     insert,
     select,
 )
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from knx_telegram_store import TelegramQuery
+from knx_telegram_store import StoredTelegram, TelegramQuery
 from knx_telegram_store.backends.sqlite import SqliteStore
+
+
+async def test_reconciliation_prefilters_latest_candidates_before_tie_ranking(tmp_path):
+    """Canonical tie ranking must not sort the complete telegram history."""
+    store = SqliteStore(tmp_path / "telegrams.db")
+    statements: list[str] = []
+
+    def capture_statement(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(" ".join(statement.lower().split()))
+
+    event.listen(store.engine.sync_engine, "before_cursor_execute", capture_statement)
+    try:
+        await store.initialize()
+    finally:
+        event.remove(store.engine.sync_engine, "before_cursor_execute", capture_statement)
+        await store.close()
+
+    [ranking_statement] = [statement for statement in statements if "row_number()" in statement]
+    assert "max(telegrams.timestamp)" in ranking_statement
+    assert "group by telegrams.destination_id" in ranking_statement
 
 
 @pytest.fixture
@@ -268,3 +290,87 @@ async def test_nulls_recovered_flag_skips_probe_scan(tmp_path):
     assert float(recovered) == 20.0
 
     await store.close()
+
+
+async def test_initialize_reconciles_stale_last_ga_summary(tmp_path):
+    """An upgrade repairs summaries written by the old unconditional upsert."""
+    db_path = tmp_path / "telegrams.db"
+    store = SqliteStore(db_path)
+    await store.initialize()
+
+    newest = StoredTelegram(
+        timestamp=datetime(2026, 9, 14, 12, tzinfo=UTC),
+        source="1.1.1",
+        destination="1/1/1",
+        telegramtype="GroupValueWrite",
+        direction="Incoming",
+        value="newest",
+    )
+    older = replace(newest, timestamp=newest.timestamp - timedelta(days=1), value="older")
+    await store.store_many([newest, older])
+
+    columns = [column.name for column in store.last_ga_telegrams.columns]
+    older_row = select(*(store.telegrams.c[name] for name in columns)).where(
+        store.telegrams.c.timestamp == older.timestamp
+    )
+    async with store.engine.begin() as conn:
+        await conn.execute(store.last_ga_telegrams.delete())
+        await conn.execute(store.last_ga_telegrams.insert().from_select(columns, older_row))
+        await conn.execute(
+            store.store_metadata.delete().where(store.store_metadata.c.key == "last_ga_newest_reconciled")
+        )
+    await store.close()
+
+    upgraded = SqliteStore(db_path)
+    try:
+        await upgraded.initialize()
+        [last] = await upgraded.get_last_unique_telegrams()
+        assert last.value == "newest"
+    finally:
+        await upgraded.close()
+
+
+async def test_initialize_handles_unrecoverable_legacy_timestamp_ties(tmp_path):
+    """Keep an existing tie winner; use a canonical fallback for a missing one."""
+    db_path = tmp_path / "telegrams.db"
+    store = SqliteStore(db_path)
+    await store.initialize()
+
+    timestamp = datetime(2026, 9, 14, 12, tzinfo=UTC)
+    missing_first = StoredTelegram(
+        timestamp=timestamp,
+        source="1.1.1",
+        destination="1/1/1",
+        telegramtype="GroupValueWrite",
+        direction="Incoming",
+        value="same",
+        raw_data="ff",
+    )
+    missing_canonical = replace(missing_first, raw_data="00")
+    preserved_first = replace(missing_first, destination="2/2/2")
+    preserved_canonical = replace(missing_canonical, destination="2/2/2")
+    await store.store_many([missing_first, missing_canonical, preserved_first, preserved_canonical])
+
+    async with store.engine.begin() as conn:
+        missing_destination_id = await conn.scalar(
+            select(store.string_lookup.c.id).where(
+                store.string_lookup.c.category == "destination",
+                store.string_lookup.c.value == missing_first.destination,
+            )
+        )
+        await conn.execute(
+            store.last_ga_telegrams.delete().where(store.last_ga_telegrams.c.destination_id == missing_destination_id)
+        )
+        await conn.execute(
+            store.store_metadata.delete().where(store.store_metadata.c.key == "last_ga_newest_reconciled")
+        )
+    await store.close()
+
+    upgraded = SqliteStore(db_path)
+    try:
+        await upgraded.initialize()
+        by_destination = {telegram.destination: telegram for telegram in await upgraded.get_last_unique_telegrams()}
+        assert by_destination[missing_first.destination].raw_data == "00"
+        assert by_destination[preserved_first.destination].raw_data == "ff"
+    finally:
+        await upgraded.close()
