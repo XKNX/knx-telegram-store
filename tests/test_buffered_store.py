@@ -239,3 +239,37 @@ async def test_buffer_limit_failed_flush(sample_telegram, monkeypatch):
     assert store._buffer[0].source == "1.1.1"
     assert store._buffer[1].source == "1.1.2"
     assert store._buffer[2].source == "1.1.3"
+
+
+@pytest.mark.parametrize("operation", ["flush", "stop"])
+async def test_lifecycle_operation_preserves_in_flight_batch(sample_telegram, monkeypatch, operation):
+    store = BufferedMemoryStore(flush_interval=0.01)
+    await store.initialize()
+    original_store_many = store.store_many
+    write_started = asyncio.Event()
+    release_write = asyncio.Event()
+    call_count = 0
+
+    async def _block_first_write(telegrams):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            write_started.set()
+            await release_write.wait()
+        await original_store_many(telegrams)
+
+    monkeypatch.setattr(store, "store_many", _block_first_write)
+    await store.store(sample_telegram)
+    store.start()
+    await asyncio.wait_for(write_started.wait(), timeout=1)
+
+    operation_task = asyncio.create_task(getattr(store, operation)())
+    await asyncio.sleep(0)
+    release_write.set()
+    await operation_task
+
+    if operation == "flush":
+        await store.stop()
+
+    assert store._buffer == []
+    assert await store.count() == 1
