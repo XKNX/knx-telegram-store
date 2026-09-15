@@ -365,7 +365,7 @@ class SqliteStore(BaseSQLStore):
             return {"telegrams": ("1 = 1", {}), "last_ga_telegrams": ("1 = 1", {})}
 
         boundary = datetime.fromisoformat(boundary_raw).astimezone(UTC).replace(tzinfo=None)
-        conservative = ("timestamp < :boundary", {"boundary": _sql_ts(boundary)})
+        conservative: tuple[str, dict[str, object]] = ("timestamp < :boundary", {"boundary": _sql_ts(boundary)})
         scopes: dict[str, tuple[str, dict[str, object]]] = {
             "telegrams": conservative,
             "last_ga_telegrams": conservative,
