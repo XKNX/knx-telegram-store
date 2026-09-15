@@ -129,8 +129,22 @@ async def test_query_telegrams_limit_reached(store):
     # Pagination is self-describing: next_offset points past the returned window.
     assert result.offset == 0
     assert result.next_offset == 1
+    second_page = await query_telegrams(store, QueryTelegramsInput(limit=1, offset=1))
+    assert second_page.next_offset == 2
+    assert second_page.next_offset > second_page.offset
     full = await query_telegrams(store, QueryTelegramsInput(limit=100))
     assert full.next_offset is None
+
+
+@pytest.mark.parametrize("limit", [0, -1, 1001])
+async def test_query_telegrams_rejects_invalid_limit(store, limit):
+    with pytest.raises(ValueError, match="limit must be between 1 and 1000"):
+        await query_telegrams(store, QueryTelegramsInput(limit=limit))
+
+
+async def test_query_telegrams_rejects_negative_offset(store):
+    with pytest.raises(ValueError, match="offset must be non-negative"):
+        await query_telegrams(store, QueryTelegramsInput(offset=-1))
 
 
 async def test_get_last_values(store):

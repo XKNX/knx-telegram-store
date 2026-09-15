@@ -1,8 +1,10 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from knx_telegram_store import KnxTelegramStoreException, StoredTelegram, TelegramQuery
+from knx_telegram_store.backends.sqlite import SqliteStore
 from knx_telegram_store.store import wrap_store_errors
 
 
@@ -55,6 +57,34 @@ async def test_store_and_count(store, sample_telegrams):
 
     await store.store_many(sample_telegrams[1:])
     assert await store.count() == 4
+
+
+async def test_failed_sql_store_does_not_publish_rolled_back_lookup_ids():
+    store = SqliteStore(":memory:")
+    await store.initialize()
+    bad = StoredTelegram(
+        timestamp=datetime.now(UTC),
+        source="9.9.9",
+        destination="9/9/9",
+        telegramtype="GroupValueWrite",
+        direction="Incoming",
+        value=object(),
+    )
+
+    try:
+        with pytest.raises(KnxTelegramStoreException):
+            await store.store(bad)
+
+        await store.store(replace(bad, value=1))
+        result = await store.query(TelegramQuery())
+
+        assert await store.count() == 1
+        assert len(result.telegrams) == 1
+        assert result.telegrams[0].source == "9.9.9"
+        assert result.telegrams[0].destination == "9/9/9"
+        assert result.telegrams[0].value == 1
+    finally:
+        await store.close()
 
 
 async def test_query_all(store, sample_telegrams):
@@ -160,6 +190,26 @@ async def test_query_time_delta(store, sample_telegrams):
     # t3 (2 mins ago) is 1 min after (included)
     # t0 (5 mins ago) is 2 mins before (excluded)
     assert len(result.telegrams) == 3
+
+
+async def test_time_delta_preserves_dictionary_values_and_duplicate_rows(store):
+    telegram = StoredTelegram(
+        timestamp=datetime(2026, 9, 14, 12, tzinfo=UTC),
+        source="1.1.1",
+        destination="1/1/1",
+        telegramtype="GroupValueWrite",
+        direction="Incoming",
+        value={"level": 42},
+    )
+    await store.store_many([telegram, telegram])
+
+    result = await store.query(TelegramQuery(destinations=["1/1/1"], delta_before_ms=1000, delta_after_ms=1000))
+
+    assert result.total_count == 2
+    assert [item.value for item in result.telegrams] == [
+        {"level": 42},
+        {"level": 42},
+    ]
 
 
 async def test_pagination(store, sample_telegrams):
@@ -268,6 +318,40 @@ async def test_get_last_unique_telegrams(store, sample_telegrams):
 
     assert dest_map["1/1/1"].value == 22.5
     assert dest_map["1/1/2"].value is None
+
+
+async def test_last_unique_telegrams_ignores_older_writes(store, sample_telegrams):
+    newer = replace(
+        sample_telegrams[0],
+        timestamp=datetime(2026, 9, 14, 12, tzinfo=UTC),
+        value="new",
+    )
+    older = replace(
+        newer,
+        timestamp=datetime(2026, 9, 13, 12, tzinfo=UTC),
+        value="old",
+    )
+    await store.store(newer)
+    await store.store(older)
+
+    by_destination = {telegram.destination: telegram for telegram in await store.get_last_unique_telegrams()}
+
+    assert by_destination[newer.destination].value == "new"
+
+
+async def test_last_unique_telegrams_keeps_first_write_for_equal_timestamps(store, sample_telegrams):
+    first = replace(
+        sample_telegrams[0],
+        timestamp=datetime(2026, 9, 14, 12, tzinfo=UTC),
+        value="first",
+    )
+    second = replace(first, value="second")
+    await store.store(first)
+    await store.store(second)
+
+    by_destination = {telegram.destination: telegram for telegram in await store.get_last_unique_telegrams()}
+
+    assert by_destination[first.destination].value == "first"
 
 
 async def test_exception_wrapping(store):

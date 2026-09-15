@@ -81,8 +81,9 @@ async def test_partial_cache_hit(sqlite_engine, lookup_table):
         result = await cache.get_or_create_ids(conn, lookup_table, [("source", "1.1.1"), ("destination", "1/1/1")])
 
     assert result[("source", "1.1.1")] == 7
-    # The new pair should have been inserted and cached
     assert ("destination", "1/1/1") in result
+    assert ("destination", "1/1/1") not in cache._cache
+    cache.publish(result)
     assert ("destination", "1/1/1") in cache._cache
 
 
@@ -100,7 +101,9 @@ async def test_sqlite_insert_new_pairs(sqlite_engine, lookup_table):
 
     assert len(result) == 2
     assert all(isinstance(v, int) for v in result.values())
-    # IDs are now in the cache
+    assert ("source", "2.2.2") not in cache._cache
+    assert ("direction", "Incoming") not in cache._cache
+    cache.publish(result)
     assert ("source", "2.2.2") in cache._cache
     assert ("direction", "Incoming") in cache._cache
 
@@ -158,6 +161,8 @@ async def test_generic_fallback_insert(sqlite_engine, lookup_table):
 
     assert ("telegramtype", "GroupValueWrite") in result
     assert isinstance(result[("telegramtype", "GroupValueWrite")], int)
+    assert ("telegramtype", "GroupValueWrite") not in cache._cache
+    cache.publish(result)
     assert ("telegramtype", "GroupValueWrite") in cache._cache
 
 
@@ -166,9 +171,12 @@ async def test_generic_fallback_existing_row(sqlite_engine, lookup_table):
     # Pre-insert the row via the real path
     cache = LookupCache()
     async with sqlite_engine.begin() as conn:
-        await cache.get_or_create_ids(conn, lookup_table, [("unit", "°C")])
+        first_result = await cache.get_or_create_ids(conn, lookup_table, [("unit", "°C")])
 
-    existing_id = cache._cache[("unit", "°C")]
+    assert ("unit", "°C") not in cache._cache
+    cache.publish(first_result)
+    existing_id = first_result[("unit", "°C")]
+    assert cache._cache[("unit", "°C")] == existing_id
 
     # Fresh cache, fake dialect — should SELECT and find the existing row
     cache2 = LookupCache()
@@ -181,3 +189,6 @@ async def test_generic_fallback_existing_row(sqlite_engine, lookup_table):
         )
 
     assert result[("unit", "°C")] == existing_id
+    assert ("unit", "°C") not in cache2._cache
+    cache2.publish(result)
+    assert cache2._cache[("unit", "°C")] == existing_id
