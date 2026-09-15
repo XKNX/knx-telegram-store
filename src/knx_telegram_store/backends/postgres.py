@@ -336,17 +336,19 @@ class PostgresStore(BaseSQLStore):
 
         A statement-level trigger with a transition table resolves the whole
         inserted batch against string_lookup in a single join (one insert from
-        store_many can hold many rows), then emits one pg_notify per row so
-        each payload stays well under Postgres's 8000-byte limit. The payload
-        mirrors query()'s decoded shape (string source/destination/etc., not
-        the raw lookup ids), so a listener can build a StoredTelegram directly
-        without a follow-up query.
+        store_many can hold many rows), then emits one pg_notify per row when
+        its payload is below Postgres's 8000-byte limit. Oversized live
+        notifications are skipped so telegram persistence can continue. The
+        payload mirrors query()'s decoded shape (string
+        source/destination/etc., not the raw lookup ids), so a listener can
+        build a StoredTelegram directly without a follow-up query.
         """
         await conn.execute(
             text(f"""
                 CREATE OR REPLACE FUNCTION knx_telegram_store_notify_insert() RETURNS trigger AS $$
                 DECLARE
                   rec RECORD;
+                  notify_payload TEXT;
                 BEGIN
                   FOR rec IN
                     SELECT
@@ -372,7 +374,10 @@ class PostgresStore(BaseSQLStore):
                     LEFT JOIN string_lookup sn ON sn.id = t.source_name_id AND sn.category = 'source_name'
                     LEFT JOIN string_lookup dn ON dn.id = t.destination_name_id AND dn.category = 'destination_name'
                   LOOP
-                    PERFORM pg_notify('{_NOTIFY_CHANNEL}', row_to_json(rec)::text);
+                    notify_payload := row_to_json(rec)::text;
+                    IF octet_length(notify_payload) < 8000 THEN
+                      PERFORM pg_notify('{_NOTIFY_CHANNEL}', notify_payload);
+                    END IF;
                   END LOOP;
                   RETURN NULL;
                 END;
