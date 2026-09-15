@@ -58,8 +58,8 @@ class _BufferMixin:
         self._flush_task = asyncio.create_task(self._flush_loop())
 
     @wrap_store_errors
-    async def stop(self) -> None:
-        """Stop the periodic flush task, perform a final flush, then close."""
+    async def close(self) -> None:
+        """Stop periodic flushing, flush pending writes, and close the backend."""
         self._closing = True
         if self._flush_task is not None:
             self._flush_task.cancel()
@@ -70,7 +70,12 @@ class _BufferMixin:
             self._flush_task = None
 
         await self._flush(raise_on_error=True)
-        await self.close()  # type: ignore[attr-defined]
+        await super().close()  # type: ignore[misc]
+
+    @wrap_store_errors
+    async def stop(self) -> None:
+        """Compatibility alias for close()."""
+        await self.close()
 
     async def _flush_loop(self) -> None:
         """Periodic flush loop."""

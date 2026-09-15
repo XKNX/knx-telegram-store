@@ -10,6 +10,8 @@ from knx_telegram_store import (
     StoredTelegram,
     TelegramQuery,
 )
+from knx_telegram_store.backends.memory import MemoryStore
+from knx_telegram_store.backends.sqlite import SqliteStore
 
 
 @pytest.fixture
@@ -103,6 +105,62 @@ async def test_stop_flushes_remaining(buffered_store, sample_telegram):
     assert len(buffered_store._buffer) == 0
 
 
+async def test_close_flushes_pending_telegrams(sample_telegram):
+    store = BufferedMemoryStore(flush_interval=60)
+    await store.initialize()
+    await store.store(sample_telegram)
+
+    await store.close()
+
+    assert store._buffer == []
+    assert await store.count() == 1
+
+
+async def test_close_persists_pending_telegrams_to_file(tmp_path, sample_telegram):
+    db_path = tmp_path / "telegrams.db"
+    store = BufferedSqliteStore(db_path, flush_interval=60)
+    await store.initialize()
+    await store.store(sample_telegram)
+
+    await store.close()
+
+    reader = SqliteStore(db_path, read_only=True)
+    await reader.initialize()
+    try:
+        assert await reader.count() == 1
+    finally:
+        await reader.close()
+
+
+async def test_close_stops_periodic_task_and_is_idempotent(sample_telegram):
+    store = BufferedMemoryStore(flush_interval=60)
+    await store.initialize()
+    await store.store(sample_telegram)
+    store.start()
+    periodic_task = store._flush_task
+    assert periodic_task is not None
+
+    await store.close()
+    await store.close()
+
+    assert periodic_task.done()
+    assert store._flush_task is None
+    assert store._buffer == []
+    assert await store.count() == 1
+
+
+async def test_stop_remains_close_alias(sample_telegram):
+    store = BufferedMemoryStore()
+    await store.initialize()
+    await store.store(sample_telegram)
+
+    await store.stop()
+    await store.stop()
+
+    assert store._buffer == []
+    assert await store.count() == 1
+
+
 async def test_flush_failure_reprepends(buffered_store, sample_telegram, monkeypatch):
     async def _fail(telegrams):
         raise RuntimeError("DB error")
@@ -144,27 +202,39 @@ async def test_query_flush_first_propagates_flush_failure(buffered_store, sample
     assert buffered_store._buffer == [sample_telegram]
 
 
-async def test_stop_propagates_final_flush_failure_without_closing(sample_telegram, monkeypatch):
+async def test_close_retries_failed_final_flush_before_closing(sample_telegram, monkeypatch):
     store = BufferedMemoryStore()
     await store.initialize()
-    closed = False
+    original_store_many = store.store_many
+    flush_attempts = 0
+    close_calls = 0
 
-    async def _fail(_telegrams):
-        raise RuntimeError("DB error")
+    async def _fail_once(telegrams):
+        nonlocal flush_attempts
+        flush_attempts += 1
+        if flush_attempts == 1:
+            raise RuntimeError("DB error")
+        await original_store_many(telegrams)
 
-    async def _close():
-        nonlocal closed
-        closed = True
+    async def _close(_store):
+        nonlocal close_calls
+        close_calls += 1
 
-    monkeypatch.setattr(store, "store_many", _fail)
-    monkeypatch.setattr(store, "close", _close)
+    monkeypatch.setattr(store, "store_many", _fail_once)
+    monkeypatch.setattr(MemoryStore, "close", _close)
     await store.store(sample_telegram)
 
     with pytest.raises(KnxTelegramStoreException, match="DB error"):
-        await store.stop()
+        await store.close()
 
     assert store._buffer == [sample_telegram]
-    assert closed is False
+    assert close_calls == 0
+
+    await store.close()
+
+    assert store._buffer == []
+    assert await store.count() == 1
+    assert close_calls == 1
 
 
 async def test_flush_failure_then_recovery(buffered_store, sample_telegram, monkeypatch):
