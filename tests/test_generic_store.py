@@ -192,6 +192,26 @@ async def test_query_time_delta(store, sample_telegrams):
     assert len(result.telegrams) == 3
 
 
+async def test_time_delta_preserves_dictionary_values_and_duplicate_rows(store):
+    telegram = StoredTelegram(
+        timestamp=datetime(2026, 9, 14, 12, tzinfo=UTC),
+        source="1.1.1",
+        destination="1/1/1",
+        telegramtype="GroupValueWrite",
+        direction="Incoming",
+        value={"level": 42},
+    )
+    await store.store_many([telegram, telegram])
+
+    result = await store.query(TelegramQuery(destinations=["1/1/1"], delta_before_ms=1000, delta_after_ms=1000))
+
+    assert result.total_count == 2
+    assert [item.value for item in result.telegrams] == [
+        {"level": 42},
+        {"level": 42},
+    ]
+
+
 async def test_pagination(store, sample_telegrams):
     await store.store_many(sample_telegrams)
 

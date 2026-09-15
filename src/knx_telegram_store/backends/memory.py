@@ -99,15 +99,15 @@ class MemoryStore(TelegramStore):
             delta_after = timedelta(milliseconds=query.delta_after_ms)
 
             # Re-collect all telegrams within any pivot's window
-            context_results = set()
-            for t in self._telegrams:
-                low_bound = t.timestamp - delta_after
-                high_bound = t.timestamp + delta_before
+            context_results: list[StoredTelegram] = []
+            for telegram in self._telegrams:
+                low_bound = telegram.timestamp - delta_after
+                high_bound = telegram.timestamp + delta_before
 
                 idx = bisect.bisect_left(pivot_timestamps, low_bound)
                 if idx < len(pivot_timestamps) and pivot_timestamps[idx] <= high_bound:
-                    context_results.add(t)
-            results = list(context_results)
+                    context_results.append(telegram)
+            results = context_results
 
         # 4. Ordering
         results.sort(key=lambda t: t.timestamp, reverse=query.order_descending)
