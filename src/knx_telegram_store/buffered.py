@@ -5,18 +5,22 @@ import logging
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .backends.memory import MemoryStore
 from .model import StoredTelegram
 from .query import TelegramQuery, TelegramQueryResult
 from .store import StoreStats, wrap_store_errors
 
+if TYPE_CHECKING:
+    from .buffered_sql import BufferedPostgresStore as BufferedPostgresStore
+    from .buffered_sql import BufferedSqliteStore as BufferedSqliteStore
+
 _LOGGER = logging.getLogger(__name__)
 
 
 class _BufferMixin:
-    """Write-buffering mixin for SQL-backed TelegramStore subclasses.
+    """Write-buffering mixin for TelegramStore subclasses.
 
     Place this before the concrete store in the MRO:
 

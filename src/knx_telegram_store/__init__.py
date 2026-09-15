@@ -1,5 +1,5 @@
 from importlib.util import find_spec
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .backends.memory import MemoryStore
 from .buffered import BufferedMemoryStore
@@ -7,6 +7,10 @@ from .connection import ConnectionCheckResult, ConnectionErrorKind
 from .model import StoredTelegram
 from .query import TelegramQuery, TelegramQueryResult
 from .store import KnxTelegramStoreException, StoreCapabilities, StoreStats, TelegramStore
+
+if TYPE_CHECKING:
+    from .buffered_sql import BufferedPostgresStore as BufferedPostgresStore
+    from .buffered_sql import BufferedSqliteStore as BufferedSqliteStore
 
 _SQL_BUFFERED_EXPORTS = {
     "BufferedPostgresStore",
