@@ -110,9 +110,11 @@ COMMUNICATION_LOG_FOOTER = "</CommunicationLog>\n"
 def format_telegram_element(record: RawTelegramRecord, *, connection_name: str = "") -> str:
     """Renders one record as an ETS-compatible ``<Telegram />`` element line."""
     connection_attr = f" ConnectionName={quoteattr(connection_name)}" if connection_name else ""
+    service_attr = quoteattr(record.service)
+    frame_format_attr = quoteattr(record.frame_format)
     return (
         f'  <Telegram Timestamp="{_format_timestamp(record.timestamp)}"{connection_attr}'
-        f' Service="{record.service}" FrameFormat="{record.frame_format}"'
+        f" Service={service_attr} FrameFormat={frame_format_attr}"
         f' RawData="{record.raw_data.hex().upper()}" />\n'
     )
 
