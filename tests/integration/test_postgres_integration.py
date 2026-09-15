@@ -431,10 +431,7 @@ async def test_legacy_unwrap_preserves_duplicates_in_compressed_chunk(timescale_
                 {"timestamp": timestamp},
             )
             await conn.execute(
-                text(
-                    "UPDATE telegrams SET value = jsonb_build_object('value', value, 'unit', 'C') "
-                    "WHERE timestamp > :timestamp"
-                ),
+                text("UPDATE telegrams SET value = jsonb_build_object('value', value) WHERE timestamp > :timestamp"),
                 {"timestamp": timestamp},
             )
             await conn.execute(text("DELETE FROM store_metadata WHERE key = 'data_unwrapped'"))
@@ -457,8 +454,8 @@ async def test_legacy_unwrap_preserves_duplicates_in_compressed_chunk(timescale_
         assert sorted(telegram.value for telegram in result.telegrams if isinstance(telegram.value, float)) == [
             1.0,
             2.0,
+            3.0,
         ]
-        assert {"value": 3.0, "unit": "C"} in [telegram.value for telegram in result.telegrams]
         assert {"value": 4.0} in [telegram.value for telegram in result.telegrams]
         assert all(telegram.payload == [12, 154] for telegram in result.telegrams)
     finally:
@@ -505,18 +502,29 @@ async def test_concurrent_legacy_backfills_unwrap_nested_value_once(store):
         assert await conn.scalar(text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")) == "true"
 
 
-async def test_legacy_unwrap_skips_concurrent_writer_and_retries(store):
+@pytest.mark.parametrize("pending_backfill", ["unwrap", "nulls", "legacy_float"])
+async def test_legacy_backfill_skips_concurrent_writer_and_retries(store, pending_backfill):
     _, pg_store = store
     await pg_store.store(make_telegram(datetime.now(UTC), value=1.0))
 
     async with pg_store.engine.begin() as conn:
-        await conn.execute(text("DELETE FROM store_metadata WHERE key = 'data_unwrapped'"))
+        if pending_backfill == "unwrap":
+            await conn.execute(text("UPDATE telegrams SET value = jsonb_build_object('value', value)"))
+            await conn.execute(text("DELETE FROM store_metadata WHERE key = 'data_unwrapped'"))
+        elif pending_backfill == "nulls":
+            await conn.execute(text("DELETE FROM store_metadata WHERE key = 'nulls_recovered'"))
+        else:
+            await conn.execute(text("ALTER TABLE telegrams ADD COLUMN value_legacy_float FLOAT"))
+            await conn.execute(text("UPDATE telegrams SET value_numeric = NULL, value_legacy_float = 1"))
 
     writer = await pg_store.engine.connect()
     backfill = await pg_store.engine.connect()
     writer_transaction = await writer.begin()
     try:
-        await writer.execute(text("UPDATE telegrams SET value = jsonb_build_object('value', value)"))
+        if pending_backfill == "nulls":
+            await writer.execute(text("UPDATE telegrams SET value = NULL"))
+        else:
+            await writer.execute(text("UPDATE telegrams SET data_secure = NOT data_secure"))
 
         async def _run_backfill():
             async with backfill.begin():
@@ -531,7 +539,17 @@ async def test_legacy_unwrap_skips_concurrent_writer_and_retries(store):
             await asyncio.wait_for(_run_backfill(), timeout=2)
         assert getattr(error.value.orig, "sqlstate", None) == "55P03"
         async with pg_store.engine.connect() as observer:
-            assert await observer.scalar(text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")) is None
+            if pending_backfill == "unwrap":
+                assert (
+                    await observer.scalar(text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")) is None
+                )
+            elif pending_backfill == "nulls":
+                assert (
+                    await observer.scalar(text("SELECT value FROM store_metadata WHERE key = 'nulls_recovered'"))
+                    is None
+                )
+            else:
+                assert await observer.scalar(text("SELECT value_numeric FROM telegrams")) is None
 
         await writer_transaction.commit()
         await _run_backfill()
@@ -543,8 +561,45 @@ async def test_legacy_unwrap_skips_concurrent_writer_and_retries(store):
 
     result = await pg_store.query(TelegramQuery())
     assert [telegram.value for telegram in result.telegrams] == [1.0]
-    async with pg_store.engine.connect() as conn:
-        assert await conn.scalar(text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")) == "true"
+    assert result.telegrams[0].value_numeric == 1.0
+
+
+async def test_legacy_backfill_skips_active_prechange_reader_and_retries(store):
+    _, pg_store = store
+    await pg_store.store(make_telegram(datetime.now(UTC), value=1.0))
+    async with pg_store.engine.begin() as conn:
+        await conn.execute(text("UPDATE telegrams SET value = jsonb_build_object('value', value)"))
+        await conn.execute(text("DELETE FROM store_metadata WHERE key = 'data_unwrapped'"))
+
+    old_migration = await pg_store.engine.connect()
+    backfill = await pg_store.engine.connect()
+    old_transaction = await old_migration.begin()
+    try:
+        await old_migration.execute(text("SELECT value FROM telegrams"))
+
+        async def _run_backfill():
+            async with backfill.begin():
+                await backfill.run_sync(
+                    lambda sync_conn: pg_store._backfill_legacy_data(
+                        sync_conn,
+                        timescale=pg_store.timescale_enabled is True,
+                    )
+                )
+
+        with pytest.raises(DBAPIError) as error:
+            await asyncio.wait_for(_run_backfill(), timeout=2)
+        assert getattr(error.value.orig, "sqlstate", None) == "55P03"
+
+        await old_transaction.commit()
+        await _run_backfill()
+    finally:
+        if old_transaction.is_active:
+            await old_transaction.rollback()
+        await old_migration.close()
+        await backfill.close()
+
+    result = await pg_store.query(TelegramQuery())
+    assert [telegram.value for telegram in result.telegrams] == [1.0]
 
 
 async def test_legacy_unwrap_records_completion_only_after_every_update(store):

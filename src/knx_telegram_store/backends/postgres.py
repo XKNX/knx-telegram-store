@@ -548,16 +548,35 @@ class PostgresStore(BaseSQLStore):
         except Exception:
             return
         existing_columns = {col["name"] for col in columns}
-        already_unwrapped = connection.execute(
-            text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")
-        ).scalar()
-        if already_unwrapped != "true":
-            # Take the relation lock before any row updates. NOWAIT lets the
-            # caller skip this pass when a writer is active and retry later.
-            connection.execute(text("LOCK TABLE telegrams IN SHARE ROW EXCLUSIVE MODE NOWAIT"))
 
         def _pending(where: str) -> bool:
             return bool(connection.execute(text(f"SELECT EXISTS (SELECT 1 FROM telegrams WHERE {where})")).scalar())
+
+        already_unwrapped = connection.execute(
+            text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")
+        ).scalar()
+        nulls_recovered = self._metadata_flag_set(connection, "nulls_recovered")
+        legacy_float_columns = "value_legacy_float" in existing_columns and "value_numeric" in existing_columns
+        legacy_float_pending = None
+        unwrap_pending = already_unwrapped != "true"
+        nulls_pending = not nulls_recovered and "value" in existing_columns and "value_numeric" in existing_columns
+        needs_relation_lock = unwrap_pending or nulls_pending
+        if not needs_relation_lock and legacy_float_columns:
+            legacy_float_pending = _pending("value_numeric IS NULL AND value_legacy_float IS NOT NULL")
+            needs_relation_lock = legacy_float_pending
+        if needs_relation_lock:
+            # Only ACCESS EXCLUSIVE conflicts with the plain SELECT used by the
+            # old read-then-write unwrap migration. The other bulk updates only
+            # need to exclude writers. NOWAIT keeps startup non-blocking.
+            lock_mode = "ACCESS EXCLUSIVE" if unwrap_pending else "SHARE ROW EXCLUSIVE"
+            connection.execute(text(f"LOCK TABLE telegrams IN {lock_mode} MODE NOWAIT"))
+            # A pre-change migration may have committed between the optimistic
+            # marker reads and lock acquisition. Refresh before changing rows.
+            already_unwrapped = connection.execute(
+                text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")
+            ).scalar()
+            nulls_recovered = self._metadata_flag_set(connection, "nulls_recovered")
+            legacy_float_pending = None
 
         def _lift_decompression_limit() -> None:
             # TimescaleDB caps how many tuples one DML transaction may
@@ -574,7 +593,7 @@ class PostgresStore(BaseSQLStore):
         # so the library's query returns it correctly. The store_metadata flag
         # marks completion so the unindexed _pending probe doesn't scan the
         # whole telegrams table on every startup.
-        if not self._metadata_flag_set(connection, "nulls_recovered"):
+        if not nulls_recovered:
             if (
                 "value" in existing_columns
                 and "value_numeric" in existing_columns
@@ -596,10 +615,10 @@ class PostgresStore(BaseSQLStore):
 
         # Handle edge case from intermediate migrations where value was
         # a FLOAT column renamed to value_legacy_float
-        if (
-            "value_legacy_float" in existing_columns
-            and "value_numeric" in existing_columns
-            and _pending("value_numeric IS NULL AND value_legacy_float IS NOT NULL")
+        if legacy_float_columns and (
+            legacy_float_pending
+            if legacy_float_pending is not None
+            else _pending("value_numeric IS NULL AND value_legacy_float IS NOT NULL")
         ):
             _lift_decompression_limit()
             connection.execute(
