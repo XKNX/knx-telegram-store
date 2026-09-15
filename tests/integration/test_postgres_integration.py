@@ -30,6 +30,7 @@ import pytest
 pytest.importorskip("asyncpg")
 
 from sqlalchemy import select, text  # noqa: E402
+from sqlalchemy.exc import DBAPIError  # noqa: E402
 
 from knx_telegram_store import (  # noqa: E402
     BufferedPostgresStore,
@@ -474,10 +475,7 @@ async def test_concurrent_legacy_backfills_unwrap_nested_value_once(store):
 
     first = await pg_store.engine.connect()
     second = await pg_store.engine.connect()
-    second_pid = await second.scalar(text("SELECT pg_backend_pid()"))
-    await second.rollback()
     first_transaction = await first.begin()
-    second_task = None
 
     def _backfill(connection):
         pg_store._backfill_legacy_data(connection, timescale=pg_store.timescale_enabled is True)
@@ -491,29 +489,13 @@ async def test_concurrent_legacy_backfills_unwrap_nested_value_once(store):
             async with second.begin():
                 await second.run_sync(_backfill)
 
-        second_task = asyncio.create_task(_second_backfill())
-        async with pg_store.engine.connect() as observer:
-            async with asyncio.timeout(5):
-                while True:
-                    waiting = await observer.scalar(
-                        text("SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = :pid"),
-                        {"pid": second_pid},
-                    )
-                    if waiting:
-                        break
-                    if second_task.done():
-                        await second_task
-                        pytest.fail("Second migration finished before the first committed")
-                    await asyncio.sleep(0.01)
+        with pytest.raises(RuntimeError, match="already running"):
+            await asyncio.wait_for(_second_backfill(), timeout=2)
 
         await first_transaction.commit()
-        await asyncio.wait_for(second_task, timeout=5)
     finally:
         if first_transaction.is_active:
             await first_transaction.rollback()
-        if second_task is not None and not second_task.done():
-            second_task.cancel()
-            await asyncio.gather(second_task, return_exceptions=True)
         await first.close()
         await second.close()
 
@@ -523,7 +505,7 @@ async def test_concurrent_legacy_backfills_unwrap_nested_value_once(store):
         assert await conn.scalar(text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")) == "true"
 
 
-async def test_legacy_unwrap_waits_for_concurrent_writer(store):
+async def test_legacy_unwrap_skips_concurrent_writer_and_retries(store):
     _, pg_store = store
     await pg_store.store(make_telegram(datetime.now(UTC), value=1.0))
 
@@ -532,10 +514,7 @@ async def test_legacy_unwrap_waits_for_concurrent_writer(store):
 
     writer = await pg_store.engine.connect()
     backfill = await pg_store.engine.connect()
-    backfill_pid = await backfill.scalar(text("SELECT pg_backend_pid()"))
-    await backfill.rollback()
     writer_transaction = await writer.begin()
-    backfill_task = None
     try:
         await writer.execute(text("UPDATE telegrams SET value = jsonb_build_object('value', value)"))
 
@@ -548,26 +527,17 @@ async def test_legacy_unwrap_waits_for_concurrent_writer(store):
                     )
                 )
 
-        backfill_task = asyncio.create_task(_run_backfill())
+        with pytest.raises(DBAPIError) as error:
+            await asyncio.wait_for(_run_backfill(), timeout=2)
+        assert getattr(error.value.orig, "sqlstate", None) == "55P03"
         async with pg_store.engine.connect() as observer:
-            async with asyncio.timeout(5):
-                while not await observer.scalar(
-                    text("SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = :pid"),
-                    {"pid": backfill_pid},
-                ):
-                    if backfill_task.done():
-                        await backfill_task
-                        pytest.fail("Backfill completed before the concurrent writer committed")
-                    await asyncio.sleep(0.01)
+            assert await observer.scalar(text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")) is None
 
         await writer_transaction.commit()
-        await asyncio.wait_for(backfill_task, timeout=5)
+        await _run_backfill()
     finally:
         if writer_transaction.is_active:
             await writer_transaction.rollback()
-        if backfill_task is not None and not backfill_task.done():
-            backfill_task.cancel()
-            await asyncio.gather(backfill_task, return_exceptions=True)
         await writer.close()
         await backfill.close()
 

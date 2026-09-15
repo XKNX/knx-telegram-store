@@ -536,17 +536,25 @@ class PostgresStore(BaseSQLStore):
         chunks decompress data and are subject to DML restrictions, so the
         common no-op case must stay read-only.
         """
-        # Serialize legacy backfills before reading any completion marker.
+        # Allow only one legacy backfill without making startup wait for it.
         # Database-scoped key: 0x4B4E5853 ("KNXS"), migration namespace 1.
         # Transaction ownership releases the lock on commit or rollback; the
-        # next caller then reads the committed markers before unwrapping.
-        connection.execute(text("SELECT pg_advisory_xact_lock(1263425619, 1)"))
+        # next initialization retries after the active backfill commits.
+        if not connection.execute(text("SELECT pg_try_advisory_xact_lock(1263425619, 1)")).scalar():
+            raise RuntimeError("Legacy telegram data backfill is already running")
         inspector = inspect(connection)
         try:
             columns = inspector.get_columns("telegrams")
         except Exception:
             return
         existing_columns = {col["name"] for col in columns}
+        already_unwrapped = connection.execute(
+            text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")
+        ).scalar()
+        if already_unwrapped != "true":
+            # Take the relation lock before any row updates. NOWAIT lets the
+            # caller skip this pass when a writer is active and retry later.
+            connection.execute(text("LOCK TABLE telegrams IN SHARE ROW EXCLUSIVE MODE NOWAIT"))
 
         def _pending(where: str) -> bool:
             return bool(connection.execute(text(f"SELECT EXISTS (SELECT 1 FROM telegrams WHERE {where})")).scalar())
@@ -604,14 +612,8 @@ class PostgresStore(BaseSQLStore):
         # Data unwrapping pass for legacy {"value": ...} wrapped structures.
         # The store_metadata flag marks completion so the full-table scan
         # doesn't run on every startup.
-        already_unwrapped = connection.execute(
-            text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")
-        ).scalar()
         if already_unwrapped == "true":
             return
-        # Block legacy writers from creating wrapped rows between the final
-        # scan and the completion marker. Completed migrations remain lock-free.
-        connection.execute(text("LOCK TABLE telegrams IN SHARE ROW EXCLUSIVE MODE"))
         wrapped = (
             "value::jsonb = jsonb_build_object('value', value::jsonb -> 'value') "
             "OR payload::jsonb = jsonb_build_object('value', payload::jsonb -> 'value')"
