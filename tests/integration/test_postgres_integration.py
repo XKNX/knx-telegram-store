@@ -21,13 +21,14 @@ Or manually:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
-pytest.importorskip("asyncpg")
+asyncpg = pytest.importorskip("asyncpg")
 
 from sqlalchemy import select, text  # noqa: E402
 from sqlalchemy.exc import DBAPIError  # noqa: E402
@@ -38,7 +39,7 @@ from knx_telegram_store import (  # noqa: E402
     StoredTelegram,
     TelegramQuery,
 )
-from knx_telegram_store.backends.postgres import PostgresStore, _build_engine  # noqa: E402
+from knx_telegram_store.backends.postgres import _NOTIFY_CHANNEL, PostgresStore, _build_engine  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
@@ -310,6 +311,44 @@ async def test_roundtrip_time_range_pagination_ordering(store):
     assert result.limit_reached
 
     assert await pg_store.count() == 50
+
+
+async def test_oversized_notify_payload_does_not_abort_batch(store):
+    backend_name, pg_store = store
+    timestamp = datetime.now(UTC)
+    oversized_value = "x" * 9000
+    oversized = StoredTelegram(
+        timestamp=timestamp,
+        source="1.1.1",
+        destination="1/2/3",
+        telegramtype="GroupValueWrite",
+        direction="Incoming",
+        value=oversized_value,
+    )
+    normal = make_telegram(timestamp, destination="4/5/6", value=21.5)
+    notifications: asyncio.Queue[str] = asyncio.Queue()
+    listener = await asyncpg.connect(_dsn(backend_name))
+
+    def _on_notify(_connection, _pid, _channel, payload):
+        notifications.put_nowait(payload)
+
+    try:
+        await listener.add_listener(_NOTIFY_CHANNEL, _on_notify)
+        await pg_store.store_many([oversized, normal])
+        received = json.loads(await asyncio.wait_for(notifications.get(), timeout=5))
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(notifications.get(), timeout=0.2)
+        result = await pg_store.query(TelegramQuery())
+    finally:
+        await listener.close()
+
+    assert received["destination"] == normal.destination
+    assert received["value"] == normal.value
+    assert result.total_count == 2
+    assert {telegram.value for telegram in result.telegrams} == {
+        oversized_value,
+        21.5,
+    }
 
 
 async def test_time_delta_context_window(store):
