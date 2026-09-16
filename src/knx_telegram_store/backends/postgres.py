@@ -536,6 +536,12 @@ class PostgresStore(BaseSQLStore):
         chunks decompress data and are subject to DML restrictions, so the
         common no-op case must stay read-only.
         """
+        # Allow only one legacy backfill without making startup wait for it.
+        # Database-scoped key: 0x4B4E5853 ("KNXS"), migration namespace 1.
+        # Transaction ownership releases the lock on commit or rollback; the
+        # next initialization retries after the active backfill commits.
+        if not connection.execute(text("SELECT pg_try_advisory_xact_lock(1263425619, 1)")).scalar():
+            raise RuntimeError("Legacy telegram data backfill is already running")
         inspector = inspect(connection)
         try:
             columns = inspector.get_columns("telegrams")
@@ -545,6 +551,32 @@ class PostgresStore(BaseSQLStore):
 
         def _pending(where: str) -> bool:
             return bool(connection.execute(text(f"SELECT EXISTS (SELECT 1 FROM telegrams WHERE {where})")).scalar())
+
+        already_unwrapped = connection.execute(
+            text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")
+        ).scalar()
+        nulls_recovered = self._metadata_flag_set(connection, "nulls_recovered")
+        legacy_float_columns = "value_legacy_float" in existing_columns and "value_numeric" in existing_columns
+        legacy_float_pending = None
+        unwrap_pending = already_unwrapped != "true"
+        nulls_pending = not nulls_recovered and "value" in existing_columns and "value_numeric" in existing_columns
+        needs_relation_lock = unwrap_pending or nulls_pending
+        if not needs_relation_lock and legacy_float_columns:
+            legacy_float_pending = _pending("value_numeric IS NULL AND value_legacy_float IS NOT NULL")
+            needs_relation_lock = legacy_float_pending
+        if needs_relation_lock:
+            # Only ACCESS EXCLUSIVE conflicts with the plain SELECT used by the
+            # old read-then-write unwrap migration. The other bulk updates only
+            # need to exclude writers. NOWAIT keeps startup non-blocking.
+            lock_mode = "ACCESS EXCLUSIVE" if unwrap_pending else "SHARE ROW EXCLUSIVE"
+            connection.execute(text(f"LOCK TABLE telegrams IN {lock_mode} MODE NOWAIT"))
+            # A pre-change migration may have committed between the optimistic
+            # marker reads and lock acquisition. Refresh before changing rows.
+            already_unwrapped = connection.execute(
+                text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")
+            ).scalar()
+            nulls_recovered = self._metadata_flag_set(connection, "nulls_recovered")
+            legacy_float_pending = None
 
         def _lift_decompression_limit() -> None:
             # TimescaleDB caps how many tuples one DML transaction may
@@ -561,7 +593,7 @@ class PostgresStore(BaseSQLStore):
         # so the library's query returns it correctly. The store_metadata flag
         # marks completion so the unindexed _pending probe doesn't scan the
         # whole telegrams table on every startup.
-        if not self._metadata_flag_set(connection, "nulls_recovered"):
+        if not nulls_recovered:
             if (
                 "value" in existing_columns
                 and "value_numeric" in existing_columns
@@ -583,10 +615,10 @@ class PostgresStore(BaseSQLStore):
 
         # Handle edge case from intermediate migrations where value was
         # a FLOAT column renamed to value_legacy_float
-        if (
-            "value_legacy_float" in existing_columns
-            and "value_numeric" in existing_columns
-            and _pending("value_numeric IS NULL AND value_legacy_float IS NOT NULL")
+        if legacy_float_columns and (
+            legacy_float_pending
+            if legacy_float_pending is not None
+            else _pending("value_numeric IS NULL AND value_legacy_float IS NOT NULL")
         ):
             _lift_decompression_limit()
             connection.execute(
@@ -599,107 +631,38 @@ class PostgresStore(BaseSQLStore):
         # Data unwrapping pass for legacy {"value": ...} wrapped structures.
         # The store_metadata flag marks completion so the full-table scan
         # doesn't run on every startup.
-        already_unwrapped = connection.execute(
-            text("SELECT value FROM store_metadata WHERE key = 'data_unwrapped'")
-        ).scalar()
         if already_unwrapped == "true":
             return
-        try:
-            # Postgres supports casting JSONB to text, so we can cast value::text or payload::text
-            rows = connection.execute(
+        wrapped = (
+            "value::jsonb = jsonb_build_object('value', value::jsonb -> 'value') "
+            "OR payload::jsonb = jsonb_build_object('value', payload::jsonb -> 'value')"
+        )
+        expected_rows = connection.execute(text(f"SELECT count(*) FROM telegrams WHERE {wrapped}")).scalar_one()
+        if expected_rows:
+            _lift_decompression_limit()
+            result = connection.execute(
                 text(
-                    "SELECT timestamp, source_id, destination_id, value::text, payload::text FROM telegrams "
-                    "WHERE (value::text LIKE '{\"value\":%' AND value IS NOT NULL) "
-                    "OR (payload::text LIKE '{\"value\":%' AND payload IS NOT NULL)"
-                )
-            ).fetchall()
-
-            if rows:
-                import json
-
-                _lift_decompression_limit()
-                for row in rows:
-                    timestamp = row[0]
-                    source_id = row[1]
-                    destination_id = row[2]
-                    val_str = row[3]
-                    pay_str = row[4]
-
-                    new_val = None
-                    new_pay = None
-                    needs_update = False
-
-                    def unwrap(s):
-                        if s is None:
-                            return None, False
-                        try:
-                            if isinstance(s, dict):
-                                d = s
-                            else:
-                                d = json.loads(s)
-                            if isinstance(d, dict) and "value" in d and len(d) == 1:
-                                return d["value"], True
-                        except Exception:
-                            pass
-                        return s, False
-
-                    if val_str is not None:
-                        unwrapped_val, unwrapped = unwrap(val_str)
-                        if unwrapped:
-                            new_val = unwrapped_val
-                            needs_update = True
-                        else:
-                            new_val = val_str
-
-                    if pay_str is not None:
-                        unwrapped_pay, unwrapped = unwrap(pay_str)
-                        if unwrapped:
-                            new_pay = unwrapped_pay
-                            needs_update = True
-                        else:
-                            new_pay = pay_str
-
-                    if needs_update:
-
-                        def to_json_str(orig_val, new_val_unwrapped, did_unwrap):
-                            if did_unwrap:
-                                return json.dumps(new_val_unwrapped)
-                            if orig_val is None:
-                                return None
-                            if isinstance(orig_val, dict | list | int | float | bool):
-                                return json.dumps(orig_val)
-                            try:
-                                json.loads(orig_val)
-                                return orig_val
-                            except Exception:
-                                return json.dumps(orig_val)
-
-                        json_val = to_json_str(val_str, new_val, val_str != new_val)
-                        json_pay = to_json_str(pay_str, new_pay, pay_str != new_pay)
-
-                        connection.execute(
-                            text(
-                                "UPDATE telegrams SET value = :value, payload = :payload "
-                                "WHERE timestamp = :timestamp AND source_id = :source_id AND destination_id = :destination_id"
-                            ),
-                            {
-                                "value": json_val,
-                                "payload": json_pay,
-                                "timestamp": timestamp,
-                                "source_id": source_id,
-                                "destination_id": destination_id,
-                            },
-                        )
-
-            # Record successful migration state in store_metadata
-            connection.execute(
-                text(
-                    "INSERT INTO store_metadata (key, value) VALUES ('data_unwrapped', 'true') "
-                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+                    "UPDATE telegrams SET "
+                    "value = CASE WHEN value::jsonb = jsonb_build_object('value', value::jsonb -> 'value') "
+                    "THEN value::jsonb -> 'value' ELSE value::jsonb END, "
+                    "payload = CASE WHEN payload::jsonb = jsonb_build_object('value', payload::jsonb -> 'value') "
+                    "THEN payload::jsonb -> 'value' ELSE payload::jsonb END "
+                    f"WHERE {wrapped}"
                 )
             )
-        except Exception:
-            pass
+            # A decoded dictionary can itself be {"value": ...}; validate the
+            # update count, not its resulting shape. Skipped/raced rows must
+            # roll back the pass before recording completion.
+            if result.rowcount != expected_rows:
+                raise RuntimeError("Legacy telegram data unwrapping did not update the expected number of rows")
+
+        # Record successful migration state in store_metadata
+        connection.execute(
+            text(
+                "INSERT INTO store_metadata (key, value) VALUES ('data_unwrapped', 'true') "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+            )
+        )
 
     def _needs_migration_sync(self, connection) -> bool:
         """Synchronously check if legacy Postgres schema migration is required."""
