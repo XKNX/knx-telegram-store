@@ -568,6 +568,9 @@ class SqliteStore(BaseSQLStore):
             )
 
         # 4. Data unwrapping pass for legacy {"value": ...} wrapped structures
+        if self._metadata_flag_set(connection, "data_unwrapped"):
+            return
+
         try:
             # Query rowid, value, payload from telegrams where they are legacy JSON wrapped
             rows = connection.execute(
