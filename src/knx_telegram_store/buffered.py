@@ -5,20 +5,22 @@ import logging
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .backends.memory import MemoryStore
-from .backends.postgres import PostgresStore
-from .backends.sqlite import SqliteStore
 from .model import StoredTelegram
 from .query import TelegramQuery, TelegramQueryResult
 from .store import StoreStats, wrap_store_errors
+
+if TYPE_CHECKING:
+    from .buffered_sql import BufferedPostgresStore as BufferedPostgresStore
+    from .buffered_sql import BufferedSqliteStore as BufferedSqliteStore
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class _BufferMixin:
-    """Write-buffering mixin for SQL-backed TelegramStore subclasses.
+    """Write-buffering mixin for TelegramStore subclasses.
 
     Place this before the concrete store in the MRO:
 
@@ -33,7 +35,7 @@ class _BufferMixin:
     - flush() atomically drains the buffer and delegates to store_many().
     - On flush failure the batch is re-prepended so no writes are lost.
     - query() accepts flush_first=True to guarantee read-your-writes consistency.
-    - clear() wipes both the in-memory buffer and the underlying table.
+    - clear() wipes both the in-memory buffer and the backing store.
     """
 
     def __init__(
@@ -275,26 +277,6 @@ class _BufferMixin:
                 await super().clear()  # type: ignore[misc]
 
 
-class BufferedSqliteStore(_BufferMixin, SqliteStore):
-    """SqliteStore with transparent write-buffering.
-
-    Args:
-        db_path: Path to the SQLite database file, or ``:memory:``.
-        retention_days: Optional retention period in days.
-        flush_interval: Seconds between automatic buffer flushes (default 1.0).
-    """
-
-
-class BufferedPostgresStore(_BufferMixin, PostgresStore):
-    """PostgresStore with transparent write-buffering.
-
-    Args:
-        dsn: PostgreSQL connection string.
-        retention_days: Optional retention period in days.
-        flush_interval: Seconds between automatic buffer flushes (default 1.0).
-    """
-
-
 class BufferedMemoryStore(_BufferMixin, MemoryStore):
     """MemoryStore with transparent write-buffering.
 
@@ -316,3 +298,17 @@ class BufferedMemoryStore(_BufferMixin, MemoryStore):
         """Keep the memory backend's max-size-only retention semantics."""
         async with self._mutation():
             return await MemoryStore.evict_older_than(self, cutoff, dry_run=dry_run)
+
+
+_SQL_BUFFERED_EXPORTS = {
+    "BufferedPostgresStore",
+    "BufferedSqliteStore",
+}
+
+
+def __getattr__(name: str) -> Any:
+    if name in _SQL_BUFFERED_EXPORTS:
+        from . import buffered_sql
+
+        return getattr(buffered_sql, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
