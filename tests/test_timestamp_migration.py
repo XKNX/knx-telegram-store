@@ -17,6 +17,7 @@ from knx_telegram_store import StoredTelegram, TelegramQuery
 from knx_telegram_store.backends.sqlite import SqliteStore
 
 BERLIN = ZoneInfo("Europe/Berlin")  # +01:00 winter, +02:00 summer
+LONDON = ZoneInfo("Europe/London")  # UTC in winter, +01:00 summer
 
 
 async def _legacy_db(path, wall_clock_stamps: list[str]) -> None:
@@ -90,6 +91,25 @@ async def test_rows_written_after_the_upgrade_are_not_shifted_again(tmp_path):
     stamps = {t.source: t.timestamp for t in (await store.query(TelegramQuery(limit=10))).telegrams}
     assert stamps["1.1.1"] == datetime(2026, 7, 15, 10, 0, tzinfo=UTC)
     assert stamps["1.1.2"] == fresh, "an already-UTC row was shifted"
+    await store.close()
+
+
+async def test_a_zone_that_is_utc_for_half_the_year(tmp_path):
+    """Europe/London's winter rows are already UTC and must not move.
+
+    The summer ones still have to be shifted, so the statement carries a branch
+    that leaves a row alone rather than shifting it by zero.
+    """
+    path = tmp_path / "london.db"
+    await _legacy_db(path, ["2026-01-15 12:00:00.000000", "2026-07-15 12:00:00.000000"])
+
+    store = SqliteStore(str(path))
+    await store.initialize()
+    assert await store.migrate_timestamps_to_utc(LONDON) == 2
+
+    stamps = sorted(t.timestamp for t in (await store.query(TelegramQuery(limit=10))).telegrams)
+    assert stamps[0] == datetime(2026, 1, 15, 12, 0, tzinfo=UTC), "a GMT row is already UTC"
+    assert stamps[1] == datetime(2026, 7, 15, 11, 0, tzinfo=UTC), "a BST row should shift by 1h"
     await store.close()
 
 

@@ -32,10 +32,13 @@ _LOGGER = logging.getLogger(__name__)
 _SQL_TS = "%Y-%m-%d %H:%M:%S.%f"
 
 
-def _as_naive(raw: str | datetime) -> datetime:
-    """Parse a stored timestamp into a naive datetime."""
-    if isinstance(raw, datetime):
-        return raw.replace(tzinfo=None)
+def _as_naive(raw: str) -> datetime:
+    """Parse a stored timestamp into a naive datetime.
+
+    The bounds are read with a raw ``text()`` query, so they arrive as the
+    driver's own type for a SQLite TEXT column rather than through the
+    ``UtcDateTime`` decorator.
+    """
     return datetime.fromisoformat(raw).replace(tzinfo=None)
 
 
