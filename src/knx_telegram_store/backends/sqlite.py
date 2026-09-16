@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from urllib.parse import quote
 
@@ -24,16 +26,115 @@ def _classify_sqlite_error(exc: BaseException) -> ConnectionErrorKind:
     return ConnectionErrorKind.UNKNOWN
 
 
+_LOGGER = logging.getLogger(__name__)
+
+# SQLite stores datetimes as text; these mirror that representation.
+_SQL_TS = "%Y-%m-%d %H:%M:%S.%f"
+
+
+def _as_naive(raw: str) -> datetime:
+    """Parse a stored timestamp into a naive datetime.
+
+    The bounds are read with a raw ``text()`` query, so they arrive as the
+    driver's own type for a SQLite TEXT column rather than through the
+    ``UtcDateTime`` decorator.
+    """
+    return datetime.fromisoformat(raw).replace(tzinfo=None)
+
+
+def _sql_ts(value: datetime) -> str:
+    return value.strftime(_SQL_TS)
+
+
+def _offset_at(moment: datetime, zone: tzinfo) -> int:
+    """The zone's UTC offset in seconds at a naive local wall-clock time.
+
+    Ambiguous times (the repeated hour of a fall-back) resolve to the first
+    pass, and times in a spring-forward gap — which no telegram can carry —
+    to the offset still in force before it. Both follow from fold=0.
+    """
+    delta = moment.replace(tzinfo=zone).utcoffset() or timedelta(0)
+    return int(delta.total_seconds())
+
+
+def _transition_between(before: datetime, after: datetime, zone: tzinfo, offset: int) -> datetime:
+    """Bisect for the first second in (before, after] that no longer has ``offset``.
+
+    The coarse walk only tells us a transition happened somewhere inside an
+    hour. Several zones do not move on the hour — Pacific/Chatham changes at
+    03:45, Lord Howe at 02:00 by half an hour — so rounding the boundary to the
+    next hour would convert everything in between with the wrong offset.
+    """
+    while after - before > timedelta(seconds=1):
+        middle = before + (after - before) / 2
+        if _offset_at(middle, zone) == offset:
+            before = middle
+        else:
+            after = middle
+    return after.replace(microsecond=0)
+
+
+def _offset_intervals(
+    oldest: datetime, newest: datetime, zone: tzinfo, *, step: timedelta = timedelta(hours=1)
+) -> list[tuple[datetime, datetime, int]]:
+    """Split [oldest, newest] into stretches of constant UTC offset.
+
+    Walks the range and coalesces, so a zone with daylight saving yields a
+    couple of intervals per year rather than one entry per row. The walk is
+    hourly because no zone holds an offset for less than that, but each
+    boundary it finds is then bisected to the exact second.
+
+    Returns (start, end_exclusive, offset_seconds) with the last interval
+    extended past ``newest`` so the final rows are included.
+    """
+    intervals: list[tuple[datetime, datetime, int]] = []
+    cursor = oldest.replace(minute=0, second=0, microsecond=0)
+    end = newest + step
+    current_offset: int | None = None
+    start = cursor
+    previous = cursor
+
+    while cursor <= end:
+        offset = _offset_at(cursor, zone)
+        if current_offset is None:
+            current_offset, start = offset, cursor
+        elif offset != current_offset:
+            boundary = _transition_between(previous, cursor, zone, current_offset)
+            intervals.append((start, boundary, current_offset))
+            current_offset, start = offset, boundary
+        previous = cursor
+        cursor += step
+
+    if current_offset is not None:
+        # Open-ended tail so rows at the very end are not missed.
+        intervals.append((start, end + step, current_offset))
+    return intervals
+
+
 class SqliteStore(BaseSQLStore):
     """Async SQLite implementation of TelegramStore."""
 
-    def __init__(self, db_path: str | Path, retention_days: int | None = None, *, read_only: bool = False) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        retention_days: int | None = None,
+        *,
+        read_only: bool = False,
+        legacy_timestamp_timezone: tzinfo | None = None,
+    ) -> None:
         """Initialize the SQLite store.
 
         With read_only=True the file is opened with sqlite's ``mode=ro`` (writes
         are impossible at the driver level), no DDL/migrations are run, and all
         mutating operations raise. Intended for reading a database owned and
         written by another process (e.g. Home Assistant's telegram store).
+
+        ``legacy_timestamp_timezone`` is the timezone whose wall clock wrote the
+        rows of a database created before timestamps were normalised to UTC. Pass
+        it and initialize() converts them automatically, once. Callers that
+        always stored ``datetime.now(UTC)`` pass ``UTC``, which marks the
+        database converted without touching a row. Leave it unset and the
+        conversion is skipped and merely offered — see migrate_timestamps_to_utc().
         """
         self._is_memory = str(db_path) == ":memory:"
         if self._is_memory:
@@ -57,6 +158,7 @@ class SqliteStore(BaseSQLStore):
         # timeout is sqlite's busy timeout: with a concurrent writer (WAL or
         # rollback journal) readers wait instead of failing with SQLITE_BUSY.
         engine = create_async_engine(url, connect_args={"timeout": 10})
+        self._legacy_timestamp_timezone = legacy_timestamp_timezone
         super().__init__(engine, retention_days, read_only=read_only)
 
     @staticmethod
@@ -122,8 +224,232 @@ class SqliteStore(BaseSQLStore):
             # 2.1 Indexes the model declares but an existing database may lack (SpectrumKNX#450)
             await conn.run_sync(self.ensure_indexes)
 
-        # 3. Warm the cache
+            # 2.2 Classify the timestamp convention (XKNX/knx-frontend#459)
+            await conn.run_sync(self._classify_timestamp_convention)
+
+        # 3. Convert pre-UTC timestamps, if the caller told us what wrote them.
+        #    Ahead of the cache warm below, which reads timestamps back.
+        if self._legacy_timestamp_timezone is not None:
+            await self.migrate_timestamps_to_utc(self._legacy_timestamp_timezone)
+
+        # 4. Warm the cache
         await super().initialize()
+
+    # ── Timestamp convention (XKNX/knx-frontend#459) ─────────────────────────
+    #
+    # Databases written before timestamps were normalised to UTC hold whatever
+    # wall clock the writer passed in, with no offset to say which. Reading
+    # those back as UTC shifts them by that offset. Which offset is not
+    # recoverable from the data, and it differs between hosts using this very
+    # library: Home Assistant writes its *configured* timezone (which need not
+    # match the host's), while SpectrumKNX writes datetime.now(UTC). Guessing
+    # from the system timezone would therefore fix the first and corrupt the
+    # second. So the host names the zone once, via the constructor, and the
+    # conversion then runs automatically on the next start like any other
+    # migration. Unset, it stays a no-op the host can trigger by hand.
+
+    _UTC_FLAG = "timestamps_utc"
+    _UTC_BOUNDARY = "timestamps_utc_from"
+    _LEGACY_MAX_ROWID = "timestamps_legacy_max_rowid"
+    _UTC_SOURCE_ZONE = "timestamps_utc_source_zone"
+
+    def _classify_timestamp_convention(self, connection) -> None:
+        """Record whether this database's timestamps are already UTC.
+
+        A database created now is UTC by construction. An empty one has nothing
+        to convert, so it counts as UTC too. Anything else keeps its rows and
+        gets markers recorded, so a later migration knows what predates the
+        upgrade and cannot shift the same row twice: ``telegrams`` by its last
+        rowid, exact because the table is append-only, and ``last_ga_telegrams``
+        - upserted in place, where no rowid helps - by the instant from which
+        its rows are UTC.
+        """
+        if self._metadata_flag_set(connection, self._UTC_FLAG):
+            return
+
+        # Both tables, because retention can empty telegrams while last values
+        # remain: treating that as an empty database would flag it converted
+        # and strand the rows that are left.
+        has_rows = connection.execute(
+            text("SELECT EXISTS (SELECT 1 FROM telegrams) OR EXISTS (SELECT 1 FROM last_ga_telegrams)")
+        ).scalar()
+        if not has_rows:
+            self._set_metadata_value(connection, self._UTC_FLAG, "true")
+            return
+
+        if self._metadata_value(connection, self._UTC_BOUNDARY) is None:
+            if self._legacy_timestamp_timezone is not None:
+                # initialize() converts right after this, before the store has
+                # written a single row, so there is nothing to protect from a
+                # second shift. Recording a boundary would only do harm: it is a
+                # UTC instant, while these rows still hold local wall-clock
+                # digits, so east of UTC it excludes exactly the rows written in
+                # the hours before the upgrade - and they would then be flagged
+                # converted without having been.
+                return
+            boundary = datetime.now(UTC).isoformat()
+            self._set_metadata_value(connection, self._UTC_BOUNDARY, boundary)
+            last_rowid = connection.execute(text("SELECT max(rowid) FROM telegrams")).scalar()
+            self._set_metadata_value(connection, self._LEGACY_MAX_ROWID, str(last_rowid or 0))
+            _LOGGER.warning(
+                "This database predates UTC timestamp normalisation, so existing rows hold local "
+                "wall-clock times and will read as UTC until converted. Telegrams stored from now "
+                "on are UTC. Pass legacy_timestamp_timezone=<the zone that wrote them> to convert "
+                "the existing ones on the next start, or call migrate_timestamps_to_utc()."
+            )
+
+    async def needs_timestamp_migration(self) -> bool:
+        """Whether this database still holds pre-UTC timestamps."""
+        async with self.engine.connect() as conn:
+            return not await conn.run_sync(lambda c: self._metadata_flag_set(c, self._UTC_FLAG))
+
+    @wrap_store_errors
+    async def migrate_timestamps_to_utc(self, source_timezone: tzinfo) -> int:
+        """Convert pre-UTC timestamps, interpreting them in ``source_timezone``.
+
+        Only rows older than the boundary recorded at first start after the
+        upgrade are touched, so calling this after the store has already written
+        UTC rows cannot shift them a second time. Idempotent: once finished the
+        database is flagged and further calls do nothing.
+
+        Each table is rewritten by a single statement whose CASE carries one
+        branch per stretch of constant UTC offset, so daylight saving is handled
+        correctly and every row is read once and written once. Rows falling in a
+        repeated hour are inherently ambiguous and resolve to the first pass.
+        """
+        self._ensure_writable()
+        if not await self.needs_timestamp_migration():
+            return 0
+
+        async with self.engine.begin() as conn:
+            scopes = await self._legacy_row_scopes(conn, source_timezone)
+
+            converted = 0
+            # last_ga_telegrams keeps one row per group address and is not subject
+            # to retention, so it can hold values older than anything left in
+            # telegrams — and can be non-empty when telegrams is empty. Its range
+            # is therefore measured on its own rather than borrowed.
+            for table, count_rows in (("telegrams", True), ("last_ga_telegrams", False)):
+                rows = await self._convert_table_to_utc(conn, table, source_timezone, *scopes[table])
+                if count_rows:
+                    converted += rows
+
+            await conn.run_sync(lambda c: self._set_metadata_value(c, self._UTC_FLAG, "true"))
+            # Which zone was assumed, so a conversion done with the wrong one
+            # can be recognised afterwards rather than inferred from the damage.
+            await conn.run_sync(lambda c: self._set_metadata_value(c, self._UTC_SOURCE_ZONE, str(source_timezone)))
+
+        _LOGGER.info("Converted %d telegram timestamps from %s to UTC", converted, source_timezone)
+        return converted
+
+    async def _legacy_row_scopes(self, conn, zone: tzinfo) -> dict[str, tuple[str, dict[str, object]]]:
+        """Which rows of each table still predate the upgrade.
+
+        ``telegrams`` is append-only, so the rowid recorded at the first start
+        after the upgrade separates the two populations exactly - which a
+        timestamp cannot, because the legacy rows hold local wall-clock digits
+        while the ones written since hold UTC, and east of UTC those two ranges
+        overlap. A marker above the table's current maximum means retention
+        emptied it in between and rowids restarted, so it is discarded.
+
+        ``last_ga_telegrams`` is upserted per group address and carries no such
+        order, leaving only the boundary instant. Comparing it with wall-clock
+        digits is exactly the overlap above, so the bound stays conservative: a
+        row still holding a local time from the last hours before the upgrade is
+        left alone rather than risk shifting an already converted one. It
+        corrects itself the next time that group address is seen.
+
+        One corner stays open, and cannot be closed without marking the rows
+        themselves: retention emptying ``telegrams`` completely between the
+        upgrade and the migration, so that rowids restart under the marker. A
+        marker above the current maximum catches most of that, and the boundary
+        read in the legacy frame catches rows written more than the zone's
+        offset afterwards - but a row written into the emptied table within that
+        window is indistinguishable from a legacy one.
+        """
+        boundary_raw = await conn.run_sync(lambda c: self._metadata_value(c, self._UTC_BOUNDARY))
+        if not boundary_raw:
+            # No boundary: nothing was written since the upgrade, so every row
+            # in the database is legacy.
+            return {"telegrams": ("1 = 1", {}), "last_ga_telegrams": ("1 = 1", {})}
+
+        boundary = datetime.fromisoformat(boundary_raw).astimezone(UTC).replace(tzinfo=None)
+        conservative: tuple[str, dict[str, object]] = ("timestamp < :boundary", {"boundary": _sql_ts(boundary)})
+        scopes: dict[str, tuple[str, dict[str, object]]] = {
+            "telegrams": conservative,
+            "last_ga_telegrams": conservative,
+        }
+
+        marker_raw = await conn.run_sync(lambda c: self._metadata_value(c, self._LEGACY_MAX_ROWID))
+        if marker_raw is not None:
+            marker = int(marker_raw)
+            current = (await conn.execute(text("SELECT max(rowid) FROM telegrams"))).scalar() or 0
+            if current >= marker:
+                # The legacy rows hold local wall-clock digits, so the boundary
+                # is read in that same frame: east of UTC a row written just
+                # before the upgrade carries digits above the boundary instant.
+                boundary_local = datetime.fromisoformat(boundary_raw).astimezone(zone).replace(tzinfo=None)
+                scopes["telegrams"] = (
+                    "rowid <= :max_rowid AND timestamp < :boundary_local",
+                    {"max_rowid": marker, "boundary_local": _sql_ts(boundary_local)},
+                )
+
+        return scopes
+
+    async def _convert_table_to_utc(self, conn, table: str, zone: tzinfo, where: str, scope: dict[str, object]) -> int:
+        """Shift one table's legacy timestamps into UTC with a single UPDATE.
+
+        One statement rather than one per offset interval, because consecutive
+        statements read a column the previous one has already written: west of
+        UTC the shift moves timestamps *forward*, into the range a later
+        interval then matches, and the row is converted twice.
+        """
+        bounds = (
+            await conn.execute(
+                text(f"SELECT min(timestamp), max(timestamp) FROM {table} WHERE {where}"),  # noqa: S608 - fixed names
+                scope,
+            )
+        ).fetchone()
+        if bounds is None or bounds[0] is None:
+            return 0
+
+        oldest, newest = _as_naive(bounds[0]), _as_naive(bounds[1])
+        intervals = _offset_intervals(oldest, newest, zone)
+        if not any(offset for _, _, offset in intervals):
+            return 0  # the whole range was already UTC
+
+        # SQLite's datetime() drops fractional seconds, so the shifted whole
+        # seconds are recombined with the original fraction. COALESCE keeps a
+        # row unchanged rather than nulling it should strftime reject the input.
+        params: dict[str, object] = dict(scope)
+
+        def shift_expr(index: int, offset: int) -> str:
+            if not offset:
+                return "timestamp"
+            params[f"shift_{index}"] = f"{-offset} seconds"
+            return f"strftime('%Y-%m-%d %H:%M:%S', timestamp, :shift_{index}) || substr(timestamp, 20)"
+
+        if len(intervals) == 1:
+            # A range with no transition in it needs no CASE at all, and would
+            # otherwise produce "CASE ELSE ... END", which SQLite rejects.
+            expression = shift_expr(0, intervals[0][2])
+        else:
+            branches = []
+            for index, (_, end_of, offset) in enumerate(intervals[:-1]):
+                params[f"end_{index}"] = _sql_ts(end_of)
+                branches.append(f"WHEN timestamp < :end_{index} THEN {shift_expr(index, offset)}")
+            last = len(intervals) - 1
+            branches.append(f"ELSE {shift_expr(last, intervals[last][2])}")  # the open-ended tail
+            expression = f"CASE {' '.join(branches)} END"
+
+        result = await conn.execute(
+            text(
+                f"UPDATE {table} SET timestamp = COALESCE({expression}, timestamp) "  # noqa: S608 - fixed names
+                f"WHERE {where}"
+            ),
+            params,
+        )
+        return result.rowcount or 0
 
     def _upgrade_schema(self, connection) -> None:
         """Synchronous part of schema upgrade (run via run_sync)."""

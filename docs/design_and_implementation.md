@@ -87,7 +87,7 @@ class StoredTelegram:
     """A KNX telegram in its stored/serialized form."""
 
     # ── Core identity ─────────────────────────────────────────────
-    timestamp: datetime  # timezone-aware (UTC or local)
+    timestamp: datetime  # timezone-aware; stored and returned as UTC
 
     # ── Addressing ────────────────────────────────────────────────
     source: str  # Individual address, e.g. "1.2.3"
@@ -344,7 +344,7 @@ SqliteStore(db_path: str | Path, max_telegrams: int | None = None)
 ```sql
 CREATE TABLE IF NOT EXISTS telegrams (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp     TEXT NOT NULL,          -- ISO 8601 with timezone
+    timestamp     TEXT NOT NULL,          -- UTC, no offset (SQLite has no tz type)
     source        TEXT NOT NULL,
     destination   TEXT NOT NULL,
     telegramtype  TEXT NOT NULL,

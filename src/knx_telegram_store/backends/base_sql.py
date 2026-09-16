@@ -16,6 +16,7 @@ from sqlalchemy import (
     MetaData,
     Table,
     Text,
+    TypeDecorator,
     and_,
     cast,
     func,
@@ -33,6 +34,67 @@ from ..store import KnxTelegramStoreException, StoreCapabilities, StoreStats, Te
 
 _LOGGER = logging.getLogger(__name__)
 _LAST_GA_RECONCILED_KEY = "last_ga_newest_reconciled"
+
+
+class UtcDateTime(TypeDecorator):
+    """A datetime column that is always stored and returned as UTC-aware.
+
+    StoredTelegram.timestamp is documented as timezone-aware UTC, but the
+    plain DateTime(timezone=True) type did not deliver that on SQLite, which
+    has no native datetime: SQLAlchemy wrote the naive digits and *discarded
+    the offset without converting*. Two telegrams two hours apart — noon at
+    +02:00 and noon at UTC — were stored as the same string, so the instant
+    was lost rather than merely the annotation. Reads then came back naive,
+    which is how the same telegram ended up with two different serializations
+    depending on whether it arrived live or from history
+    (XKNX/knx-frontend#459).
+
+    Normalising in one place fixes both directions for every backend:
+    PostgreSQL already round-tripped correctly and is unaffected in substance.
+
+    A naive value on the way in is taken to be UTC rather than guessed at —
+    guessing would need the writer's timezone, which this library has no way
+    to know.
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def coerce_compared_value(self, op: Any, value: Any) -> Any:
+        """Keep datetimes on this type; let DateTime rule on anything else.
+
+        A TypeDecorator otherwise types every comparison operand as itself,
+        which breaks datetime arithmetic: the time-delta context window builds
+        "timestamp - :delta" with a timedelta, and typing that as a timestamp
+        makes PostgreSQL reject "timestamptz >= interval". DateTime's own rules
+        map a timedelta to an Interval, so non-datetimes are delegated.
+
+        Datetimes must *not* be delegated, though. Doing so hands query bounds
+        to the plain DateTime, which on SQLite writes the digits and drops the
+        offset — the very bug this type exists to fix, reappearing on the read
+        side: a telegram stored at 12:00+02:00 would not be found by a range
+        from 11:00+02:00 to 13:00+02:00 (XKNX/knx-telegram-store#40 review).
+        """
+        if isinstance(value, datetime):
+            return self
+        return self.impl.coerce_compared_value(op, value)
+
+    def process_bind_param(self, value: Any, dialect: Any) -> Any:
+        # Belt and braces alongside coerce_compared_value above: anything that
+        # is not a datetime is passed through untouched.
+        if not isinstance(value, datetime):
+            return value
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    def process_result_value(self, value: Any, dialect: Any) -> Any:
+        if not isinstance(value, datetime):
+            return value
+        if value.tzinfo is None:
+            # SQLite: stored naive, and by the bind above those digits are UTC.
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
 
 class BaseSQLStore(TelegramStore):
@@ -54,7 +116,7 @@ class BaseSQLStore(TelegramStore):
         self.telegrams = Table(
             "telegrams",
             self._metadata,
-            Column("timestamp", DateTime(timezone=True), nullable=False, index=True),
+            Column("timestamp", UtcDateTime, nullable=False, index=True),
             Column("source_id", Integer, nullable=False, index=True),
             Column("destination_id", Integer, nullable=False, index=True),
             Column("telegramtype_id", Integer, nullable=False, index=True),
@@ -80,7 +142,7 @@ class BaseSQLStore(TelegramStore):
             "last_ga_telegrams",
             self._metadata,
             Column("destination_id", Integer, primary_key=True),
-            Column("timestamp", DateTime(timezone=True), nullable=False),
+            Column("timestamp", UtcDateTime, nullable=False),
             Column("source_id", Integer, nullable=False),
             Column("telegramtype_id", Integer, nullable=False),
             Column("direction_id", Integer, nullable=False),
@@ -158,6 +220,25 @@ class BaseSQLStore(TelegramStore):
         except Exception:
             return False
         return row is not None and row[0] == "true"
+
+    @staticmethod
+    def _set_metadata_value(connection, key: str, value: str) -> None:
+        """Write a store_metadata value (upsert, dialect-agnostic)."""
+        connection.execute(text("DELETE FROM store_metadata WHERE key = :key"), {"key": key})
+        connection.execute(
+            text("INSERT INTO store_metadata (key, value) VALUES (:key, :value)"), {"key": key, "value": value}
+        )
+
+    @staticmethod
+    def _metadata_value(connection, key: str) -> str | None:
+        """Read a store_metadata value, or None when absent/unreadable."""
+        try:
+            if not inspect(connection).has_table("store_metadata"):
+                return None
+            row = connection.execute(text("SELECT value FROM store_metadata WHERE key = :key"), {"key": key}).fetchone()
+        except Exception:
+            return None
+        return row[0] if row is not None else None
 
     @wrap_store_errors
     async def initialize(self) -> None:
