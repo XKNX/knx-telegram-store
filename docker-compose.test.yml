@@ -11,7 +11,12 @@ services:
       POSTGRES_PASSWORD: knxtest
       POSTGRES_DB: knx
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U knx -d knx"]
+      # Over TCP, not the unix socket: the entrypoint runs a temporary init
+      # server that listens on the socket alone, so a socket check reports
+      # healthy while that server is still about to be shut down and replaced.
+      # `up --wait` then returns mid-shutdown and the first connections are
+      # reset by peer.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U knx -d knx"]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -25,7 +30,12 @@ services:
       POSTGRES_PASSWORD: knxtest
       POSTGRES_DB: knx
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U knx -d knx"]
+      # Over TCP, not the unix socket: the entrypoint runs a temporary init
+      # server that listens on the socket alone, so a socket check reports
+      # healthy while that server is still about to be shut down and replaced.
+      # `up --wait` then returns mid-shutdown and the first connections are
+      # reset by peer.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U knx -d knx"]
       interval: 2s
       timeout: 5s
       retries: 30
