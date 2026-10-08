@@ -720,4 +720,15 @@ class SqliteStore(BaseSQLStore):
             except Exception:
                 pass
 
-        return False
+        # 6. Pre-UTC timestamps still to convert, which initialize() does on this
+        #    start when the caller named the zone that wrote them. Without the
+        #    zone the conversion is only offered, so there is nothing to wait for.
+        #    Mirrors _classify_timestamp_convention(): an empty database counts as UTC.
+        if (
+            self._legacy_timestamp_timezone is not None
+            and not self._metadata_flag_set(connection, self._UTC_FLAG)
+            and (self._has_rows(connection, "telegrams") or self._has_rows(connection, "last_ga_telegrams"))
+        ):
+            return True
+
+        return super()._needs_migration_sync(connection)

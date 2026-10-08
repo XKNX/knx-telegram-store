@@ -765,4 +765,4 @@ class PostgresStore(BaseSQLStore):
             except Exception:
                 pass
 
-        return False
+        return super()._needs_migration_sync(connection)
