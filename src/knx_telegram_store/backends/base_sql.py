@@ -433,6 +433,27 @@ class BaseSQLStore(TelegramStore):
         cutoff = datetime.now(UTC) - timedelta(days=self._retention_days)
         return await self.evict_older_than(cutoff, dry_run=dry_run)
 
+    def _lookup_filter(self, column: Any, category: str, values: list[str]) -> Any:
+        """``column`` holds the id of any of ``values`` in ``category``.
+
+        One scalar subquery per value, OR-ed, rather than ``column IN (SELECT
+        id ... WHERE value IN (...))``. The two are equivalent - (category,
+        value) is unique - but SQLite's planner cannot tell how many ids an IN
+        subquery yields and assumes many: with statistics in place it then
+        preferred walking the whole timestamp index over the destination or
+        source index for a single group address (284 ms against 24 ms on 1M
+        rows). An equality against a scalar subquery is one value, and the
+        planner picks the index.
+        """
+        lookup = self.string_lookup
+        return or_(
+            *(
+                column
+                == select(lookup.c.id).where(lookup.c.category == category, lookup.c.value == value).scalar_subquery()
+                for value in values
+            )
+        )
+
     @wrap_store_errors
     async def query(self, query: TelegramQuery, *, flush_first: bool = False) -> TelegramQueryResult:
         """Retrieve telegrams matching the given query.
@@ -443,26 +464,13 @@ class BaseSQLStore(TelegramStore):
         # 1. Base Filters
         filters: list[Any] = []
         if query.sources:
-            # Subquery to get IDs for sources
-            source_ids = select(self.string_lookup.c.id).where(
-                self.string_lookup.c.category == "source", self.string_lookup.c.value.in_(query.sources)
-            )
-            filters.append(self.telegrams.c.source_id.in_(source_ids))
+            filters.append(self._lookup_filter(self.telegrams.c.source_id, "source", query.sources))
         if query.destinations:
-            dest_ids = select(self.string_lookup.c.id).where(
-                self.string_lookup.c.category == "destination", self.string_lookup.c.value.in_(query.destinations)
-            )
-            filters.append(self.telegrams.c.destination_id.in_(dest_ids))
+            filters.append(self._lookup_filter(self.telegrams.c.destination_id, "destination", query.destinations))
         if query.telegram_types:
-            tt_ids = select(self.string_lookup.c.id).where(
-                self.string_lookup.c.category == "telegramtype", self.string_lookup.c.value.in_(query.telegram_types)
-            )
-            filters.append(self.telegrams.c.telegramtype_id.in_(tt_ids))
+            filters.append(self._lookup_filter(self.telegrams.c.telegramtype_id, "telegramtype", query.telegram_types))
         if query.directions:
-            dir_ids = select(self.string_lookup.c.id).where(
-                self.string_lookup.c.category == "direction", self.string_lookup.c.value.in_(query.directions)
-            )
-            filters.append(self.telegrams.c.direction_id.in_(dir_ids))
+            filters.append(self._lookup_filter(self.telegrams.c.direction_id, "direction", query.directions))
         dpt_conds: list[Any] = []
         if query.dpt_mains:
             dpt_conds.append(self.telegrams.c.dpt_main.in_(query.dpt_mains))
