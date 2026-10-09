@@ -2,8 +2,9 @@
 
 Without ``sqlite_stat1`` the planner guesses, and the same filter gets a good
 plan on one database and a several times slower one on another
-(XKNX/knx-telegram-store#78). initialize() runs ANALYZE when statistics are
-missing or stale.
+(XKNX/knx-telegram-store#78). initialize() runs ANALYZE when a file has no
+statistics, evict_older_than() refreshes stale ones, close() lets SQLite
+refresh its own.
 """
 
 import sqlite3
@@ -119,6 +120,19 @@ async def test_large_table_is_reported_until_analysed(tmp_path: Path, monkeypatc
     await store.close()
 
 
+async def test_stale_statistics_are_not_a_startup_pass(tmp_path: Path) -> None:
+    """A file that has statistics keeps them at start; the refresh waits for the next eviction."""
+    path = tmp_path / "t.db"
+    await _database(path, rows=3)
+    _set_timestamp_stat(path, "100000 1")
+
+    store = SqliteStore(str(path))
+    assert await store.needs_migration() is False
+    await store.initialize()
+    await store.close()
+    assert _timestamp_stat(path) == "100000 1"
+
+
 @pytest.mark.parametrize(
     ("recorded", "refreshed"),
     [
@@ -127,16 +141,32 @@ async def test_large_table_is_reported_until_analysed(tmp_path: Path, monkeypatc
         pytest.param("3 1", False, id="exact"),
     ],
 )
-async def test_stale_statistics_are_refreshed(tmp_path: Path, recorded: str, refreshed: bool) -> None:
-    """A tenfold change in row count since the last ANALYZE triggers another one."""
+async def test_eviction_refreshes_stale_statistics(tmp_path: Path, recorded: str, refreshed: bool) -> None:
+    """A tenfold change in row count since the last ANALYZE triggers another one after an eviction."""
     path = tmp_path / "t.db"
     await _database(path, rows=3)
     _set_timestamp_stat(path, recorded)
 
     store = SqliteStore(str(path))
     await store.initialize()
+    assert await store.evict_older_than(datetime(2020, 1, 1, tzinfo=UTC)) == 0
     await store.close()
     assert _timestamp_stat(path) == ("3 1" if refreshed else recorded)
+
+
+async def test_eviction_collects_missing_statistics_but_a_dry_run_does_not(tmp_path: Path) -> None:
+    path = tmp_path / "t.db"
+    await _database(path, rows=3)
+    _forget_statistics(path)
+
+    store = SqliteStore(str(path))
+    await store.initialize()  # collects them at start, so forget again to isolate the eviction
+    _forget_statistics(path)
+    assert await store.evict_older_than(datetime(2020, 1, 1, tzinfo=UTC), dry_run=True) == 0
+    assert _timestamp_stat(path) is None
+    assert await store.evict_older_than(datetime(2020, 1, 1, tzinfo=UTC)) == 0
+    assert _timestamp_stat(path) == "3 1"
+    await store.close()
 
 
 async def test_read_only_store_never_analyses(tmp_path: Path) -> None:
