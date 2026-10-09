@@ -395,45 +395,6 @@ class BaseSQLStore(TelegramStore):
         flush_first is accepted for signature compatibility with the buffered
         stores; there is no write buffer here, so it is a no-op.
         """
-        # Aliases for lookup JOINs
-        s_lk = self.string_lookup.alias("s_lk")
-        d_lk = self.string_lookup.alias("d_lk")
-        tt_lk = self.string_lookup.alias("tt_lk")
-        dir_lk = self.string_lookup.alias("dir_lk")
-        sn_lk = self.string_lookup.alias("sn_lk")
-        den_lk = self.string_lookup.alias("den_lk")
-
-        stmt = select(
-            self.telegrams.c.timestamp,
-            s_lk.c.value.label("source"),
-            d_lk.c.value.label("destination"),
-            tt_lk.c.value.label("telegramtype"),
-            dir_lk.c.value.label("direction"),
-            sn_lk.c.value.label("source_name"),
-            den_lk.c.value.label("destination_name"),
-            self.telegrams.c.payload,
-            self.telegrams.c.dpt_main,
-            self.telegrams.c.dpt_sub,
-            self.telegrams.c.value,
-            self.telegrams.c.value_numeric,
-            self.telegrams.c.raw_data,
-            self.telegrams.c.data_secure,
-        )
-
-        # Joins to lookup table
-        stmt = stmt.join(s_lk, and_(s_lk.c.id == self.telegrams.c.source_id, s_lk.c.category == "source"))
-        stmt = stmt.join(d_lk, and_(d_lk.c.id == self.telegrams.c.destination_id, d_lk.c.category == "destination"))
-        stmt = stmt.join(
-            tt_lk, and_(tt_lk.c.id == self.telegrams.c.telegramtype_id, tt_lk.c.category == "telegramtype")
-        )
-        stmt = stmt.join(dir_lk, and_(dir_lk.c.id == self.telegrams.c.direction_id, dir_lk.c.category == "direction"))
-        stmt = stmt.outerjoin(
-            sn_lk, and_(sn_lk.c.id == self.telegrams.c.source_name_id, sn_lk.c.category == "source_name")
-        )
-        stmt = stmt.outerjoin(
-            den_lk, and_(den_lk.c.id == self.telegrams.c.destination_name_id, den_lk.c.category == "destination_name")
-        )
-
         # 1. Base Filters
         filters: list[Any] = []
         if query.sources:
@@ -501,13 +462,10 @@ class BaseSQLStore(TelegramStore):
         else:
             where_clause = and_(*filters) if filters else None
 
-        if where_clause is not None:
-            stmt = stmt.where(where_clause)
-
         # 3. Total Count (before pagination)
         #
-        # Counted straight off `telegrams` instead of wrapping the statement
-        # above in a subquery. The six string_lookup joins only *project*
+        # Counted straight off `telegrams`, without the string_lookup joins of
+        # the row query below. Those six joins only *project*
         # resolved names into the result rows — every filter is expressed
         # against telegrams columns via id subqueries — so they cannot change
         # which rows match, and they made an unfiltered count roughly 44x
@@ -520,14 +478,60 @@ class BaseSQLStore(TelegramStore):
         if where_clause is not None:
             count_stmt = count_stmt.where(where_clause)
 
-        # 4. Ordering
-        if query.order_descending:
-            stmt = stmt.order_by(self.telegrams.c.timestamp.desc())
-        else:
-            stmt = stmt.order_by(self.telegrams.c.timestamp.asc())
+        # 4. Page selection: filter, order and paginate on `telegrams` alone
+        #
+        # The lookup joins below only resolve ids to strings, so they belong
+        # *after* the LIMIT. Joined first, the four inner joins look to the
+        # planner as if they could drop rows, so it cannot walk the timestamp
+        # index for the first n rows: it joins the whole table and sorts. Even
+        # `limit=1` then touched every row — 3.9 s on 114k telegrams against
+        # 5 ms for the shape below (#75, SpectrumKNX#480). A subquery with a
+        # LIMIT is not flattened into its parent by PostgreSQL or SQLite, so the
+        # order of operations written here is the one that runs.
+        #
+        # Same rows as before, by the argument given for the count above: every
+        # *_id has its lookup row, so the inner joins never removed any.
+        order = self.telegrams.c.timestamp.desc() if query.order_descending else self.telegrams.c.timestamp.asc()
+        page_stmt = select(self.telegrams)
+        if where_clause is not None:
+            page_stmt = page_stmt.where(where_clause)
+        page = page_stmt.order_by(order).offset(query.offset).limit(query.limit).subquery("page")
 
-        # 5. Pagination
-        stmt = stmt.offset(query.offset).limit(query.limit)
+        # 5. Resolve the lookup ids of that page
+        s_lk = self.string_lookup.alias("s_lk")
+        d_lk = self.string_lookup.alias("d_lk")
+        tt_lk = self.string_lookup.alias("tt_lk")
+        dir_lk = self.string_lookup.alias("dir_lk")
+        sn_lk = self.string_lookup.alias("sn_lk")
+        den_lk = self.string_lookup.alias("den_lk")
+
+        stmt = (
+            select(
+                page.c.timestamp,
+                s_lk.c.value.label("source"),
+                d_lk.c.value.label("destination"),
+                tt_lk.c.value.label("telegramtype"),
+                dir_lk.c.value.label("direction"),
+                sn_lk.c.value.label("source_name"),
+                den_lk.c.value.label("destination_name"),
+                page.c.payload,
+                page.c.dpt_main,
+                page.c.dpt_sub,
+                page.c.value,
+                page.c.value_numeric,
+                page.c.raw_data,
+                page.c.data_secure,
+            )
+            .select_from(page)
+            .join(s_lk, and_(s_lk.c.id == page.c.source_id, s_lk.c.category == "source"))
+            .join(d_lk, and_(d_lk.c.id == page.c.destination_id, d_lk.c.category == "destination"))
+            .join(tt_lk, and_(tt_lk.c.id == page.c.telegramtype_id, tt_lk.c.category == "telegramtype"))
+            .join(dir_lk, and_(dir_lk.c.id == page.c.direction_id, dir_lk.c.category == "direction"))
+            .outerjoin(sn_lk, and_(sn_lk.c.id == page.c.source_name_id, sn_lk.c.category == "source_name"))
+            .outerjoin(den_lk, and_(den_lk.c.id == page.c.destination_name_id, den_lk.c.category == "destination_name"))
+            # The joins do not promise to keep the page's order.
+            .order_by(page.c.timestamp.desc() if query.order_descending else page.c.timestamp.asc())
+        )
 
         async with self.engine.connect() as conn:
             total_count = await conn.scalar(count_stmt)
