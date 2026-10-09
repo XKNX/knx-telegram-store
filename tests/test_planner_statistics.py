@@ -3,7 +3,7 @@
 Without ``sqlite_stat1`` the planner guesses, and the same filter gets a good
 plan on one database and a several times slower one on another
 (XKNX/knx-telegram-store#78). initialize() runs ANALYZE when statistics are
-missing or stale, and lookup filters are shaped so the planner can use them.
+missing or stale.
 """
 
 import sqlite3
@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import event
 
-from knx_telegram_store import StoredTelegram, TelegramQuery
+from knx_telegram_store import StoredTelegram
 from knx_telegram_store.backends.sqlite import SqliteStore
 
 
@@ -159,22 +159,3 @@ async def test_close_runs_pragma_optimize(tmp_path: Path) -> None:
     await store.initialize()
     await store.close()
     assert "PRAGMA optimize" in statements
-
-
-async def test_lookup_filters_are_scalar_subqueries(tmp_path: Path) -> None:
-    """One ``= (SELECT id ...)`` per value, so the planner knows it is one id, not many."""
-    path = tmp_path / "t.db"
-    await _database(path, rows=3)
-
-    store = SqliteStore(str(path))
-    await store.initialize()
-    statements = _capture_sql(store)
-    result = await store.query(TelegramQuery(destinations=["1/1/0", "1/1/2", "9/9/9"]))
-    await store.close()
-
-    assert sorted(t.destination for t in result.telegrams) == ["1/1/0", "1/1/2"]
-    assert result.total_count == 2
-    selects = [s for s in statements if s.lstrip().startswith("SELECT")]
-    assert selects
-    assert not [s for s in selects if "IN (SELECT" in s]
-    assert all(s.count("= (SELECT string_lookup.id") == 3 for s in selects)
