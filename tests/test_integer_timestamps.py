@@ -56,7 +56,12 @@ async def _pre_0_15_db(path: Path, telegrams: list[str], last_values: list[str])
     store = SqliteStore(str(template))
     await store.initialize()
     await store.close()
-    ddl = [sql for (sql,) in _raw(template, "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL")]
+    # Not the sqlite_* internals (sqlite_stat1 once the store is analysed): they
+    # cannot be created by hand and belong to the engine, not the schema.
+    ddl = [
+        sql
+        for (sql,) in _raw(template, "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'")
+    ]
 
     con = sqlite3.connect(str(path))
     for statement in ddl:
