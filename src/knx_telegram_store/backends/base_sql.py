@@ -197,13 +197,58 @@ class BaseSQLStore(TelegramStore):
 
     @wrap_store_errors
     async def needs_migration(self) -> bool:
-        """Check if any schema upgrades or migrations are pending."""
+        """Check if any schema upgrades, migrations or one-off data passes are pending.
+
+        True means the next initialize() does work that scales with the size of
+        the database, so hosts should run it without a timeout and tell the
+        user not to interrupt it. False means initialize() is quick.
+        """
         async with self.engine.connect() as conn:
             return await conn.run_sync(self._needs_migration_sync)
 
     def _needs_migration_sync(self, connection) -> bool:
-        """Synchronously check if schema upgrades or legacy migrations are required."""
+        """Synchronously check if schema upgrades or legacy migrations are required.
+
+        Backends add their own schema checks and fall through to this, so the
+        one-off passes initialize() runs on every backend are reported as well.
+        """
+        return self._pending_startup_work_sync(connection)
+
+    def _pending_startup_work_sync(self, connection) -> bool:
+        """Whether initialize() still has a pass over the whole telegrams table to do.
+
+        Hosts use needs_migration() to decide whether initialize() may run under a
+        timeout (Home Assistant allows 10 s otherwise), so anything that scales
+        with the table has to be reported here, not only schema changes
+        (XKNX/knx-telegram-store#76). Each check is a catalogue or metadata
+        lookup, so the probe itself stays cheap enough to run under that timeout.
+        """
+        inspector = inspect(connection)
+        if not inspector.has_table(self.telegrams.name):
+            return False
+
+        # Indexes the model gained after the database was created; mirrors the
+        # lookup in ensure_indexes() so both always agree.
+        for table in (self.telegrams, self.last_ga_telegrams, self.string_lookup):
+            try:
+                existing = {index["name"] for index in inspector.get_indexes(table.name)}
+            except Exception:
+                continue
+            if any(index.name not in existing for index in table.indexes):
+                return True
+
+        # _reconcile_last_ga_telegrams() groups the whole telegrams table unless
+        # it already ran and left summaries behind. Nothing to do while the
+        # table is empty.
+        reconciled = self._metadata_flag_set(connection, _LAST_GA_RECONCILED_KEY)
+        if not reconciled or not self._has_rows(connection, self.last_ga_telegrams.name):
+            return self._has_rows(connection, self.telegrams.name)
         return False
+
+    @staticmethod
+    def _has_rows(connection, table_name: str) -> bool:
+        """Return True if ``table_name`` holds at least one row (stops at the first)."""
+        return bool(connection.execute(text(f"SELECT EXISTS (SELECT 1 FROM {table_name})")).scalar())  # noqa: S608 - fixed names
 
     @staticmethod
     def _metadata_flag_set(connection, key: str) -> bool:
