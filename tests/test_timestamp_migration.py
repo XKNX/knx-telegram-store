@@ -9,19 +9,35 @@ caller supplies it (XKNX/knx-frontend#459).
 
 import sqlite3
 from datetime import UTC, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from knx_telegram_store import StoredTelegram, TelegramQuery
+from knx_telegram_store.backends.base_sql import micros_to_datetime
 from knx_telegram_store.backends.sqlite import SqliteStore
 
 BERLIN = ZoneInfo("Europe/Berlin")  # +01:00 winter, +02:00 summer
 LONDON = ZoneInfo("Europe/London")  # UTC in winter, +01:00 summer
 
 
+def _raw_timestamps(path: Path, table: str = "telegrams") -> list[datetime]:
+    """The timestamps as stored on disk, in storage order, read back as UTC."""
+    con = sqlite3.connect(str(path))
+    try:
+        return [micros_to_datetime(row[0]) for row in con.execute(f"SELECT timestamp FROM {table} ORDER BY timestamp")]  # noqa: S608
+    finally:
+        con.close()
+
+
 async def _legacy_db(path, wall_clock_stamps: list[str]) -> None:
-    """Create a database holding rows as the pre-UTC code wrote them."""
+    """Create a database holding rows as the pre-UTC code wrote them.
+
+    Those rows are text, so the integer flag goes as well: the next
+    initialize() then rewrites them as integers first, and the UTC shift under
+    test runs on integers, as it does for a real pre-0.15 database.
+    """
     store = SqliteStore(str(path))
     await store.initialize()
     await store.close()
@@ -39,8 +55,8 @@ async def _legacy_db(path, wall_clock_stamps: list[str]) -> None:
             "VALUES (?,?,?,?,?)",
             (stamp, ids["source"], ids["destination"], ids["telegramtype"], ids["direction"]),
         )
-    # Undo the flag initialize() set, so the file looks like it predates the fix.
-    con.execute("DELETE FROM store_metadata WHERE key='timestamps_utc'")
+    # Undo the flags initialize() set, so the file looks like it predates the fix.
+    con.execute("DELETE FROM store_metadata WHERE key IN ('timestamps_utc', 'timestamps_integer')")
     con.commit()
     con.close()
 
@@ -181,11 +197,11 @@ async def test_last_values_are_converted_too(tmp_path):
     )
     await store.close()
 
-    # Rewrite both tables to local wall clock and clear the flag.
+    # Rewrite both tables to local wall clock and clear the flags.
     con = sqlite3.connect(str(path))
     con.execute("UPDATE telegrams SET timestamp = '2026-07-15 12:00:00.000000'")
     con.execute("UPDATE last_ga_telegrams SET timestamp = '2026-07-15 12:00:00.000000'")
-    con.execute("DELETE FROM store_metadata WHERE key='timestamps_utc'")
+    con.execute("DELETE FROM store_metadata WHERE key IN ('timestamps_utc', 'timestamps_integer')")
     con.commit()
     con.close()
 
@@ -362,8 +378,7 @@ async def test_without_a_zone_nothing_is_guessed(tmp_path):
     await store.initialize()
 
     assert await store.needs_timestamp_migration() is True
-    raw = sqlite3.connect(str(path)).execute("SELECT timestamp FROM telegrams").fetchone()[0]
-    assert raw.startswith("2026-07-15 12:00:00")
+    assert _raw_timestamps(path) == [datetime(2026, 7, 15, 12, 0, tzinfo=UTC)]
     await store.close()
 
 
@@ -396,8 +411,10 @@ async def test_microseconds_survive_the_conversion(tmp_path):
     await store.initialize()
     await store.close()
 
-    raw = [r[0] for r in sqlite3.connect(str(path)).execute("SELECT timestamp FROM telegrams ORDER BY timestamp")]
-    assert raw == ["2026-01-15 11:00:00.123456", "2026-07-15 10:00:00.654321"]
+    assert _raw_timestamps(path) == [
+        datetime(2026, 1, 15, 11, 0, 0, 123456, tzinfo=UTC),
+        datetime(2026, 7, 15, 10, 0, 0, 654321, tzinfo=UTC),
+    ]
 
 
 async def test_west_of_utc_rows_are_shifted_exactly_once(tmp_path):
@@ -438,8 +455,8 @@ async def test_last_values_older_than_any_telegram_are_converted(tmp_path):
     await store.initialize()
     await store.close()
 
-    stored = sqlite3.connect(str(path)).execute("SELECT timestamp FROM last_ga_telegrams").fetchone()[0]
-    assert stored.startswith("2026-01-15 11:00:00"), "outside the telegrams range, but still ours to convert"
+    (stored,) = _raw_timestamps(path, "last_ga_telegrams")
+    assert stored == datetime(2026, 1, 15, 11, 0, tzinfo=UTC), "outside the telegrams range, but still ours to convert"
 
 
 async def test_last_values_are_converted_when_telegrams_is_empty(tmp_path):
@@ -462,8 +479,8 @@ async def test_last_values_are_converted_when_telegrams_is_empty(tmp_path):
     await store.initialize()
     await store.close()
 
-    stored = sqlite3.connect(str(path)).execute("SELECT timestamp FROM last_ga_telegrams").fetchone()[0]
-    assert stored.startswith("2026-07-15 10:00:00"), "an empty telegrams table is not an empty database"
+    (stored,) = _raw_timestamps(path, "last_ga_telegrams")
+    assert stored == datetime(2026, 7, 15, 10, 0, tzinfo=UTC), "an empty telegrams table is not an empty database"
 
 
 async def test_transitions_that_do_not_fall_on_the_hour(tmp_path):
@@ -478,4 +495,43 @@ async def test_transitions_that_do_not_fall_on_the_hour(tmp_path):
     stamps = sorted(t.timestamp for t in (await store.query(TelegramQuery(limit=10))).telegrams)
     assert stamps[0] == datetime(2026, 4, 5, 3, 30, tzinfo=chatham).astimezone(UTC), "before the 03:45 change"
     assert stamps[1] == datetime(2026, 4, 5, 3, 50, tzinfo=chatham).astimezone(UTC), "after it"
+    await store.close()
+
+
+# ── Integer timestamps (XKNX/knx-telegram-store#78) ──────────────────────────
+
+
+async def test_utc_shift_on_a_later_start_than_the_integer_conversion(tmp_path):
+    """The two conversions need not run in the same start.
+
+    A host may name the zone only after the file was already rewritten as
+    integers, with the boundary and rowid markers recorded in between. The
+    UTC shift then has only integers to work on.
+    """
+    path = tmp_path / "later.db"
+    await _legacy_db(path, ["2026-01-15 12:00:00.123456", "2026-07-15 12:00:00.654321"])
+
+    earlier = SqliteStore(str(path))
+    await earlier.initialize()  # integers now, markers recorded, no zone yet
+    await earlier.close()
+
+    con = sqlite3.connect(str(path))
+    flags = dict(con.execute("SELECT key, value FROM store_metadata").fetchall())
+    types = con.execute("SELECT DISTINCT typeof(timestamp) FROM telegrams").fetchall()
+    con.close()
+    assert flags.get("timestamps_integer") == "true"
+    assert "timestamps_utc" not in flags
+    assert "timestamps_utc_from" in flags and "timestamps_legacy_max_rowid" in flags
+    assert types == [("integer",)]
+
+    store = SqliteStore(str(path))
+    await store.initialize()
+    assert await store.migrate_timestamps_to_utc(BERLIN) == 2
+    assert await store.needs_timestamp_migration() is False
+
+    stamps = sorted(t.timestamp for t in (await store.query(TelegramQuery(limit=10))).telegrams)
+    assert stamps == [
+        datetime(2026, 1, 15, 11, 0, 0, 123456, tzinfo=UTC),
+        datetime(2026, 7, 15, 10, 0, 0, 654321, tzinfo=UTC),
+    ]
     await store.close()

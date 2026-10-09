@@ -15,7 +15,7 @@ from ..connection import (
     probe_engine,
 )
 from ..store import wrap_store_errors
-from .base_sql import BaseSQLStore
+from .base_sql import BaseSQLStore, datetime_to_micros, micros_to_datetime
 
 
 def _classify_sqlite_error(exc: BaseException) -> ConnectionErrorKind:
@@ -28,22 +28,34 @@ def _classify_sqlite_error(exc: BaseException) -> ConnectionErrorKind:
 
 _LOGGER = logging.getLogger(__name__)
 
-# SQLite stores datetimes as text; these mirror that representation.
-_SQL_TS = "%Y-%m-%d %H:%M:%S.%f"
+# Rewrites one table's text timestamps (SQLAlchemy's fixed SQLite format,
+# ``YYYY-MM-DD HH:MM:SS.ffffff``) as integer microseconds in place. The whole
+# seconds come from strftime and the fraction is cut out of the string itself:
+# julianday() would be the obvious one-liner, but it is a double and loses
+# about 40 µs. strftime only sees the first 19 characters because SQLite keeps
+# milliseconds internally and rounds a fraction of .9995 or more up into the
+# next second. The padding keeps a value without a fraction at six digits.
+_TEXT_TO_MICROS = (
+    "UPDATE {table} SET timestamp = "
+    "CAST(strftime('%s', substr(timestamp, 1, 19)) AS INTEGER) * 1000000 "
+    "+ CAST(substr(timestamp || '000000', 21, 6) AS INTEGER) "
+    "WHERE typeof(timestamp) = 'text'"
+)
 
 
-def _as_naive(raw: str) -> datetime:
-    """Parse a stored timestamp into a naive datetime.
+def _as_naive(stored: int) -> datetime:
+    """The naive datetime a stored integer spells out, digit for digit.
 
-    The bounds are read with a raw ``text()`` query, so they arrive as the
-    driver's own type for a SQLite TEXT column rather than through the
-    ``UtcDateTime`` decorator.
+    The bounds are read with a raw ``text()`` query, so they arrive as plain
+    integers rather than through the ``UtcDateTime`` decorator. Legacy rows
+    hold local wall-clock digits, so the result is in that frame, not UTC.
     """
-    return datetime.fromisoformat(raw).replace(tzinfo=None)
+    return micros_to_datetime(stored).replace(tzinfo=None)
 
 
-def _sql_ts(value: datetime) -> str:
-    return value.strftime(_SQL_TS)
+def _stored(value: datetime) -> int:
+    """The integer a naive datetime is stored as, digit for digit."""
+    return datetime_to_micros(value)
 
 
 def _offset_at(moment: datetime, zone: tzinfo) -> int:
@@ -221,11 +233,25 @@ class SqliteStore(BaseSQLStore):
             # 2. Perform column-level upgrades
             await conn.run_sync(self._upgrade_schema)
 
-            # 2.1 Indexes the model declares but an existing database may lack (SpectrumKNX#450)
+            # 2.1 Text timestamps to integers (XKNX/knx-telegram-store#78).
+            #     Ahead of the indexes: it drops the timestamp index so the
+            #     rewrite does not maintain it row by row.
+            converted = await conn.run_sync(self._convert_timestamps_to_integers)
+
+            # 2.2 Indexes the model declares but an existing database may lack (SpectrumKNX#450)
             await conn.run_sync(self.ensure_indexes)
 
-            # 2.2 Classify the timestamp convention (XKNX/knx-frontend#459)
+            # 2.3 Classify the timestamp convention (XKNX/knx-frontend#459)
             await conn.run_sync(self._classify_timestamp_convention)
+
+        if converted:
+            # The rewritten rows are smaller, but their pages only go back to
+            # the file system through a VACUUM.
+            _LOGGER.info(
+                "Reclaiming the space freed by the timestamp conversion with VACUUM - "
+                "this needs free disk of about the database size and blocks writers until done"
+            )
+            await self.optimize()
 
         # 3. Convert pre-UTC timestamps, if the caller told us what wrote them.
         #    Ahead of the cache warm below, which reads timestamps back.
@@ -234,6 +260,44 @@ class SqliteStore(BaseSQLStore):
 
         # 4. Warm the cache
         await super().initialize()
+
+    # ── Integer timestamps (XKNX/knx-telegram-store#78) ──────────────────────
+
+    _INTEGER_FLAG = "timestamps_integer"
+
+    def _convert_timestamps_to_integers(self, connection) -> bool:
+        """Rewrite text timestamps as integer microseconds, once.
+
+        Databases written before 0.15 hold SQLAlchemy's 26-character strings;
+        ``UtcDateTime`` now binds and reads integers, so they are converted in
+        place and the file is flagged. A fresh or already converted database
+        pays one probe that stops at the first text row, then only the flag.
+
+        Returns whether rows were rewritten, so the caller knows a VACUUM is
+        worth running. The column keeps its declared type: in old files that is
+        DATETIME (NUMERIC affinity), which stores the integers as INTEGER just
+        as the BIGINT of a new file does.
+        """
+        if self._metadata_flag_set(connection, self._INTEGER_FLAG):
+            return False
+
+        has_text = connection.execute(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM telegrams WHERE typeof(timestamp) = 'text') "
+                "OR EXISTS (SELECT 1 FROM last_ga_telegrams WHERE typeof(timestamp) = 'text')"
+            )
+        ).scalar()
+        if has_text:
+            _LOGGER.info(
+                "Converting timestamps to integers, which shrinks the database by about a quarter - "
+                "this can take a while on a large store"
+            )
+            connection.execute(text("DROP INDEX IF EXISTS ix_telegrams_timestamp"))
+            for table in ("telegrams", "last_ga_telegrams"):
+                connection.execute(text(_TEXT_TO_MICROS.format(table=table)))
+
+        self._set_metadata_value(connection, self._INTEGER_FLAG, "true")
+        return bool(has_text)
 
     # ── Timestamp convention (XKNX/knx-frontend#459) ─────────────────────────
     #
@@ -345,6 +409,9 @@ class SqliteStore(BaseSQLStore):
     async def _legacy_row_scopes(self, conn, zone: tzinfo) -> dict[str, tuple[str, dict[str, object]]]:
         """Which rows of each table still predate the upgrade.
 
+        Bounds are passed as the integers the column holds (see UtcDateTime):
+        a legacy row's local wall-clock digits, read as if they were UTC.
+
         ``telegrams`` is append-only, so the rowid recorded at the first start
         after the upgrade separates the two populations exactly - which a
         timestamp cannot, because the legacy rows hold local wall-clock digits
@@ -374,7 +441,7 @@ class SqliteStore(BaseSQLStore):
             return {"telegrams": ("1 = 1", {}), "last_ga_telegrams": ("1 = 1", {})}
 
         boundary = datetime.fromisoformat(boundary_raw).astimezone(UTC).replace(tzinfo=None)
-        conservative: tuple[str, dict[str, object]] = ("timestamp < :boundary", {"boundary": _sql_ts(boundary)})
+        conservative: tuple[str, dict[str, object]] = ("timestamp < :boundary", {"boundary": _stored(boundary)})
         scopes: dict[str, tuple[str, dict[str, object]]] = {
             "telegrams": conservative,
             "last_ga_telegrams": conservative,
@@ -391,7 +458,7 @@ class SqliteStore(BaseSQLStore):
                 boundary_local = datetime.fromisoformat(boundary_raw).astimezone(zone).replace(tzinfo=None)
                 scopes["telegrams"] = (
                     "rowid <= :max_rowid AND timestamp < :boundary_local",
-                    {"max_rowid": marker, "boundary_local": _sql_ts(boundary_local)},
+                    {"max_rowid": marker, "boundary_local": _stored(boundary_local)},
                 )
 
         return scopes
@@ -418,16 +485,15 @@ class SqliteStore(BaseSQLStore):
         if not any(offset for _, _, offset in intervals):
             return 0  # the whole range was already UTC
 
-        # SQLite's datetime() drops fractional seconds, so the shifted whole
-        # seconds are recombined with the original fraction. COALESCE keeps a
-        # row unchanged rather than nulling it should strftime reject the input.
+        # Integer microseconds, so the shift is a subtraction in the same unit
+        # and the fraction needs no special care.
         params: dict[str, object] = dict(scope)
 
         def shift_expr(index: int, offset: int) -> str:
             if not offset:
                 return "timestamp"
-            params[f"shift_{index}"] = f"{-offset} seconds"
-            return f"strftime('%Y-%m-%d %H:%M:%S', timestamp, :shift_{index}) || substr(timestamp, 20)"
+            params[f"shift_{index}"] = offset * 1_000_000
+            return f"timestamp - :shift_{index}"
 
         if len(intervals) == 1:
             # A range with no transition in it needs no CASE at all, and would
@@ -436,17 +502,14 @@ class SqliteStore(BaseSQLStore):
         else:
             branches = []
             for index, (_, end_of, offset) in enumerate(intervals[:-1]):
-                params[f"end_{index}"] = _sql_ts(end_of)
+                params[f"end_{index}"] = _stored(end_of)
                 branches.append(f"WHEN timestamp < :end_{index} THEN {shift_expr(index, offset)}")
             last = len(intervals) - 1
             branches.append(f"ELSE {shift_expr(last, intervals[last][2])}")  # the open-ended tail
             expression = f"CASE {' '.join(branches)} END"
 
         result = await conn.execute(
-            text(
-                f"UPDATE {table} SET timestamp = COALESCE({expression}, timestamp) "  # noqa: S608 - fixed names
-                f"WHERE {where}"
-            ),
+            text(f"UPDATE {table} SET timestamp = {expression} WHERE {where}"),  # noqa: S608 - fixed names
             params,
         )
         return result.rowcount or 0
@@ -656,6 +719,17 @@ class SqliteStore(BaseSQLStore):
         inspector = inspect(connection)
         if not inspector.has_table("telegrams"):
             return False
+
+        # 0. Text timestamps still to rewrite as integers: a pass over both
+        #    tables, so it is reported whenever the flag is missing rather than
+        #    probed for. Mirrors _convert_timestamps_to_integers(): an empty
+        #    database has nothing to rewrite.
+        if not self._metadata_flag_set(connection, self._INTEGER_FLAG) and (
+            self._has_rows(connection, "telegrams")
+            or (inspector.has_table("last_ga_telegrams") and self._has_rows(connection, "last_ga_telegrams"))
+        ):
+            return True
+
         columns = inspector.get_columns("telegrams")
         existing_columns = {col["name"] for col in columns}
 
