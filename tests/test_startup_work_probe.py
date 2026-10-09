@@ -69,9 +69,25 @@ async def test_empty_database_reports_nothing_even_without_flags(tmp_path):
     """Passes over an empty table are instant, so they are not worth a warning."""
     path = tmp_path / "t.db"
     await _database(path, rows=0)
-    _sql(path, "DELETE FROM store_metadata WHERE key IN ('timestamps_utc', 'last_ga_newest_reconciled')")
+    _sql(
+        path,
+        "DELETE FROM store_metadata WHERE key IN ('timestamps_utc', 'timestamps_integer', 'last_ga_newest_reconciled')",
+    )
 
     store = SqliteStore(str(path), legacy_timestamp_timezone=BERLIN)
+    assert await store.needs_migration() is False
+    await store.close()
+
+
+async def test_pending_integer_timestamp_conversion_is_reported(tmp_path):
+    """Rewriting the timestamps as integers touches every row (XKNX/knx-telegram-store#78)."""
+    path = tmp_path / "t.db"
+    await _database(path, rows=3)
+    _sql(path, "DELETE FROM store_metadata WHERE key = 'timestamps_integer'")
+
+    store = SqliteStore(str(path))
+    assert await store.needs_migration() is True
+    await store.initialize()
     assert await store.needs_migration() is False
     await store.close()
 

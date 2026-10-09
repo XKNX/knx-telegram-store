@@ -108,6 +108,19 @@ driver level. `capabilities.read_only` is `True` and `supports_optimize` is
 `False` in this mode. Writing stores enable WAL journaling, which makes this
 single-writer/multi-reader setup safe across processes.
 
+## SQLite file format
+
+Since 0.15 the SQLite backend stores timestamps as integer microseconds since
+the Unix epoch (UTC) instead of SQLAlchemy's 26-character text format, which
+makes the file about a quarter smaller. A database written by an earlier
+version is converted in place on the first `initialize()` of a writing store:
+the pass rewrites every row, is reported through `needs_migration()` so hosts
+can run that start without a timeout, and ends with a `VACUUM`, which needs
+free disk of about the size of the database and blocks writers while it runs.
+A converted file cannot be read by library versions before 0.15. Read-only
+stores never convert; opened on an unconverted file they report
+`needs_migration()` as `True` until the writing process has upgraded it.
+
 ## Validating a config / connection
 
 Before triggering an expensive operation such as a migration, you can validate that a
