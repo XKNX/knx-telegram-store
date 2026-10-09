@@ -331,8 +331,9 @@ SqliteStore(db_path: str | Path, max_telegrams: int | None = None)
 
 - Uses `aiosqlite` for async I/O.
 - **Automated Schema Management:** `initialize()` handles creation of the `telegrams` table and indices. It also manages idempotent schema upgrades (adding missing columns) if an existing database is found.
+- **Integer timestamps:** SQLite has no datetime type, and SQLAlchemy's default is a 26-character string (`2026-09-28 01:00:01.667641`) that costs about a quarter of the file once `ix_telegrams_timestamp` is counted in. The `UtcDateTime` type decorator therefore stores the column as a `BIGINT` of microseconds since the Unix epoch, UTC, on SQLite only — microseconds because that is the precision the strings carried, so the conversion is lossless (XKNX/knx-telegram-store#78). PostgreSQL keeps `TIMESTAMPTZ`. A database written before 0.15 is rewritten in place on the first start (`UPDATE ... SET timestamp = CAST(strftime('%s', substr(timestamp, 1, 19)) AS INTEGER) * 1000000 + CAST(substr(timestamp || '000000', 21, 6) AS INTEGER)`, the timestamp index dropped for the duration and recreated after), flagged `timestamps_integer` in `store_metadata`, and compacted with a `VACUUM`. The pass is reported through `needs_migration()`, so hosts run that `initialize()` without a timeout. Read-only stores never convert; they still parse a text value they meet, but range queries on an unconverted file compare integers against text and return nothing until the writer has converted it.
 - Implements full `TelegramQuery` filtering via SQL `WHERE` clauses.
-- Supports time-delta context windows via SQL subqueries.
+- Supports time-delta context windows via SQL subqueries; on SQLite the window is plain integer arithmetic on the microsecond column (`pivot.timestamp - :delta_us`), on PostgreSQL `timestamptz - interval`.
 - Optional `max_telegrams` cap with automatic pruning of oldest rows (`DELETE FROM telegrams WHERE rowid IN (SELECT rowid FROM telegrams ORDER BY timestamp ASC LIMIT ?)`).
 - Optional dependency: `knx-telegram-store[sqlite]` → `aiosqlite`.
 
@@ -344,7 +345,7 @@ SqliteStore(db_path: str | Path, max_telegrams: int | None = None)
 ```sql
 CREATE TABLE IF NOT EXISTS telegrams (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp     TEXT NOT NULL,          -- UTC, no offset (SQLite has no tz type)
+    timestamp     BIGINT NOT NULL,        -- microseconds since the Unix epoch, UTC (SQLite has no tz type)
     source        TEXT NOT NULL,
     destination   TEXT NOT NULL,
     telegramtype  TEXT NOT NULL,

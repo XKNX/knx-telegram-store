@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     Column,
     DateTime,
@@ -34,6 +35,24 @@ from ..store import KnxTelegramStoreException, StoreCapabilities, StoreStats, Te
 
 _LOGGER = logging.getLogger(__name__)
 _LAST_GA_RECONCILED_KEY = "last_ga_newest_reconciled"
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_MICROSECOND = timedelta(microseconds=1)
+
+
+def datetime_to_micros(value: datetime) -> int:
+    """Microseconds since the Unix epoch of ``value``, naive taken as UTC.
+
+    Exact integer arithmetic: a float multiplication would round the last
+    digit of a microsecond-precision timestamp.
+    """
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return (value - _EPOCH) // _MICROSECOND
+
+
+def micros_to_datetime(value: int) -> datetime:
+    """The aware UTC datetime ``value`` microseconds after the Unix epoch."""
+    return _EPOCH + timedelta(microseconds=value)
 
 
 class UtcDateTime(TypeDecorator):
@@ -55,10 +74,25 @@ class UtcDateTime(TypeDecorator):
     A naive value on the way in is taken to be UTC rather than guessed at —
     guessing would need the writer's timezone, which this library has no way
     to know.
+
+    The column type is dialect-specific. PostgreSQL has ``timestamptz`` and
+    keeps it. SQLite has no datetime type at all, and SQLAlchemy's default is
+    a 26-character string (``2026-09-28 01:00:01.667641``) that costs about a
+    quarter of the file once the timestamp index is counted in
+    (XKNX/knx-telegram-store#78). There the column is a BIGINT holding
+    microseconds since the Unix epoch, UTC - microseconds because that is the
+    precision the strings carried, so the conversion is lossless. A string
+    still read from a database that has not been converted yet (a read-only
+    store never converts) is parsed as before, so reads keep working.
     """
 
     impl = DateTime(timezone=True)
     cache_ok = True
+
+    def load_dialect_impl(self, dialect: Any) -> Any:
+        if dialect.name == "sqlite":
+            return dialect.type_descriptor(BigInteger())
+        return dialect.type_descriptor(DateTime(timezone=True))
 
     def coerce_compared_value(self, op: Any, value: Any) -> Any:
         """Keep datetimes on this type; let DateTime rule on anything else.
@@ -84,15 +118,23 @@ class UtcDateTime(TypeDecorator):
         # is not a datetime is passed through untouched.
         if not isinstance(value, datetime):
             return value
+        if dialect.name == "sqlite":
+            return datetime_to_micros(value)
         if value.tzinfo is None:
             return value.replace(tzinfo=UTC)
         return value.astimezone(UTC)
 
     def process_result_value(self, value: Any, dialect: Any) -> Any:
+        if dialect.name == "sqlite":
+            if isinstance(value, int):
+                return micros_to_datetime(value)
+            if isinstance(value, str):
+                # Not converted yet: the digits are UTC by the bind above.
+                return datetime.fromisoformat(value).replace(tzinfo=UTC)
+            return value
         if not isinstance(value, datetime):
             return value
         if value.tzinfo is None:
-            # SQLite: stored naive, and by the bind above those digits are UTC.
             return value.replace(tzinfo=UTC)
         return value.astimezone(UTC)
 
@@ -485,13 +527,12 @@ class BaseSQLStore(TelegramStore):
             pivots = select(self.telegrams.c.timestamp).where(and_(*filters)).alias("pivots")
 
             if self.engine.dialect.name == "sqlite":
-                # SQLite specific date math
-                before_str = f"-{query.delta_before_ms / 1000.0} seconds"
-                after_str = f"+{query.delta_after_ms / 1000.0} seconds"
-
+                # Timestamps are integer microseconds there (see UtcDateTime).
+                delta_before_us = query.delta_before_ms * 1000
+                delta_after_us = query.delta_after_ms * 1000
                 cond = and_(
-                    self.telegrams.c.timestamp >= func.datetime(pivots.c.timestamp, before_str),
-                    self.telegrams.c.timestamp <= func.datetime(pivots.c.timestamp, after_str),
+                    self.telegrams.c.timestamp >= pivots.c.timestamp - delta_before_us,
+                    self.telegrams.c.timestamp <= pivots.c.timestamp + delta_after_us,
                 )
             else:
                 # Standard math (Postgres, etc.)
