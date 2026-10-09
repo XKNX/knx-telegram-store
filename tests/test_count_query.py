@@ -113,19 +113,25 @@ async def test_count_matches_paginated_rows_with_time_delta_context(populated_st
     assert result.total_count >= 1
 
 
-def test_declared_indexes_cover_the_filterable_columns(tmp_path):
-    """Every column TelegramQuery can filter on should be indexed.
+def test_declared_indexes_cover_the_selective_filterable_columns(tmp_path):
+    """Every column TelegramQuery can filter on selectively should be indexed.
 
     Audited by EXPLAIN against a 2M-row hypertable: without these, dpt filters
     were the only ones still doing a sequential scan.
+
+    telegramtype_id and direction_id are the exception: with two or three
+    distinct values an index on them never narrows a search, and they cost
+    about 12 bytes per row each on SQLite (XKNX/knx-telegram-store#78).
     """
     store = SqliteStore(str(tmp_path / "idx.db"))
     indexed = {tuple(c.name for c in index.columns) for index in store.telegrams.indexes}
 
-    for column in ("timestamp", "source_id", "destination_id", "telegramtype_id", "direction_id"):
+    for column in ("timestamp", "source_id", "destination_id"):
         assert (column,) in indexed, f"{column} is filterable but not indexed"
     # Composite so a dpt_main-only filter uses the leading column too.
     assert ("dpt_main", "dpt_sub") in indexed
+    for column in ("telegramtype_id", "direction_id"):
+        assert (column,) not in indexed, f"{column} has too few distinct values to be worth an index"
 
 
 def test_last_ga_telegrams_is_not_over_indexed(tmp_path):
