@@ -331,6 +331,7 @@ SqliteStore(db_path: str | Path, max_telegrams: int | None = None)
 
 - Uses `aiosqlite` for async I/O.
 - **Automated Schema Management:** `initialize()` handles creation of the `telegrams` table and indices. It also manages idempotent schema upgrades (adding missing columns) if an existing database is found.
+- **Planner statistics:** without `sqlite_stat1` SQLite's planner guesses, and the same filter gets a good plan on one database and a several times slower one on another (XKNX/knx-telegram-store#78). `initialize()` runs `ANALYZE` when the timestamp index has no statistics (never analysed, or rebuilt since); on a table of 100 000 rows or more the pass is reported through `needs_migration()`. `evict_older_than()` runs it again when the table has grown or shrunk tenfold since the statistics were taken, the nightly moment the table changes shape anyway. `close()` issues `PRAGMA optimize`, SQLite's own end-of-connection refresh. Planners before SQLite 3.46 mis-cost the `column IN (SELECT id …)` lookup filters once statistics exist and abandon the destination and source indexes; current planners cost them correctly, and the library targets those.
 - Implements full `TelegramQuery` filtering via SQL `WHERE` clauses.
 - Supports time-delta context windows via SQL subqueries.
 - Optional `max_telegrams` cap with automatic pruning of oldest rows (`DELETE FROM telegrams WHERE rowid IN (SELECT rowid FROM telegrams ORDER BY timestamp ASC LIMIT ?)`).
