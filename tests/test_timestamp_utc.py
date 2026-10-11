@@ -12,10 +12,11 @@ import sqlite3
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.sql import operators
 
 from knx_telegram_store import StoredTelegram, TelegramQuery
-from knx_telegram_store.backends.base_sql import UtcDateTime
+from knx_telegram_store.backends.base_sql import UtcDateTime, datetime_to_micros
 from knx_telegram_store.backends.sqlite import SqliteStore
 
 PLUS_TWO = timezone(timedelta(hours=2))
@@ -87,7 +88,9 @@ async def test_values_are_stored_as_utc_on_disk(tmp_path):
     await store.close()
 
     (raw,) = next(iter(sqlite3.connect(str(path)).execute("SELECT timestamp FROM telegrams")))
-    assert raw.startswith("2026-09-12 10:00:00"), f"stored local time instead of UTC: {raw}"
+    assert raw == datetime_to_micros(datetime(2026, 9, 12, 10, 0, 0, tzinfo=UTC)), (
+        f"stored local time instead of UTC: {raw}"
+    )
 
 
 async def test_ordering_is_by_instant_not_by_wall_clock(store):
@@ -195,15 +198,15 @@ def test_non_datetime_operands_are_left_to_the_plain_datetime_type():
 
     A TypeDecorator types every comparison operand as itself, and typing a
     timedelta as a timestamp makes PostgreSQL reject "timestamptz >= interval".
-    Only the PostgreSQL branch builds that expression (base_sql.py:490-497) -
-    SQLite uses `datetime(pivot, '-N seconds')` - so no store-level test here
-    reaches the delegation, and the bug it guards was invisible until the
-    integration suite ran.
+    Only the PostgreSQL branch builds that expression - SQLite's window is
+    integer arithmetic - so no store-level test here reaches the delegation,
+    and the bug it guards was invisible until the integration suite ran.
     """
     utc_type = UtcDateTime()
+    pg = postgresql.dialect()
 
     assert utc_type.coerce_compared_value(operators.sub, timedelta(seconds=30)) is not utc_type
-    assert utc_type.process_bind_param(timedelta(seconds=30), None) == timedelta(seconds=30)
+    assert utc_type.process_bind_param(timedelta(seconds=30), pg) == timedelta(seconds=30)
 
     # A datetime must stay on this type, or query bounds go to the plain
     # DateTime and lose their offset again - the read side of the same bug.
@@ -211,6 +214,19 @@ def test_non_datetime_operands_are_left_to_the_plain_datetime_type():
 
     # PostgreSQL hands back an aware datetime; it is normalised rather than
     # trusted, so a column in another offset still reads as UTC.
-    assert utc_type.process_result_value(datetime(2026, 9, 12, 12, 0, tzinfo=PLUS_TWO), None) == datetime(
+    assert utc_type.process_result_value(datetime(2026, 9, 12, 12, 0, tzinfo=PLUS_TWO), pg) == datetime(
         2026, 9, 12, 10, 0, tzinfo=UTC
     )
+
+
+def test_sqlite_integer_operands_bind_as_plain_integers():
+    """The SQLite window builds "pivot.timestamp - :delta" with an int.
+
+    It has to reach the database as an integer, not pass through the datetime
+    conversion of this type.
+    """
+    utc_type = UtcDateTime()
+    sq = sqlite.dialect()
+
+    assert utc_type.coerce_compared_value(operators.sub, 5_000_000) is not utc_type
+    assert utc_type.process_bind_param(5_000_000, sq) == 5_000_000
