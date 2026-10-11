@@ -360,6 +360,31 @@ class SqliteStore(BaseSQLStore):
 
     _INTEGER_FLAG = "timestamps_integer"
 
+    # Set once a read-only store has seen the flag: a file is never converted back.
+    _integer_timestamps_seen = False
+
+    async def _text_timestamps(self) -> bool:
+        """Whether a read-only store is looking at a file not converted yet.
+
+        A read-only store cannot convert, and the process that owns the file
+        may run an older version of this library for a long time - Home
+        Assistant and an add-on reading its database are updated separately.
+        Reads already cope with a text value; range bounds have to as well, or
+        every query with a time range silently returns nothing, because SQLite
+        sorts the integer bound before any text value.
+
+        The writer converts both tables and sets the flag in one transaction,
+        so the flag tells the two formats apart. It is looked up per query
+        until it is seen, as the writer may convert while this store is open.
+        """
+        if not self._read_only or self._integer_timestamps_seen:
+            return False
+        async with self.engine.connect() as conn:
+            converted = await conn.run_sync(lambda c: self._metadata_flag_set(c, self._INTEGER_FLAG))
+        if converted:
+            self._integer_timestamps_seen = True
+        return not converted
+
     def _convert_timestamps_to_integers(self, connection) -> bool:
         """Rewrite text timestamps as integer microseconds, once.
 

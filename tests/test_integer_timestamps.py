@@ -290,3 +290,101 @@ async def test_eviction_and_stats_use_the_same_integers(populated: SqliteStore) 
     remaining = (await populated.query(TelegramQuery(limit=10))).telegrams
     assert [t.source for t in remaining] == ["1.1.3"]
     assert (await populated.get_stats()).oldest_timestamp == BASE + timedelta(seconds=1)
+
+
+# ── A read-only store on a file its writer has not converted yet ─────────────
+#
+# Home Assistant owns the file and an add-on reads it; the two are updated
+# separately, so a 0.15 reader meets a text file for as long as the writer is
+# older. Range bounds bound as integers would match nothing there: SQLite
+# sorts every integer before every text value.
+
+SECONDS = [f"2026-07-15 12:00:{second:02d}.{second:06d}" for second in range(10)]
+
+
+def _at(second: int, microsecond: int | None = None) -> datetime:
+    return datetime(2026, 7, 15, 12, 0, second, second if microsecond is None else microsecond, tzinfo=UTC)
+
+
+async def test_a_read_only_store_filters_an_unconverted_file_by_time(tmp_path: Path) -> None:
+    path = tmp_path / "old.db"
+    await _pre_0_15_db(path, SECONDS, [SECONDS[-1]])
+    store = SqliteStore(str(path), read_only=True)
+    await store.initialize()
+
+    async def stamps(**bounds: datetime) -> list[datetime]:
+        result = await store.query(TelegramQuery(limit=100, order_descending=False, **bounds))
+        assert result.total_count == len(result.telegrams)
+        return [t.timestamp for t in result.telegrams]
+
+    assert await stamps(start_time=_at(3), end_time=_at(6)) == [_at(s) for s in (3, 4, 5, 6)]
+    # Both bounds are inclusive, to the microsecond.
+    assert await stamps(start_time=_at(3, 4), end_time=_at(6, 5)) == [_at(s) for s in (4, 5)]
+    assert await stamps(start_time=_at(8)) == [_at(8), _at(9)]
+    assert await stamps(end_time=_at(1)) == [_at(0), _at(1)]
+    assert await stamps(start_time=_at(9, 999999)) == []
+    # A bound in another zone is the same instant.
+    assert await stamps(start_time=_at(8).astimezone(PLUS_TWO)) == [_at(8), _at(9)]
+    # A naive bound is taken as UTC, as everywhere else.
+    assert await stamps(start_time=_at(8).replace(tzinfo=None)) == [_at(8), _at(9)]
+    await store.close()
+
+    assert _raw(path, "SELECT DISTINCT typeof(timestamp) FROM telegrams") == [("text",)]
+
+
+async def test_time_delta_context_on_an_unconverted_file(tmp_path: Path) -> None:
+    path = tmp_path / "old.db"
+    await _pre_0_15_db(path, SECONDS, [SECONDS[-1]])
+    store = SqliteStore(str(path), read_only=True)
+    await store.initialize()
+
+    result = await store.query(
+        TelegramQuery(
+            limit=100,
+            order_descending=False,
+            start_time=_at(5),
+            end_time=_at(5),
+            delta_before_ms=2100,
+            delta_after_ms=1100,
+        )
+    )
+
+    assert [t.timestamp for t in result.telegrams] == [_at(s) for s in (3, 4, 5, 6)]
+    await store.close()
+
+
+async def test_a_read_only_store_follows_the_writer_converting_the_file(tmp_path: Path) -> None:
+    """Opened on a text file, it keeps working when the owner upgrades underneath it."""
+    path = tmp_path / "old.db"
+    await _pre_0_15_db(path, SECONDS, [SECONDS[-1]])
+    reader = SqliteStore(str(path), read_only=True)
+    await reader.initialize()
+    window = TelegramQuery(limit=100, order_descending=False, start_time=_at(3), end_time=_at(6))
+    expected = [_at(s) for s in (3, 4, 5, 6)]
+    assert [t.timestamp for t in (await reader.query(window)).telegrams] == expected
+
+    writer = SqliteStore(str(path))
+    await writer.initialize()
+    await writer.close()
+    assert _raw(path, "SELECT DISTINCT typeof(timestamp) FROM telegrams") == [("integer",)]
+
+    assert [t.timestamp for t in (await reader.query(window)).telegrams] == expected
+    assert await reader.needs_migration() is False
+    await reader.close()
+
+
+async def test_text_bounds_are_only_used_by_a_read_only_store_until_the_flag_is_seen(tmp_path: Path) -> None:
+    path = tmp_path / "new.db"
+    writer = SqliteStore(str(path))
+    await writer.initialize()
+    await writer.store(_telegram(_at(1)))
+    # A writing store converts at start, so it never compares text.
+    assert await writer._text_timestamps() is False
+    await writer.close()
+
+    reader = SqliteStore(str(path), read_only=True)
+    await reader.initialize()
+    assert await reader._text_timestamps() is False
+    assert reader._integer_timestamps_seen is True
+    assert [t.timestamp for t in (await reader.query(TelegramQuery(limit=10, start_time=_at(0)))).telegrams] == [_at(1)]
+    await reader.close()

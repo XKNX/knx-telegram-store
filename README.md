@@ -117,9 +117,12 @@ version is converted in place on the first `initialize()` of a writing store:
 the pass rewrites every row, is reported through `needs_migration()` so hosts
 can run that start without a timeout, and ends with a `VACUUM`, which needs
 free disk of about the size of the database and blocks writers while it runs.
-A converted file cannot be read by library versions before 0.15. Read-only
-stores never convert; opened on an unconverted file they report
-`needs_migration()` as `True` until the writing process has upgraded it.
+A converted file cannot be read by library versions before 0.15, so a process
+that only reads another one's database has to be on 0.15 before the owner is.
+Read-only stores never convert; opened on an unconverted file they report
+`needs_migration()` as `True` until the writing process has upgraded it. Since
+0.15.1 they query such a file correctly in the meantime, time ranges included,
+and carry on when the owner converts it underneath them.
 
 ## Validating a config / connection
 

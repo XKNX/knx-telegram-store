@@ -15,6 +15,7 @@ from sqlalchemy import (
     Index,
     Integer,
     MetaData,
+    String,
     Table,
     Text,
     TypeDecorator,
@@ -22,6 +23,7 @@ from sqlalchemy import (
     cast,
     func,
     inspect,
+    literal,
     or_,
     select,
     text,
@@ -137,6 +139,25 @@ class UtcDateTime(TypeDecorator):
         if value.tzinfo is None:
             return value.replace(tzinfo=UTC)
         return value.astimezone(UTC)
+
+
+# SQLAlchemy's fixed text format for a SQLite datetime, which is what a
+# database written before 0.15 holds, and the same shape from SQLite's strftime
+# with the fraction it offers (milliseconds).
+_SQLITE_TEXT = "%Y-%m-%d %H:%M:%S.%f"
+_SQLITE_TEXT_MS = "%Y-%m-%d %H:%M:%f"
+
+
+def _text_timestamp(value: datetime) -> Any:
+    """A datetime as the text an unconverted SQLite file stores it as.
+
+    Bound as a string on purpose: left to UtcDateTime it would become an
+    integer, and SQLite sorts every integer before every text value, so a
+    range compared that way matches nothing.
+    """
+    if value.tzinfo is not None:
+        value = value.astimezone(UTC)
+    return literal(value.strftime(_SQLITE_TEXT), String())
 
 
 class BaseSQLStore(TelegramStore):
@@ -485,6 +506,14 @@ class BaseSQLStore(TelegramStore):
         cutoff = datetime.now(UTC) - timedelta(days=self._retention_days)
         return await self.evict_older_than(cutoff, dry_run=dry_run)
 
+    async def _text_timestamps(self) -> bool:
+        """Whether the timestamp columns still hold text instead of integers.
+
+        Only ever true for a read-only SQLite store on a file written before
+        0.15 that its owner has not converted yet; see SqliteStore.
+        """
+        return False
+
     @wrap_store_errors
     async def query(self, query: TelegramQuery, *, flush_first: bool = False) -> TelegramQueryResult:
         """Retrieve telegrams matching the given query.
@@ -526,17 +555,35 @@ class BaseSQLStore(TelegramStore):
         if dpt_conds:
             filters.append(or_(*dpt_conds))
 
+        # A read-only SQLite store may be looking at a file its writer has not
+        # converted to integer timestamps yet (see _text_timestamps()).
+        text_timestamps = await self._text_timestamps()
         if query.start_time:
-            filters.append(self.telegrams.c.timestamp >= query.start_time)
+            filters.append(
+                self.telegrams.c.timestamp
+                >= (_text_timestamp(query.start_time) if text_timestamps else query.start_time)
+            )
         if query.end_time:
-            filters.append(self.telegrams.c.timestamp <= query.end_time)
+            filters.append(
+                self.telegrams.c.timestamp <= (_text_timestamp(query.end_time) if text_timestamps else query.end_time)
+            )
 
         # 2. Time-Delta Context Logic
         if (query.delta_before_ms > 0 or query.delta_after_ms > 0) and filters:
             # Create a subquery for the matching pivots
             pivots = select(self.telegrams.c.timestamp).where(and_(*filters)).alias("pivots")
 
-            if self.engine.dialect.name == "sqlite":
+            if text_timestamps:
+                # Text of an unconverted file: SQLite's own date arithmetic,
+                # formatted like the stored strings but to the millisecond,
+                # which is the precision of the window itself.
+                cond = and_(
+                    self.telegrams.c.timestamp
+                    >= func.strftime(_SQLITE_TEXT_MS, pivots.c.timestamp, f"-{query.delta_before_ms / 1000.0} seconds"),
+                    self.telegrams.c.timestamp
+                    <= func.strftime(_SQLITE_TEXT_MS, pivots.c.timestamp, f"+{query.delta_after_ms / 1000.0} seconds"),
+                )
+            elif self.engine.dialect.name == "sqlite":
                 # Timestamps are integer microseconds there (see UtcDateTime).
                 delta_before_us = query.delta_before_ms * 1000
                 delta_after_us = query.delta_after_ms * 1000
