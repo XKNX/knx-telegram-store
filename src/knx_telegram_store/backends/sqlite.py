@@ -224,7 +224,10 @@ class SqliteStore(BaseSQLStore):
             # 2.1 Indexes the model declares but an existing database may lack (SpectrumKNX#450)
             await conn.run_sync(self.ensure_indexes)
 
-            # 2.2 Classify the timestamp convention (XKNX/knx-frontend#459)
+            # 2.2 Planner statistics, after the indexes they describe
+            await conn.run_sync(self._collect_missing_statistics)
+
+            # 2.3 Classify the timestamp convention (XKNX/knx-frontend#459)
             await conn.run_sync(self._classify_timestamp_convention)
 
         # 3. Convert pre-UTC timestamps, if the caller told us what wrote them.
@@ -234,6 +237,98 @@ class SqliteStore(BaseSQLStore):
 
         # 4. Warm the cache
         await super().initialize()
+
+    @wrap_store_errors
+    async def close(self) -> None:
+        """Close the engine, after giving SQLite a chance to refresh its statistics.
+
+        ``PRAGMA optimize`` is SQLite's own hygiene call for the end of a
+        connection: it re-runs ANALYZE for tables whose statistics it considers
+        stale (from 3.46 also ones that merely grew a lot) and is otherwise a
+        no-op. It only reasons about what this connection has seen, so it is a
+        complement to the check initialize() runs, not a replacement.
+        """
+        if not self._read_only and not self._is_memory:
+            try:
+                engine = self.engine.execution_options(isolation_level="AUTOCOMMIT")
+                async with engine.connect() as conn:
+                    await conn.execute(text("PRAGMA optimize"))
+            except Exception as err:  # noqa: BLE001 - closing must not fail
+                _LOGGER.debug("PRAGMA optimize on close failed: %s", err)
+        await super().close()
+
+    # ── Planner statistics ───────────────────────────────────────────────────
+    #
+    # Without sqlite_stat1 the planner guesses: it does not know that
+    # string_lookup is tiny and telegrams huge, nor how selective an index is,
+    # so the same filter gets a good plan on one database and a 5x slower one
+    # on another (XKNX/knx-telegram-store#78). ANALYZE reads every index once,
+    # about 0.5 s per million rows here. A file without any statistics gets
+    # them at start, reported through needs_migration() like the other startup
+    # passes; statistics that merely went stale are refreshed after an
+    # eviction, the nightly moment the table changes shape anyway.
+
+    _STATISTICS_CANARY = "ix_telegrams_timestamp"  # the one index every version has
+    _STATISTICS_STALE_FACTOR = 10
+    _STATISTICS_REPORT_ROWS = 100_000
+
+    def _statistics_missing(self, connection) -> bool:
+        """No statistics for the timestamp index: never analysed, or rebuilt since."""
+        if not inspect(connection).has_table("sqlite_stat1"):
+            return True
+        stat = connection.execute(
+            text("SELECT stat FROM sqlite_stat1 WHERE tbl = 'telegrams' AND idx = :idx"),
+            {"idx": self._STATISTICS_CANARY},
+        ).scalar()
+        return not stat
+
+    def _statistics_stale(self, connection) -> bool:
+        """Missing, or the table grew or shrank tenfold since they were taken.
+
+        The recorded row count is the first number of the stat.
+        """
+        if self._statistics_missing(connection):
+            return True
+        rows = int(connection.execute(text("SELECT count(*) FROM telegrams")).scalar() or 0)
+        stat = connection.execute(
+            text("SELECT stat FROM sqlite_stat1 WHERE tbl = 'telegrams' AND idx = :idx"),
+            {"idx": self._STATISTICS_CANARY},
+        ).scalar()
+        recorded = int(str(stat).split()[0]) or 1
+        return max(rows, recorded) / max(min(rows, recorded), 1) >= self._STATISTICS_STALE_FACTOR
+
+    def _telegram_rows(self, connection) -> int:
+        return int(connection.execute(text("SELECT count(*) FROM telegrams")).scalar() or 0)
+
+    def _collect_missing_statistics(self, connection) -> None:
+        """First start after the upgrade, or after an index rebuild."""
+        if not self._statistics_missing(connection):
+            return
+        rows = self._telegram_rows(connection)
+        if not rows:
+            return
+        if rows >= self._STATISTICS_REPORT_ROWS:
+            _LOGGER.info("Collecting query planner statistics for %d telegrams - this can take a moment", rows)
+        connection.execute(text("ANALYZE"))
+
+    def _refresh_stale_statistics(self, connection) -> None:
+        if self._statistics_stale(connection) and self._telegram_rows(connection):
+            connection.execute(text("ANALYZE"))
+
+    @wrap_store_errors
+    async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
+        """Delete all telegrams with timestamp < cutoff, then refresh stale statistics.
+
+        An eviction is the one recurring moment the table changes shape - a
+        retention change removes most of it in one go, a new file grows into
+        its steady state - and the nightly schedule hosts run it on makes a
+        sub-second ANALYZE free, where the startup path has a timeout to keep.
+        """
+        deleted = await super().evict_older_than(cutoff, dry_run=dry_run)
+        if not dry_run:
+            async with self.engine.begin() as conn:
+                await conn.run_sync(self._refresh_stale_statistics)
+        return deleted
 
     # ── Timestamp convention (XKNX/knx-frontend#459) ─────────────────────────
     #
@@ -656,6 +751,12 @@ class SqliteStore(BaseSQLStore):
         inspector = inspect(connection)
         if not inspector.has_table("telegrams"):
             return False
+        # 0. No planner statistics yet on a table large enough for ANALYZE to
+        #    take a while; below that it runs unreported. Stale statistics are
+        #    not a startup pass: they wait for the next eviction.
+        if self._statistics_missing(connection) and self._telegram_rows(connection) >= self._STATISTICS_REPORT_ROWS:
+            return True
+
         columns = inspector.get_columns("telegrams")
         existing_columns = {col["name"] for col in columns}
 

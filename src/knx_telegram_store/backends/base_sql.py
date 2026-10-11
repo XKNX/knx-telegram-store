@@ -536,6 +536,14 @@ class BaseSQLStore(TelegramStore):
         #
         # Same rows as before, by the argument given for the count above: every
         # *_id has its lookup row, so the inner joins never removed any.
+        #
+        # All six lookups are LEFT JOINs, the four required ones included, so
+        # the page stays the outer loop: an inner join lets SQLite start from
+        # the few lookup rows instead once it has statistics, build an
+        # automatic index over the page and sort it a second time, 20-35 %
+        # slower on every shape measured (XKNX/knx-telegram-store#82). A LEFT
+        # JOIN cannot be reordered ahead of its left side. Equivalent, by the
+        # same interning argument.
         order = self.telegrams.c.timestamp.desc() if query.order_descending else self.telegrams.c.timestamp.asc()
         page_stmt = select(self.telegrams)
         if where_clause is not None:
@@ -568,10 +576,10 @@ class BaseSQLStore(TelegramStore):
                 page.c.data_secure,
             )
             .select_from(page)
-            .join(s_lk, and_(s_lk.c.id == page.c.source_id, s_lk.c.category == "source"))
-            .join(d_lk, and_(d_lk.c.id == page.c.destination_id, d_lk.c.category == "destination"))
-            .join(tt_lk, and_(tt_lk.c.id == page.c.telegramtype_id, tt_lk.c.category == "telegramtype"))
-            .join(dir_lk, and_(dir_lk.c.id == page.c.direction_id, dir_lk.c.category == "direction"))
+            .outerjoin(s_lk, and_(s_lk.c.id == page.c.source_id, s_lk.c.category == "source"))
+            .outerjoin(d_lk, and_(d_lk.c.id == page.c.destination_id, d_lk.c.category == "destination"))
+            .outerjoin(tt_lk, and_(tt_lk.c.id == page.c.telegramtype_id, tt_lk.c.category == "telegramtype"))
+            .outerjoin(dir_lk, and_(dir_lk.c.id == page.c.direction_id, dir_lk.c.category == "direction"))
             .outerjoin(sn_lk, and_(sn_lk.c.id == page.c.source_name_id, sn_lk.c.category == "source_name"))
             .outerjoin(den_lk, and_(den_lk.c.id == page.c.destination_name_id, den_lk.c.category == "destination_name"))
             # The joins do not promise to keep the page's order.

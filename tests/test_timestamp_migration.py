@@ -8,7 +8,7 @@ caller supplies it (XKNX/knx-frontend#459).
 """
 
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -298,7 +298,9 @@ async def test_deferred_conversion_includes_recent_legacy_rows_east_of_utc(tmp_p
     unconverted while still flagging the database as converted.
     """
     path = tmp_path / "deferred-recent.db"
-    legacy = datetime.now(BERLIN).replace(microsecond=123456)
+    # A couple of seconds back, so the row sorts before the boundary initialize()
+    # records below even when both fall into the same wall-clock second.
+    legacy = datetime.now(BERLIN).replace(microsecond=123456) - timedelta(seconds=2)
     await _legacy_db(path, [legacy.strftime("%Y-%m-%d %H:%M:%S.%f")])
 
     store = SqliteStore(str(path))
