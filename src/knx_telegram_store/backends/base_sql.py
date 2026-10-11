@@ -119,8 +119,12 @@ class BaseSQLStore(TelegramStore):
             Column("timestamp", UtcDateTime, nullable=False, index=True),
             Column("source_id", Integer, nullable=False, index=True),
             Column("destination_id", Integer, nullable=False, index=True),
-            Column("telegramtype_id", Integer, nullable=False, index=True),
-            Column("direction_id", Integer, nullable=False, index=True),
+            # Not indexed: with two or three distinct values an index on either
+            # never narrows a search, and every query orders by timestamp with
+            # a limit, which the timestamp index serves. They still cost ~12
+            # bytes per row each on SQLite (XKNX/knx-telegram-store#78).
+            Column("telegramtype_id", Integer, nullable=False),
+            Column("direction_id", Integer, nullable=False),
             Column("source_name_id", Integer, nullable=True),
             Column("destination_name_id", Integer, nullable=True),
             Column("payload", JSON, nullable=True),
@@ -383,11 +387,15 @@ class BaseSQLStore(TelegramStore):
 
         self._lookup_cache.publish(lookup_ids)
 
+    # Indexes earlier versions created that the model no longer declares.
+    _OBSOLETE_INDEXES = ("ix_telegrams_telegramtype_id", "ix_telegrams_direction_id")
+
     def ensure_indexes(self, connection) -> None:
-        """Create any declared index that the database is missing.
+        """Create any declared index that the database is missing, drop obsolete ones.
 
         ``metadata.create_all`` skips tables that already exist, so an index
-        added to the model later never reaches an existing installation.
+        added to the model later never reaches an existing installation, and
+        one removed from the model lingers until it is dropped here.
 
         On a large TimescaleDB hypertable this takes a moment as it propagates
         to every chunk — around 1-2.5 s per million rows in testing — so it logs
@@ -409,6 +417,8 @@ class BaseSQLStore(TelegramStore):
                         table.name,
                     )
                     index.create(connection, checkfirst=True)
+        for name in self._OBSOLETE_INDEXES:
+            connection.execute(text(f"DROP INDEX IF EXISTS {name}"))
 
     @wrap_store_errors
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
