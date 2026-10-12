@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 from .backends.memory import MemoryStore
 from .model import StoredTelegram
 from .query import TelegramQuery, TelegramQueryResult
-from .store import StoreStats, wrap_store_errors
+from .store import KnxTelegramStoreException, StoreStats, wrap_store_errors
 
 if TYPE_CHECKING:
     from .buffered_sql import BufferedPostgresStore as BufferedPostgresStore
@@ -40,6 +40,10 @@ class _BufferMixin:
       there is no database to write to and the buffer is dropped.
     - query() accepts flush_first=True to guarantee read-your-writes consistency.
     - clear() wipes both the in-memory buffer and the backing store.
+    - begin_backup() flushes, hands over to the backing store and then holds
+      off every write until end_backup(): telegrams keep accumulating in the
+      buffer, flushes (periodic or flush_first) return without writing, and
+      store_many(), evictions, clear() and optimize() wait.
     """
 
     def __init__(
@@ -55,6 +59,8 @@ class _BufferMixin:
         self._mutation_lock = asyncio.Lock()
         self._mutation_owner: asyncio.Task[Any] | None = None
         self._flush_task: asyncio.Task[None] | None = None
+        self._writes_allowed = asyncio.Event()
+        self._writes_allowed.set()
         self._closing = False
         self._initialized = False
         self.flush_interval = flush_interval
@@ -77,6 +83,20 @@ class _BufferMixin:
                 yield
             finally:
                 self._mutation_owner = None
+
+    @asynccontextmanager
+    async def _write_gate(self) -> AsyncIterator[None]:
+        """Take the mutation lock once no backup is in progress.
+
+        A backup that starts while waiting for the lock sends the caller back
+        to waiting, so nothing reaches the backing store until end_backup().
+        """
+        while True:
+            await self._writes_allowed.wait()
+            async with self._mutation():
+                if self._writes_allowed.is_set():
+                    yield
+                    return
 
     # --- Lifecycle ---
 
@@ -101,6 +121,9 @@ class _BufferMixin:
         dropped instead of flushed and only the backend is closed.
         """
         self._closing = True
+        if not self._writes_allowed.is_set():
+            _LOGGER.warning("Closing the store while a backup is in progress, resuming writes")
+            await self.end_backup()
         if self._flush_task is not None:
             self._flush_task.cancel()
             try:
@@ -172,12 +195,18 @@ class _BufferMixin:
     @wrap_store_errors
     async def store_many(self, telegrams: Sequence[StoredTelegram]) -> None:
         """Write a batch while excluding lifecycle operations."""
-        async with self._mutation():
+        async with self._write_gate():
             await super().store_many(telegrams)  # type: ignore[misc]
 
     async def _flush(self, *, raise_on_error: bool) -> None:
-        """Drain the buffer into the backing store (private implementation)."""
+        """Drain the buffer into the backing store (private implementation).
+
+        During a backup the buffer is kept as it is: a flush must never wait
+        for the backup to end, since flush_first queries go through here.
+        """
         async with self._mutation():
+            if not self._writes_allowed.is_set():
+                return
             async with self._flush_lock:
                 if not self._buffer:
                     return
@@ -249,14 +278,40 @@ class _BufferMixin:
     @wrap_store_errors
     async def optimize(self) -> None:
         """Flush buffered writes, then reclaim space in the backing store."""
-        async with self._mutation():
+        async with self._write_gate():
             await self.flush()
             await super().optimize()  # type: ignore[misc]
+
+    # --- Backup ---
+
+    @wrap_store_errors
+    async def begin_backup(self) -> None:
+        """Flush, prepare the backing store and hold off writes until end_backup().
+
+        Telegrams stored meanwhile stay in the buffer, bounded by
+        max_buffer_size, and are written once the backup has ended.
+        """
+        async with self._mutation():
+            if not self._writes_allowed.is_set():
+                raise KnxTelegramStoreException("A backup is already in progress")
+            await self._flush(raise_on_error=True)
+            await super().begin_backup()  # type: ignore[misc]
+            self._writes_allowed.clear()
+
+    @wrap_store_errors
+    async def end_backup(self) -> None:
+        """Resume writing to the backing store."""
+        if self._writes_allowed.is_set():
+            raise KnxTelegramStoreException("No backup is in progress")
+        try:
+            await super().end_backup()  # type: ignore[misc]
+        finally:
+            self._writes_allowed.set()
 
     @wrap_store_errors
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
         """Evict matching persisted and buffered telegrams atomically on cancellation."""
-        async with self._mutation():
+        async with self._write_gate():
             task = asyncio.create_task(self._evict_older_than(cutoff, dry_run=dry_run))
             try:
                 return await asyncio.shield(task)
@@ -286,7 +341,7 @@ class _BufferMixin:
     @wrap_store_errors
     async def evict_expired(self, *, dry_run: bool = False) -> int:
         """Apply backend retention within the store lifecycle, including no-ops."""
-        async with self._mutation():
+        async with self._write_gate():
             return await super().evict_expired(dry_run=dry_run)  # type: ignore[misc, no-any-return]
 
     # --- Clear overrride (wipe buffer + table) ---
@@ -294,7 +349,7 @@ class _BufferMixin:
     @wrap_store_errors
     async def clear(self) -> None:
         """Clear both the in-memory buffer and the underlying table."""
-        async with self._mutation():
+        async with self._write_gate():
             async with self._flush_lock:
                 self._buffer.clear()
                 await super().clear()  # type: ignore[misc]
@@ -319,7 +374,7 @@ class BufferedMemoryStore(_BufferMixin, MemoryStore):
     @wrap_store_errors
     async def evict_older_than(self, cutoff: datetime, *, dry_run: bool = False) -> int:
         """Keep the memory backend's max-size-only retention semantics."""
-        async with self._mutation():
+        async with self._write_gate():
             return await MemoryStore.evict_older_than(self, cutoff, dry_run=dry_run)
 
 

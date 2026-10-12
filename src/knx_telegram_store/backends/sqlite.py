@@ -6,7 +6,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from sqlalchemy import URL, inspect, text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from ..connection import (
     ConnectionCheckResult,
@@ -14,7 +14,7 @@ from ..connection import (
     evaluate_sqlite_path,
     probe_engine,
 )
-from ..store import wrap_store_errors
+from ..store import KnxTelegramStoreException, wrap_store_errors
 from .base_sql import BaseSQLStore, datetime_to_micros, micros_to_datetime
 
 
@@ -171,6 +171,8 @@ class SqliteStore(BaseSQLStore):
         # rollback journal) readers wait instead of failing with SQLITE_BUSY.
         engine = create_async_engine(url, connect_args={"timeout": 10})
         self._legacy_timestamp_timezone = legacy_timestamp_timezone
+        self._backup_in_progress = False
+        self._backup_connection: AsyncConnection | None = None
         super().__init__(engine, retention_days, read_only=read_only)
 
     @staticmethod
@@ -208,6 +210,52 @@ class SqliteStore(BaseSQLStore):
         engine = self.engine.execution_options(isolation_level="AUTOCOMMIT")
         async with engine.connect() as conn:
             await conn.execute(text("VACUUM"))
+
+    @wrap_store_errors
+    async def begin_backup(self) -> None:
+        """Make the database file safe to copy until end_backup() is called.
+
+        Moves the WAL into the main file so the copy needs nothing but the
+        ``.db`` file (the ``-wal`` file is left empty), then holds a write lock
+        so no page changes under a process copying the file. Readers are not
+        affected; a writer in any process waits on its busy timeout. The lock
+        is held by one connection taken from the pool for the duration.
+        """
+        self._ensure_writable()
+        if self._backup_in_progress:
+            raise KnxTelegramStoreException("A backup is already in progress")
+        if self._is_memory:
+            self._backup_in_progress = True
+            return
+
+        engine = self.engine.execution_options(isolation_level="AUTOCOMMIT")
+        conn = await engine.connect()
+        try:
+            row = (await conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))).first()
+            if row is not None and row[0]:
+                # Readers kept the checkpoint from completing. The copy is still
+                # consistent under the write lock, it just needs the -wal file too.
+                _LOGGER.debug("WAL checkpoint could not complete, readers are active")
+            await conn.execute(text("BEGIN IMMEDIATE"))
+        except BaseException:
+            await conn.close()
+            raise
+        self._backup_connection = conn
+        self._backup_in_progress = True
+
+    @wrap_store_errors
+    async def end_backup(self) -> None:
+        """Release the write lock taken by begin_backup()."""
+        if not self._backup_in_progress:
+            raise KnxTelegramStoreException("No backup is in progress")
+        self._backup_in_progress = False
+        conn, self._backup_connection = self._backup_connection, None
+        if conn is None:
+            return
+        try:
+            await conn.execute(text("COMMIT"))
+        finally:
+            await conn.close()
 
     async def initialize(self) -> None:
         """Set up the database schema and perform upgrades."""
@@ -274,6 +322,9 @@ class SqliteStore(BaseSQLStore):
         no-op. It only reasons about what this connection has seen, so it is a
         complement to the check initialize() runs, not a replacement.
         """
+        if self._backup_in_progress:
+            _LOGGER.warning("Closing the store while a backup is in progress, releasing its write lock")
+            await self.end_backup()
         if not self._read_only and not self._is_memory:
             try:
                 engine = self.engine.execution_options(isolation_level="AUTOCOMMIT")
