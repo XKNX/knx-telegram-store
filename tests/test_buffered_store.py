@@ -163,6 +163,88 @@ async def test_close_persists_pending_telegrams_to_file(tmp_path, sample_telegra
         await store.close()
 
 
+@pytest.mark.parametrize("backend", ["sqlite", "memory"])
+async def test_store_before_initialize_is_buffered_and_flushed(sample_telegram, backend):
+    store = BufferedSqliteStore(":memory:", flush_interval=60) if backend == "sqlite" else BufferedMemoryStore()
+    store.store_sync(sample_telegram)
+    await store.store(replace(sample_telegram, destination="1/1/2"))
+    assert len(store._buffer) == 2
+
+    await store.initialize()
+    store.start()
+    try:
+        assert len(store._buffer) == 2
+        await store.flush()
+        assert store._buffer == []
+        assert await store.count() == 2
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "memory"])
+async def test_close_before_initialize_discards_buffer(sample_telegram, backend, monkeypatch, tmp_path, caplog):
+    db_path = tmp_path / "telegrams.db"
+    store = BufferedSqliteStore(db_path, flush_interval=60) if backend == "sqlite" else BufferedMemoryStore()
+    backend_cls = SqliteStore if backend == "sqlite" else MemoryStore
+    backend_close_calls = 0
+    original_close = backend_cls.close
+
+    async def _close(_store):
+        nonlocal backend_close_calls
+        backend_close_calls += 1
+        await original_close(_store)
+
+    async def _store_many(_telegrams):
+        raise AssertionError("close() must not write before initialize()")
+
+    monkeypatch.setattr(backend_cls, "close", _close)
+    monkeypatch.setattr(store, "store_many", _store_many)
+    store.store_sync(sample_telegram)
+
+    await store.close()
+
+    assert store._buffer == []
+    assert backend_close_calls == 1
+    assert "dropping 1 buffered telegrams" in caplog.text
+
+    # Idempotent, like close() on an initialized store.
+    await store.close()
+    assert backend_close_calls == 2
+
+
+async def test_close_after_failed_initialize_discards_buffer(sample_telegram, monkeypatch, tmp_path):
+    """The host's teardown path: initialize() failed, the store is closed without a schema to write to."""
+    db_path = tmp_path / "telegrams.db"
+    store = BufferedSqliteStore(db_path, flush_interval=60)
+
+    async def _fail(_store):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(SqliteStore, "initialize", _fail)
+    store.store_sync(sample_telegram)
+    with pytest.raises(KnxTelegramStoreException, match="disk full"):
+        await store.initialize()
+    store.store_sync(replace(sample_telegram, destination="1/1/2"))
+    assert len(store._buffer) == 2
+
+    await store.close()
+
+    assert store._buffer == []
+    monkeypatch.undo()
+    reader = SqliteStore(db_path)
+    await reader.initialize()
+    try:
+        assert await reader.count() == 0
+    finally:
+        await reader.close()
+
+
+async def test_close_before_initialize_with_empty_buffer_is_quiet(caplog):
+    store = BufferedMemoryStore()
+    await store.close()
+    assert "dropping" not in caplog.text
+
+
 async def test_close_stops_periodic_task_and_is_idempotent(sample_telegram):
     store = BufferedMemoryStore(flush_interval=60)
     await store.initialize()
