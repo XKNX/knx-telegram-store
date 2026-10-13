@@ -354,6 +354,13 @@ class SqliteStore(BaseSQLStore):
         if not dry_run:
             async with self.engine.begin() as conn:
                 await conn.run_sync(self._refresh_stale_statistics)
+        if deleted and not dry_run and not self._is_memory:
+            # The deleted pages went through the WAL, which SQLite's automatic
+            # checkpoints empty but never shrink; truncate it here instead of
+            # carrying a file of that size until the next explicit checkpoint.
+            engine = self.engine.execution_options(isolation_level="AUTOCOMMIT")
+            async with engine.connect() as conn:
+                await conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
         return deleted
 
     # ── Integer timestamps (XKNX/knx-telegram-store#78) ──────────────────────
