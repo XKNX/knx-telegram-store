@@ -137,6 +137,30 @@ driver level. `capabilities.read_only` is `True` and `supports_optimize` is
 `False` in this mode. Writing stores enable WAL journaling, which makes this
 single-writer/multi-reader setup safe across processes.
 
+## Backups
+
+A host that copies the SQLite file while the store is running (Home Assistant
+does, for its backups) calls `begin_backup()` first and `end_backup()` once the
+copy is done. The writing store checkpoints the WAL into the main file, leaving
+the `-wal` file empty, and holds a write lock until `end_backup()`, so the file
+does not change under the copy. Readers, including read-only stores in other
+processes, are not affected.
+
+Between the two calls a buffered store keeps incoming telegrams in its buffer
+(bounded by `max_buffer_size`) and writes them when the backup has ended.
+Flushes and `flush_first` queries return without writing instead of waiting;
+`store_many()`, evictions, `clear()` and `optimize()` wait for `end_backup()`.
+Closing a store during a backup releases the lock. The calls are no-ops for the
+memory store and the PostgreSQL store, whose data the host does not copy.
+
+```python
+await store.begin_backup()
+try:
+    ...  # copy telegrams.db
+finally:
+    await store.end_backup()
+```
+
 ## SQLite file format
 
 Since 0.15 the SQLite backend stores timestamps as integer microseconds since

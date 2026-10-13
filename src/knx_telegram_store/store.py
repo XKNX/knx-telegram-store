@@ -139,6 +139,19 @@ class TelegramStore(ABC):
             retention_days=self.retention_days,
         )
 
+    async def begin_backup(self) -> None:
+        """Make the store's files safe to copy until end_backup() is called.
+
+        For a backend whose data lives in files the host copies (SQLite), this
+        gets the files into a consistent state and holds off writes. Backends
+        that keep their data elsewhere do nothing.
+        """
+        return
+
+    async def end_backup(self) -> None:
+        """Resume normal operation after begin_backup()."""
+        return
+
     async def optimize(self) -> None:
         """Reclaim storage space after deletions (e.g. VACUUM).
 
