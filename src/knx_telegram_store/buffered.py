@@ -31,9 +31,13 @@ class _BufferMixin:
     public store_many() dispatch under the lifecycle locks.
 
     Behaviour:
-    - store() / store_sync() are O(1) and never touch the database.
+    - store() / store_sync() are O(1) and never touch the database, so they
+      may be called before initialize() has run; the buffer is written by the
+      first flush after it.
     - flush() atomically drains the buffer and delegates to store_many().
     - On flush failure the batch is re-prepended so no writes are lost.
+    - close() flushes the buffer, unless initialize() never completed: then
+      there is no database to write to and the buffer is dropped.
     - query() accepts flush_first=True to guarantee read-your-writes consistency.
     - clear() wipes both the in-memory buffer and the backing store.
     """
@@ -52,6 +56,7 @@ class _BufferMixin:
         self._mutation_owner: asyncio.Task[Any] | None = None
         self._flush_task: asyncio.Task[None] | None = None
         self._closing = False
+        self._initialized = False
         self.flush_interval = flush_interval
         self.max_buffer_size = max_buffer_size
         self._buffer_full_warned = False
@@ -75,6 +80,12 @@ class _BufferMixin:
 
     # --- Lifecycle ---
 
+    @wrap_store_errors
+    async def initialize(self) -> None:
+        """Set up the backend; telegrams buffered before this are kept."""
+        await super().initialize()  # type: ignore[misc]
+        self._initialized = True
+
     def start(self) -> None:
         """Start the periodic flush task."""
         if self._closing or self._flush_task is not None:
@@ -83,7 +94,12 @@ class _BufferMixin:
 
     @wrap_store_errors
     async def close(self) -> None:
-        """Stop periodic flushing, flush pending writes, and close the backend."""
+        """Stop periodic flushing, flush pending writes, and close the backend.
+
+        A store whose initialize() never completed has no schema to write
+        to - it timed out, failed, or was never attempted - so its buffer is
+        dropped instead of flushed and only the backend is closed.
+        """
         self._closing = True
         if self._flush_task is not None:
             self._flush_task.cancel()
@@ -94,7 +110,14 @@ class _BufferMixin:
             self._flush_task = None
 
         async with self._mutation(allow_closing=True):
-            await self._flush(raise_on_error=True)
+            if self._initialized:
+                await self._flush(raise_on_error=True)
+            elif self._buffer:
+                _LOGGER.warning(
+                    "Closing a telegram store that was never initialized, dropping %d buffered telegrams",
+                    len(self._buffer),
+                )
+                self._buffer.clear()
             await super().close()  # type: ignore[misc]
 
     @wrap_store_errors

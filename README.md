@@ -64,6 +64,35 @@ async def main():
     await store.close()
 ```
 
+## Write-buffered stores
+
+`BufferedSqliteStore`, `BufferedPostgresStore` and `BufferedMemoryStore` wrap
+the backend of the same name in an in-memory write buffer. `store()` and
+`store_sync()` only append to it and never touch the database; a periodic task
+started by `start()` drains it with `store_many()`, and so do `flush()`,
+`close()` and the reads that need to see every write (`get_last_unique_telegrams()`,
+`get_stats()`, `query(..., flush_first=True)`). The buffer holds at most
+`max_buffer_size` telegrams and drops the oldest beyond that.
+
+```python
+from knx_telegram_store import BufferedSqliteStore
+
+store = BufferedSqliteStore("/data/telegrams.db", flush_interval=600, max_buffer_size=120_000)
+store.store_sync(telegram)  # allowed before initialize(): buffered, written by the first flush
+await store.initialize()
+store.start()
+...
+await store.close()  # flushes what is left, then closes the backend
+```
+
+Telegrams may be handed to the store before `initialize()` has run, or while
+it is running, and are written by the first flush after it. That lets a host
+keep recording while a long startup pass (see `needs_migration()`) or a
+retried initialization is under way. `close()` on a store whose `initialize()`
+never completed has no schema to write to, so it drops the buffer with a
+warning and only closes the backend; `flush()` and the flushing reads above
+are the caller's to avoid until `initialize()` has returned.
+
 ## Stats, purging and space reclamation
 
 ```python
