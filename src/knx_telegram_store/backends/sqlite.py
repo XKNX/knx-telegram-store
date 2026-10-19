@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from urllib.parse import quote
@@ -14,7 +15,7 @@ from ..connection import (
     evaluate_sqlite_path,
     probe_engine,
 )
-from ..store import KnxTelegramStoreException, wrap_store_errors
+from ..store import InsufficientDiskSpaceError, KnxTelegramStoreException, wrap_store_errors
 from .base_sql import BaseSQLStore, datetime_to_micros, micros_to_datetime
 
 
@@ -40,6 +41,10 @@ _TEXT_TO_MICROS = (
     "CAST(strftime('%s', substr(timestamp, 1, 19)) AS INTEGER) * 1000000 "
     "+ CAST(substr(timestamp || '000000', 21, 6) AS INTEGER) "
     "WHERE typeof(timestamp) = 'text'"
+)
+_HAS_TEXT_TIMESTAMPS = (
+    "SELECT EXISTS (SELECT 1 FROM telegrams WHERE typeof(timestamp) = 'text') "
+    "OR EXISTS (SELECT 1 FROM last_ga_telegrams WHERE typeof(timestamp) = 'text')"
 )
 
 
@@ -149,12 +154,14 @@ class SqliteStore(BaseSQLStore):
         conversion is skipped and merely offered — see migrate_timestamps_to_utc().
         """
         self._is_memory = str(db_path) == ":memory:"
+        self._db_path: Path | None = None
         if self._is_memory:
             if read_only:
                 raise ValueError("read_only is not supported for in-memory databases")
             url = URL.create("sqlite+aiosqlite", database=":memory:")
         else:
             path = Path(db_path)
+            self._db_path = path
             if read_only:
                 encoded_path = quote(str(path), safe="/:")
                 url = URL.create(
@@ -197,6 +204,42 @@ class SqliteStore(BaseSQLStore):
         if page_count is None or page_size is None:
             return None
         return int(page_count) * int(page_size)
+
+    # ── Disk space ────────────────────────────────────────────────────────────
+    #
+    # In WAL mode every page a pass rewrites goes to the -wal file before the
+    # commit, and a VACUUM copies the live data to a temporary file. A pass that
+    # runs out of disk rolls back cleanly, but it has filled the volume for
+    # everything else meanwhile and runs into the same wall on the next start.
+    # So the passes that scale with the file check first (#91).
+
+    def _file_size(self) -> int:
+        """Bytes the database occupies on disk, its WAL included; 0 for in-memory."""
+        if self._db_path is None:
+            return 0
+        size = 0
+        for suffix in ("", "-wal"):
+            try:
+                size += Path(f"{self._db_path}{suffix}").stat().st_size
+            except OSError:
+                pass
+        return size
+
+    def _free_space(self) -> int | None:
+        """Free bytes on the volume holding the database; None for in-memory."""
+        if self._db_path is None:
+            return None
+        return shutil.disk_usage(self._db_path.parent).free
+
+    def _require_free_space(self, needed: int, pass_name: str) -> None:
+        free = self._free_space()
+        if free is not None and free < needed:
+            raise InsufficientDiskSpaceError(pass_name, needed, free)
+
+    def _vacuum_fits(self) -> bool:
+        """Whether the volume has room for the copy a VACUUM makes."""
+        free = self._free_space()
+        return free is None or free >= self._file_size()
 
     @wrap_store_errors
     async def optimize(self) -> None:
@@ -281,11 +324,12 @@ class SqliteStore(BaseSQLStore):
             # 2. Perform column-level upgrades
             await conn.run_sync(self._upgrade_schema)
 
-            # 2.1 Text timestamps to integers (XKNX/knx-telegram-store#78).
-            #     Ahead of the indexes: it drops the timestamp index so the
-            #     rewrite does not maintain it row by row.
-            converted = await conn.run_sync(self._convert_timestamps_to_integers)
+        # 2.1 Text timestamps to integers (XKNX/knx-telegram-store#78), in
+        #     batches with their own commits. Ahead of the indexes: it drops
+        #     the timestamp index so the rewrite does not maintain it row by row.
+        converted = await self._convert_timestamps_to_integers()
 
+        async with self.engine.begin() as conn:
             # 2.2 Indexes the model declares but an existing database may lack (SpectrumKNX#450)
             await conn.run_sync(self.ensure_indexes)
 
@@ -295,14 +339,10 @@ class SqliteStore(BaseSQLStore):
             # 2.4 Classify the timestamp convention (XKNX/knx-frontend#459)
             await conn.run_sync(self._classify_timestamp_convention)
 
-        if converted:
-            # The rewritten rows are smaller, but their pages only go back to
-            # the file system through a VACUUM.
-            _LOGGER.info(
-                "Reclaiming the space freed by the timestamp conversion with VACUUM - "
-                "this needs free disk of about the database size and blocks writers until done"
-            )
-            await self.optimize()
+        # 2.5 The rewritten rows are smaller, but their pages only go back to
+        #     the file system through a VACUUM - which waits for room.
+        if converted or await self._flag(self._VACUUM_PENDING_FLAG):
+            await self._vacuum_when_room()
 
         # 3. Convert pre-UTC timestamps, if the caller told us what wrote them.
         #    Ahead of the cache warm below, which reads timestamps back.
@@ -443,7 +483,18 @@ class SqliteStore(BaseSQLStore):
             self._integer_timestamps_seen = True
         return not converted
 
-    def _convert_timestamps_to_integers(self, connection) -> bool:
+    _CONVERSION_BATCH_ROWS = 50_000
+    _VACUUM_PENDING_FLAG = "vacuum_pending"
+
+    async def _flag(self, key: str) -> bool:
+        async with self.engine.connect() as conn:
+            return await conn.run_sync(lambda c: self._metadata_flag_set(c, key))
+
+    async def _set_flag(self, key: str, value: str) -> None:
+        async with self.engine.begin() as conn:
+            await conn.run_sync(lambda c: self._set_metadata_value(c, key, value))
+
+    async def _convert_timestamps_to_integers(self) -> bool:
         """Rewrite text timestamps as integer microseconds, once.
 
         Databases written before 0.15 hold SQLAlchemy's 26-character strings;
@@ -451,31 +502,72 @@ class SqliteStore(BaseSQLStore):
         place and the file is flagged. A fresh or already converted database
         pays one probe that stops at the first text row, then only the flag.
 
+        The rewrite commits per batch of rows, so the WAL holds a batch rather
+        than the whole table and a start that is cut off resumes where it
+        stopped: converted rows no longer match the text filter. The flag is
+        set once no text row is left. What still has to fit on the volume is
+        the index rebuilt afterwards, about half the file at most, and that is
+        checked before a row is touched.
+
         Returns whether rows were rewritten, so the caller knows a VACUUM is
         worth running. The column keeps its declared type: in old files that is
         DATETIME (NUMERIC affinity), which stores the integers as INTEGER just
         as the BIGINT of a new file does.
         """
-        if self._metadata_flag_set(connection, self._INTEGER_FLAG):
-            return False
+        async with self.engine.connect() as conn:
+            if await conn.run_sync(lambda c: self._metadata_flag_set(c, self._INTEGER_FLAG)):
+                return False
+            has_text = bool(await conn.scalar(text(_HAS_TEXT_TIMESTAMPS)))
 
-        has_text = connection.execute(
-            text(
-                "SELECT EXISTS (SELECT 1 FROM telegrams WHERE typeof(timestamp) = 'text') "
-                "OR EXISTS (SELECT 1 FROM last_ga_telegrams WHERE typeof(timestamp) = 'text')"
-            )
-        ).scalar()
         if has_text:
+            self._require_free_space(self._file_size() // 2, "The timestamp conversion")
             _LOGGER.info(
                 "Converting timestamps to integers, which shrinks the database by about a quarter - "
                 "this can take a while on a large store"
             )
-            connection.execute(text("DROP INDEX IF EXISTS ix_telegrams_timestamp"))
+            async with self.engine.begin() as conn:
+                await conn.execute(text("DROP INDEX IF EXISTS ix_telegrams_timestamp"))
             for table in ("telegrams", "last_ga_telegrams"):
-                connection.execute(text(_TEXT_TO_MICROS.format(table=table)))
+                await self._convert_table_to_integers(table)
 
-        self._set_metadata_value(connection, self._INTEGER_FLAG, "true")
-        return bool(has_text)
+        await self._set_flag(self._INTEGER_FLAG, "true")
+        return has_text
+
+    async def _convert_table_to_integers(self, table: str) -> None:
+        """Rewrite one table in rowid ranges, each range its own transaction."""
+        async with self.engine.connect() as conn:
+            max_rowid = await conn.scalar(text(f"SELECT max(rowid) FROM {table}")) or 0  # noqa: S608 - fixed names
+        for low in range(0, int(max_rowid), self._CONVERSION_BATCH_ROWS):
+            await self._convert_rows_to_integers(table, low, low + self._CONVERSION_BATCH_ROWS)
+
+    async def _convert_rows_to_integers(self, table: str, low: int, high: int) -> None:
+        statement = text(_TEXT_TO_MICROS.format(table=table) + " AND rowid > :low AND rowid <= :high")
+        async with self.engine.begin() as conn:
+            await conn.execute(statement, {"low": low, "high": high})
+
+    async def _vacuum_when_room(self) -> None:
+        """Compact the file after a conversion, once the volume has room for VACUUM's copy.
+
+        A VACUUM that fails for lack of space leaves the file as it is, so it is
+        not worth the attempt: the pass is skipped, flagged, and tried again on
+        a later start. needs_migration() reports it while it would fit.
+        """
+        if not self._vacuum_fits():
+            _LOGGER.warning(
+                "Not compacting the telegram database after the timestamp conversion: VACUUM needs "
+                "about %d MiB free next to the database, %d MiB are available. It runs on a later "
+                "start once there is room",
+                self._file_size() >> 20,
+                (self._free_space() or 0) >> 20,
+            )
+            await self._set_flag(self._VACUUM_PENDING_FLAG, "true")
+            return
+        _LOGGER.info(
+            "Reclaiming the space freed by the timestamp conversion with VACUUM - "
+            "this needs free disk of about the database size and blocks writers until done"
+        )
+        await self.optimize()
+        await self._set_flag(self._VACUUM_PENDING_FLAG, "false")
 
     # ── Timestamp convention (XKNX/knx-frontend#459) ─────────────────────────
     #
@@ -562,6 +654,8 @@ class SqliteStore(BaseSQLStore):
         self._ensure_writable()
         if not await self.needs_timestamp_migration():
             return 0
+        # One UPDATE per table, so the WAL grows to about the file before the commit.
+        self._require_free_space(self._file_size(), "The UTC timestamp conversion")
 
         async with self.engine.begin() as conn:
             scopes = await self._legacy_row_scopes(conn, source_timezone)
@@ -911,6 +1005,10 @@ class SqliteStore(BaseSQLStore):
             self._has_rows(connection, "telegrams")
             or (inspector.has_table("last_ga_telegrams") and self._has_rows(connection, "last_ga_telegrams"))
         ):
+            return True
+
+        # 0.2 A VACUUM skipped for lack of disk space, once there is room for it.
+        if self._metadata_flag_set(connection, self._VACUUM_PENDING_FLAG) and self._vacuum_fits():
             return True
 
         columns = inspector.get_columns("telegrams")
