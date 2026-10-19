@@ -66,6 +66,7 @@ To release a new version of the store (e.g., bumping from `0.3.1` to `0.3.2`):
    ```bash
    git push origin <branch-name> && git push origin v0.3.2
    ```
+6. **Let CI Publish**: Pushing the tag triggers `.github/workflows/publish.yml`, which uploads the package to PyPI and then creates the GitHub Release for the tag (notes generated from merged PRs, wheel and sdist attached). Do not create the Release by hand; if the workflow fails, fix it and re-run it instead.
 
 ---
 
