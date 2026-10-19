@@ -6,7 +6,7 @@ from .buffered import BufferedMemoryStore
 from .connection import ConnectionCheckResult, ConnectionErrorKind
 from .model import StoredTelegram
 from .query import TelegramQuery, TelegramQueryResult
-from .store import KnxTelegramStoreException, StoreCapabilities, StoreStats, TelegramStore
+from .store import InsufficientDiskSpaceError, KnxTelegramStoreException, StoreCapabilities, StoreStats, TelegramStore
 
 if TYPE_CHECKING:
     from .buffered_sql import BufferedPostgresStore as BufferedPostgresStore
@@ -41,6 +41,7 @@ __all__ = [
     "MemoryStore",
     "BufferedMemoryStore",
     "KnxTelegramStoreException",
+    "InsufficientDiskSpaceError",
     "ConnectionCheckResult",
     "ConnectionErrorKind",
 ]
