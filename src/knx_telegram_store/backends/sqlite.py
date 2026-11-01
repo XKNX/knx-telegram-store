@@ -169,7 +169,8 @@ class SqliteStore(BaseSQLStore):
 
         # timeout is sqlite's busy timeout: with a concurrent writer (WAL or
         # rollback journal) readers wait instead of failing with SQLITE_BUSY.
-        engine = create_async_engine(url, connect_args={"timeout": 10})
+        # hide_parameters: errors of a batch insert would log every row
+        engine = create_async_engine(url, connect_args={"timeout": 10}, hide_parameters=True)
         self._legacy_timestamp_timezone = legacy_timestamp_timezone
         self._backup_in_progress = False
         self._backup_connection: AsyncConnection | None = None

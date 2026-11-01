@@ -19,6 +19,35 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
+def _data_error_cause(err: BaseException) -> BaseException | None:
+    """Return the cause if a write failed because of the telegrams, not the database.
+
+    Such a batch fails the same way on every retry - e.g. a value the JSON
+    column cannot serialize (TypeError) or a constraint violation. Connection
+    and other database errors return None: retrying them later may succeed.
+    """
+    data_error_types: tuple[type[BaseException], ...] = (TypeError, ValueError)
+    try:
+        from sqlalchemy.exc import DataError, IntegrityError
+    except ImportError:
+        pass
+    else:
+        data_error_types += (DataError, IntegrityError)
+
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [err]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, data_error_types):
+            return current
+        # SQLAlchemy's StatementError keeps the original exception in `orig`
+        pending.extend((current.__cause__, current.__context__, getattr(current, "orig", None)))
+    return None
+
+
 class _BufferMixin:
     """Write-buffering mixin for TelegramStore subclasses.
 
@@ -217,20 +246,52 @@ class _BufferMixin:
                 try:
                     await self.store_many(batch)
                     self._buffer_full_warned = False
+                    return
                 except BaseException as err:
-                    self._buffer[0:0] = batch
-                    if len(self._buffer) > self.max_buffer_size:
-                        if not self._buffer_full_warned:
+                    if not isinstance(err, Exception) or _data_error_cause(err) is None:
+                        self._requeue(batch)
+                        if not isinstance(err, Exception) or raise_on_error:
+                            raise
+                        _LOGGER.error("Error flushing telegram buffer: %s", err)
+                        return
+
+                # A telegram of the batch can never be stored. Retrying the batch
+                # would block the buffer for good, so store the telegrams one by
+                # one and drop only those failing for the same reason.
+                for index, telegram in enumerate(batch):
+                    try:
+                        await self.store_many([telegram])
+                    except BaseException as err:
+                        if isinstance(err, Exception) and (cause := _data_error_cause(err)) is not None:
                             _LOGGER.warning(
-                                "Telegram store buffer exceeded limit (%d items) after failed flush, dropping %d oldest telegrams",
-                                self.max_buffer_size,
-                                len(self._buffer) - self.max_buffer_size,
+                                "Dropping telegram to %s from %s at %s (DPT %s.%s) that cannot be stored: %s",
+                                telegram.destination,
+                                telegram.source,
+                                telegram.timestamp.isoformat(),
+                                telegram.dpt_main,
+                                telegram.dpt_sub,
+                                cause,
                             )
-                            self._buffer_full_warned = True
-                        self._buffer = self._buffer[-self.max_buffer_size :]
-                    if not isinstance(err, Exception) or raise_on_error:
-                        raise
-                    _LOGGER.error("Error flushing telegram buffer: %s", err)
+                            continue
+                        self._requeue(batch[index:])
+                        if not isinstance(err, Exception) or raise_on_error:
+                            raise
+                        _LOGGER.error("Error flushing telegram buffer: %s", err)
+                        return
+                self._buffer_full_warned = False
+
+    def _requeue(self, telegrams: list[StoredTelegram]) -> None:
+        """Put telegrams of a failed flush back in front of the buffer."""
+        self._buffer[0:0] = telegrams
+        if len(self._buffer) > self.max_buffer_size:
+            if not self._buffer_full_warned:
+                _LOGGER.warning(
+                    "Telegram store buffer exceeded limit (%d items) after failed flush, dropping %d oldest telegrams",
+                    self.max_buffer_size,
+                    len(self._buffer) - self.max_buffer_size,
+                )
+                self._buffer_full_warned = True
+            self._buffer = self._buffer[-self.max_buffer_size :]
 
     @wrap_store_errors
     async def flush(self) -> None:

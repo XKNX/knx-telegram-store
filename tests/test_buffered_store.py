@@ -1088,3 +1088,91 @@ async def test_lifecycle_operation_preserves_in_flight_batch(sample_telegram, mo
 
     assert store._buffer == []
     assert await store.count() == 1
+
+
+class _Unserializable:
+    """A value the JSON column cannot store, like xknx's Switch enum."""
+
+
+async def test_flush_drops_only_unstorable_telegrams(sample_telegram, caplog):
+    store = BufferedSqliteStore(":memory:", flush_interval=60)
+    await store.initialize()
+    try:
+        good_1 = replace(sample_telegram, destination="1/1/1", value=1.0)
+        bad = replace(sample_telegram, destination="1/1/2", payload=_Unserializable())
+        good_2 = replace(sample_telegram, destination="1/1/3", value=21.5)
+        for telegram in (good_1, bad, good_2):
+            await store.store(telegram)
+
+        await store.flush()
+
+        assert store._buffer == []
+        assert await store.count() == 2
+        result = await store.query(TelegramQuery())
+        assert {t.destination for t in result.telegrams} == {"1/1/1", "1/1/3"}
+        (record,) = [r for r in caplog.records if "cannot be stored" in r.getMessage()]
+        message = record.getMessage()
+        assert "1/1/2" in message
+        assert "_Unserializable is not JSON serializable" in message
+        # neither the SQL parameters of the batch nor the statement end up in the log
+        assert "21.5" not in message
+        assert "INSERT" not in message
+    finally:
+        await store.close()
+
+
+async def test_flush_requeues_rest_when_database_fails_after_data_error(sample_telegram, monkeypatch):
+    store = BufferedMemoryStore(flush_interval=60)
+    await store.initialize()
+    original_store_many = store.store_many
+    telegrams = [replace(sample_telegram, destination=f"1/1/{i}") for i in range(4)]
+    calls: list[list[str]] = []
+
+    async def _store_many(batch):
+        calls.append([t.destination for t in batch])
+        if len(batch) > 1 or batch[0].destination == "1/1/1":
+            raise TypeError("not JSON serializable")
+        if batch[0].destination == "1/1/2":
+            raise RuntimeError("DB error")
+        await original_store_many(batch)
+
+    monkeypatch.setattr(store, "store_many", _store_many)
+    try:
+        for telegram in telegrams:
+            await store.store(telegram)
+
+        with pytest.raises(KnxTelegramStoreException, match="DB error"):
+            await store.flush()
+
+        # 1/1/0 stored, 1/1/1 dropped, 1/1/2 hit the database error and is kept with the rest
+        assert calls[1:] == [["1/1/0"], ["1/1/1"], ["1/1/2"]]
+        assert [t.destination for t in store._buffer] == ["1/1/2", "1/1/3"]
+        monkeypatch.setattr(store, "store_many", original_store_many)
+        await store.flush()
+        assert await store.count() == 3
+    finally:
+        monkeypatch.setattr(store, "store_many", original_store_many)
+        await store.close()
+
+
+async def test_flush_keeps_batch_on_database_error(buffered_store, sample_telegram, monkeypatch):
+    original_store_many = buffered_store.store_many
+    calls = 0
+
+    async def _fail(_telegrams):
+        nonlocal calls
+        calls += 1
+        raise ConnectionError("database unreachable")
+
+    monkeypatch.setattr(buffered_store, "store_many", _fail)
+    try:
+        await buffered_store.store(sample_telegram)
+        await buffered_store.store(replace(sample_telegram, destination="1/1/2"))
+        with pytest.raises(KnxTelegramStoreException, match="database unreachable"):
+            await buffered_store.flush()
+
+        # no row-by-row retry: the database, not the data, is the problem
+        assert calls == 1
+        assert len(buffered_store._buffer) == 2
+    finally:
+        monkeypatch.setattr(buffered_store, "store_many", original_store_many)
