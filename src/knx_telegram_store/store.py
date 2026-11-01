@@ -19,6 +19,22 @@ class KnxTelegramStoreException(Exception):
     """Base exception for all KNX telegram store operations."""
 
 
+class InsufficientDiskSpaceError(KnxTelegramStoreException):
+    """A startup pass needs more free space on the database's volume than there is.
+
+    The database was left untouched and the pass is attempted again on the
+    next start. ``required`` and ``available`` are bytes.
+    """
+
+    def __init__(self, pass_name: str, required: int, available: int) -> None:
+        self.required = required
+        self.available = available
+        super().__init__(
+            f"{pass_name} needs about {required >> 20} MiB free next to the database, "
+            f"{available >> 20} MiB are available"
+        )
+
+
 def wrap_store_errors[**P, T](func: Callable[P, Awaitable[T]]) -> Callable[P, Coroutine[Any, Any, T]]:
     """Wrap any exception thrown by a store operation in KnxTelegramStoreException."""
 
