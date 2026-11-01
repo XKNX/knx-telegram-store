@@ -50,7 +50,8 @@ def _build_engine(dsn: str) -> AsyncEngine:
         # SQLAlchemy's make_url leaves it encoded — decode it here so
         # percent-encoded database names target the right database.
         url = url.set(database=unquote(url.database))
-    return create_async_engine(url, connect_args={"ssl": ssl_value})
+    # hide_parameters: errors of a batch insert would log every row
+    return create_async_engine(url, connect_args={"ssl": ssl_value}, hide_parameters=True)
 
 
 def _timescale_advisory(result: ConnectionCheckResult) -> ConnectionCheckResult:
