@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -1176,3 +1177,69 @@ async def test_flush_keeps_batch_on_database_error(buffered_store, sample_telegr
         assert len(buffered_store._buffer) == 2
     finally:
         monkeypatch.setattr(buffered_store, "store_many", original_store_many)
+
+
+def test_data_error_cause_without_sqlalchemy(monkeypatch):
+    from knx_telegram_store.buffered import _data_error_cause
+
+    # sqlalchemy is optional; a None entry makes its import raise ImportError
+    monkeypatch.setitem(sys.modules, "sqlalchemy.exc", None)
+    wrapped = KnxTelegramStoreException("Database error during store_many")
+    wrapped.__cause__ = TypeError("Object of type Switch is not JSON serializable")
+
+    assert _data_error_cause(wrapped) is wrapped.__cause__
+    assert _data_error_cause(RuntimeError("DB error")) is None
+
+
+async def test_periodic_flush_logs_database_error_after_data_error(sample_telegram, monkeypatch, caplog):
+    store = BufferedMemoryStore(flush_interval=60)
+    await store.initialize()
+    original_store_many = store.store_many
+    telegrams = [replace(sample_telegram, destination=f"1/1/{i}") for i in range(3)]
+
+    async def _store_many(batch):
+        if len(batch) > 1:
+            raise TypeError("not JSON serializable")
+        if batch[0].destination == "1/1/1":
+            raise RuntimeError("DB error")
+        await original_store_many(batch)
+
+    monkeypatch.setattr(store, "store_many", _store_many)
+    try:
+        for telegram in telegrams:
+            await store.store(telegram)
+
+        # the periodic flush logs instead of raising
+        await store._flush(raise_on_error=False)
+
+        assert [t.destination for t in store._buffer] == ["1/1/1", "1/1/2"]
+        assert "Error flushing telegram buffer: DB error" in caplog.text
+    finally:
+        monkeypatch.setattr(store, "store_many", original_store_many)
+        await store.close()
+
+
+async def test_failed_flush_trims_buffer_to_limit(sample_telegram, monkeypatch, caplog):
+    store = BufferedMemoryStore(flush_interval=60, max_buffer_size=3)
+    await store.initialize()
+    original_store_many = store.store_many
+    telegrams = [replace(sample_telegram, destination=f"1/1/{i}") for i in range(5)]
+
+    async def _fail_while_telegrams_arrive(_batch):
+        for telegram in telegrams[2:]:
+            await store.store(telegram)
+        raise RuntimeError("DB error")
+
+    monkeypatch.setattr(store, "store_many", _fail_while_telegrams_arrive)
+    try:
+        for telegram in telegrams[:2]:
+            await store.store(telegram)
+
+        await store._flush(raise_on_error=False)
+
+        # the re-queued batch plus the new telegrams exceed the limit: the oldest go
+        assert [t.destination for t in store._buffer] == ["1/1/2", "1/1/3", "1/1/4"]
+        assert "exceeded limit (3 items) after failed flush, dropping 2 oldest" in caplog.text
+    finally:
+        monkeypatch.setattr(store, "store_many", original_store_many)
+        await store.close()
