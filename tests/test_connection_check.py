@@ -260,6 +260,15 @@ def test_postgres_build_engine_decodes_url_components():
     assert engine.url.database == "knx?query#hash"
 
 
+def test_postgres_build_engine_decodes_database_once():
+    pytest.importorskip("asyncpg")
+    from knx_telegram_store.backends.postgres import _build_engine
+
+    # %25 is a literal %; decoding the result again would garble the name.
+    engine = _build_engine("postgresql://u:p@host:5432/100%25db%2520")
+    assert engine.url.database == "100%db%20"
+
+
 def test_postgres_build_engine_translates_sslmode():
     pytest.importorskip("asyncpg")
     from knx_telegram_store.backends.postgres import _build_engine
