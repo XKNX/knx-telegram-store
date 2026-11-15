@@ -25,6 +25,9 @@ from .base_sql import BaseSQLStore
 
 _NOTIFY_CHANNEL = "telegram_inserted"
 
+# SQLAlchemy 2.1 percent-decodes the database in make_url, 2.0 leaves it encoded
+_MAKE_URL_DECODES_DATABASE = make_url("postgresql:///%41").database == "A"
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -45,9 +48,9 @@ def _build_engine(dsn: str) -> AsyncEngine:
     # Default to no SSL when not requested, to avoid blocking cert loading.
     ssl_value = query.pop("sslmode", None) or query.pop("ssl", None) or False
     url = url.set(query=query)
-    if url.database:
+    if url.database and not _MAKE_URL_DECODES_DATABASE:
         # libpq/asyncpg URIs percent-decode the database component, but
-        # SQLAlchemy's make_url leaves it encoded — decode it here so
+        # SQLAlchemy 2.0's make_url leaves it encoded — decode it here so
         # percent-encoded database names target the right database.
         url = url.set(database=unquote(url.database))
     # hide_parameters: errors of a batch insert would log every row
