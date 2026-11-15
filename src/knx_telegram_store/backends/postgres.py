@@ -335,14 +335,22 @@ class PostgresStore(BaseSQLStore):
     async def _setup_notify_trigger(self, conn: AsyncConnection) -> None:
         """Create the NOTIFY trigger that lets a read-only store LISTEN for new rows.
 
-        A statement-level trigger with a transition table resolves the whole
-        inserted batch against string_lookup in a single join (one insert from
-        store_many can hold many rows), then emits one pg_notify per row when
-        its payload is below Postgres's 8000-byte limit. Oversized live
-        notifications are skipped so telegram persistence can continue. The
-        payload mirrors query()'s decoded shape (string
-        source/destination/etc., not the raw lookup ids), so a listener can
-        build a StoredTelegram directly without a follow-up query.
+        A row-level AFTER INSERT trigger resolves each inserted row against
+        string_lookup and emits one pg_notify when its payload is below
+        Postgres's 8000-byte limit. Oversized live notifications are skipped
+        so telegram persistence can continue. The payload mirrors query()'s
+        decoded shape (string source/destination/etc., not the raw lookup
+        ids), so a listener can build a StoredTelegram directly without a
+        follow-up query.
+
+        Row-level rather than the earlier statement-level trigger with a
+        transition table: on one production database (PostgreSQL 16.13,
+        TimescaleDB 2.26.3) the statement-level trigger did not fire for the
+        Home Assistant writer's inserts, while a row-level trigger with the
+        same body did. The root cause has not been identified; it could not
+        be reproduced, not even by replaying that writer's session statement
+        by statement. TimescaleDB propagates row-level triggers to every
+        chunk, and they fired in every case observed.
         """
         await conn.execute(
             text(f"""
@@ -367,7 +375,7 @@ class PostgresStore(BaseSQLStore):
                       t.value_numeric,
                       t.raw_data,
                       t.data_secure
-                    FROM new_rows t
+                    FROM (SELECT NEW.*) t
                     JOIN string_lookup s ON s.id = t.source_id AND s.category = 'source'
                     JOIN string_lookup d ON d.id = t.destination_id AND d.category = 'destination'
                     JOIN string_lookup tt ON tt.id = t.telegramtype_id AND tt.category = 'telegramtype'
@@ -390,8 +398,7 @@ class PostgresStore(BaseSQLStore):
             text("""
                 CREATE TRIGGER knx_telegram_store_notify
                   AFTER INSERT ON telegrams
-                  REFERENCING NEW TABLE AS new_rows
-                  FOR EACH STATEMENT
+                  FOR EACH ROW
                   EXECUTE FUNCTION knx_telegram_store_notify_insert()
             """)
         )

@@ -351,6 +351,50 @@ async def test_oversized_notify_payload_does_not_abort_batch(store):
     }
 
 
+async def test_notify_after_reinitialize_on_existing_table(backend):
+    """The notify trigger fires when it is (re)created on an existing table.
+
+    A long-running store initializes again on every host start, recreating the
+    trigger on a table that is already a hypertable (TimescaleDB). This guards
+    that path: exactly one notification per inserted row after re-initialize.
+    It is not a reproduction of the production case where the earlier
+    statement-level trigger stayed silent; that case was never reproduced.
+    """
+    backend_name, dsn = backend
+    first = PostgresStore(dsn, retention_days=30)
+    await first.initialize()
+    await first.store_many([make_telegram(datetime.now(UTC) - timedelta(minutes=5))])
+    await first.close()
+    if backend_name == "timescale":
+        assert await _is_hypertable(dsn)
+
+    second = PostgresStore(dsn, retention_days=30)
+    await second.initialize()
+    notifications: asyncio.Queue[str] = asyncio.Queue()
+    listener = await asyncpg.connect(dsn)
+
+    def _on_notify(_connection, _pid, _channel, payload):
+        notifications.put_nowait(payload)
+
+    try:
+        await listener.add_listener(_NOTIFY_CHANNEL, _on_notify)
+        await second.store_many(
+            [
+                make_telegram(datetime.now(UTC), destination="7/7/7", value=1.0),
+                make_telegram(datetime.now(UTC), 1, destination="7/7/8", value=2.0),
+            ]
+        )
+        received = [json.loads(await asyncio.wait_for(notifications.get(), timeout=5)) for _ in range(2)]
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(notifications.get(), timeout=0.2)
+    finally:
+        await listener.close()
+        await second.close()
+
+    assert {r["destination"] for r in received} == {"7/7/7", "7/7/8"}
+    assert all(r["destination_name"] == "Temperature" for r in received)
+
+
 async def test_time_delta_context_window(store):
     _, pg_store = store
     base = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
